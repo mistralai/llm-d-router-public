@@ -66,10 +66,17 @@ type Options struct {
 	// only lets a request that reaches a standby (e.g. via a not-yet-refreshed
 	// Envoy connection during a handoff) be routed instead of failing with 503.
 	HAPopulateNonLeaderDatastore bool
-	GRPCMaxRecvMsgSize           int    // Maximum size of a gRPC message to receive (parsed bytes).
-	GRPCMaxSendMsgSize           int    // Maximum size of a gRPC message to send (parsed bytes).
-	GRPCMaxRecvMsgSizeStr        string // Raw string value from CLI flag for receive limit.
-	GRPCMaxSendMsgSizeStr        string // Raw string value from CLI flag for send limit.
+	// DrainTimeout enables graceful shutdown when > 0. On SIGTERM the EPP marks
+	// itself NotServing (readiness/ext_proc health) and lets the manager release
+	// its leader lease, but keeps the ext_proc gRPC server accepting requests for
+	// this long before stopping, so in-flight and pre-DNS-refresh requests are
+	// served instead of rejected. 0 (default) keeps the upstream behavior of
+	// stopping the ext_proc server as soon as the manager stops.
+	DrainTimeout          time.Duration
+	GRPCMaxRecvMsgSize    int    // Maximum size of a gRPC message to receive (parsed bytes).
+	GRPCMaxSendMsgSize    int    // Maximum size of a gRPC message to send (parsed bytes).
+	GRPCMaxRecvMsgSizeStr string // Raw string value from CLI flag for receive limit.
+	GRPCMaxSendMsgSizeStr string // Raw string value from CLI flag for send limit.
 	//
 	// InferencePool.
 	//
@@ -162,6 +169,10 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 		"Only with --ha-enable-leader-election: also run the reconcilers on non-leader replicas so their datastore stays "+
 			"populated. Non-leaders still fail their readiness/ext_proc health check (they are not advertised); this only lets "+
 			"a request that reaches a standby be routed instead of returning 503.")
+	fs.DurationVar(&opts.DrainTimeout, "drain-timeout", opts.DrainTimeout,
+		"Graceful shutdown drain window. When > 0, on SIGTERM the EPP goes NotServing and releases its leader lease "+
+			"immediately but keeps serving ext_proc for this long so in-flight and pre-DNS-refresh requests are not "+
+			"rejected. 0 disables graceful drain (stop serving as soon as the manager stops).")
 	fs.StringVar(&opts.GRPCMaxRecvMsgSizeStr, "grpc-max-recv-msg-size", opts.GRPCMaxRecvMsgSizeStr, "Maximum size of a gRPC message to receive (e.g., 10MiB, 25MB).")
 	fs.StringVar(&opts.GRPCMaxSendMsgSizeStr, "grpc-max-send-msg-size", opts.GRPCMaxSendMsgSizeStr, "Maximum size of a gRPC message to send (e.g., 10MiB, 25MB).")
 	fs.StringVar(&opts.PoolGroup, "pool-group", opts.PoolGroup,
