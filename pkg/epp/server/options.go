@@ -57,12 +57,19 @@ type Options struct {
 	//
 	// ext_proc configuration.
 	//
-	GRPCPort              int    // gRPC port used for communicating with Envoy proxy. (TODO: uint16?)
-	EnableLeaderElection  bool   // Enables leader election for high availability
-	GRPCMaxRecvMsgSize    int    // Maximum size of a gRPC message to receive (parsed bytes).
-	GRPCMaxSendMsgSize    int    // Maximum size of a gRPC message to send (parsed bytes).
-	GRPCMaxRecvMsgSizeStr string // Raw string value from CLI flag for receive limit.
-	GRPCMaxSendMsgSizeStr string // Raw string value from CLI flag for send limit.
+	GRPCPort             int  // gRPC port used for communicating with Envoy proxy. (TODO: uint16?)
+	EnableLeaderElection bool // Enables leader election for high availability
+	// HAPopulateNonLeaderDatastore, when leader election is enabled, runs the
+	// InferencePool/Pod (and CRD) reconcilers on non-leader replicas too, so
+	// their datastore stays populated. Non-leaders still report NotServing on
+	// their readiness/ext_proc health check, so they are not advertised; this
+	// only lets a request that reaches a standby (e.g. via a not-yet-refreshed
+	// Envoy connection during a handoff) be routed instead of failing with 503.
+	HAPopulateNonLeaderDatastore bool
+	GRPCMaxRecvMsgSize           int    // Maximum size of a gRPC message to receive (parsed bytes).
+	GRPCMaxSendMsgSize           int    // Maximum size of a gRPC message to send (parsed bytes).
+	GRPCMaxRecvMsgSizeStr        string // Raw string value from CLI flag for receive limit.
+	GRPCMaxSendMsgSizeStr        string // Raw string value from CLI flag for send limit.
 	//
 	// InferencePool.
 	//
@@ -151,6 +158,10 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.GRPCPort, "grpc-port", opts.GRPCPort, "gRPC port used for communicating with Envoy proxy.")
 	fs.BoolVar(&opts.EnableLeaderElection, "ha-enable-leader-election", opts.EnableLeaderElection,
 		"Enables leader election for high availability. When enabled, readiness probes will only pass on the leader.")
+	fs.BoolVar(&opts.HAPopulateNonLeaderDatastore, "ha-populate-non-leader-datastore", opts.HAPopulateNonLeaderDatastore,
+		"Only with --ha-enable-leader-election: also run the reconcilers on non-leader replicas so their datastore stays "+
+			"populated. Non-leaders still fail their readiness/ext_proc health check (they are not advertised); this only lets "+
+			"a request that reaches a standby be routed instead of returning 503.")
 	fs.StringVar(&opts.GRPCMaxRecvMsgSizeStr, "grpc-max-recv-msg-size", opts.GRPCMaxRecvMsgSizeStr, "Maximum size of a gRPC message to receive (e.g., 10MiB, 25MB).")
 	fs.StringVar(&opts.GRPCMaxSendMsgSizeStr, "grpc-max-send-msg-size", opts.GRPCMaxSendMsgSizeStr, "Maximum size of a gRPC message to send (e.g., 10MiB, 25MB).")
 	fs.StringVar(&opts.PoolGroup, "pool-group", opts.PoolGroup,

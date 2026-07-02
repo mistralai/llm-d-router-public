@@ -40,6 +40,10 @@ type ControllerConfig struct {
 	hasInferenceModelRewrites bool
 	InferenceObjectiveGV      schema.GroupVersion
 	InferenceModelRewriteGV   schema.GroupVersion
+	// PopulateNonLeaderDatastore runs the reconcilers on all replicas (not just
+	// the leader) so non-leaders keep a populated datastore. See
+	// Options.HAPopulateNonLeaderDatastore.
+	PopulateNonLeaderDatastore bool
 }
 
 func NewControllerConfig(startCrdReconcilers bool) ControllerConfig {
