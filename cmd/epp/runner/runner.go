@@ -70,6 +70,7 @@ import (
 	sourcemetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/metrics"
 	srcmodels "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/models"
 	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
+	statestore "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/cross_plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/globalstrict"
 	programaware "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/program-aware"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/roundrobin"
@@ -583,6 +584,10 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(mmcacheaffinity.Type, mmcacheaffinity.Factory)
 	fwkplugin.Register(preciseproducer.PluginType, preciseproducer.PluginFactory)
 	fwkplugin.Register(p2psource.PluginType, p2psource.PluginFactory)
+
+	// Cross-replica state store plugins
+	fwkplugin.Register(statestore.LocalStateStoreType, statestore.LocalStateStoreFactory)
+	fwkplugin.Register(statestore.RedisStateStoreType, statestore.RedisStateStoreFactory)
 
 	// Flow Control plugins
 	fwkplugin.Register(globalstrict.GlobalStrictFairnessPolicyType, globalstrict.GlobalStrictFairnessPolicyFactory)
