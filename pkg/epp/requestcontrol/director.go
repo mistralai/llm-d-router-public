@@ -352,7 +352,23 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	if err := d.repackage(ctx, reqCtx, inferenceRequestBody); err != nil {
 		return reqCtx, err
 	}
+	releaseRequestBody(inferenceRequestBody)
 	return reqCtx, nil
+}
+
+// releaseRequestBody nils heavy fields so GC can collect them during the
+// long inference wait (60-700s) instead of retaining them via
+// SchedulingRequest.Body.
+func releaseRequestBody(body *fwkrh.InferenceRequestBody) {
+	body.Payload = nil
+	body.ChatCompletions = nil
+	body.Completions = nil
+	body.Messages = nil
+	body.Responses = nil
+	body.Conversations = nil
+	body.Embeddings = nil
+	body.Generate = nil
+	body.TokenizedPrompt = nil
 }
 
 func (d *Director) modelRewriteIfNeeded(ctx context.Context, reqCtx *handlers.RequestContext, inferenceRequestBody *fwkrh.InferenceRequestBody) error {
