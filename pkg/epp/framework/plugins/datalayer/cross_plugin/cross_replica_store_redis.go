@@ -116,27 +116,30 @@ func (s *RedisStateStore) hashKey(key fwkdl.StateKey, endpointID string) string 
 	return string(key) + ":" + endpointID
 }
 
-type gobValue struct{ Value any }
+type stampedValue struct {
+	Value   any
+	WrittenAt time.Time
+}
 
-func gobEncode(value any) ([]byte, error) {
+func gobEncode(value any, now time.Time) ([]byte, error) {
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(gobValue{Value: value}); err != nil {
+	if err := gob.NewEncoder(&buf).Encode(stampedValue{Value: value, WrittenAt: now}); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
-func gobDecode(data []byte) (any, error) {
-	var w gobValue
+func gobDecode(data []byte) (any, time.Time, error) {
+	var w stampedValue
 	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&w); err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
-	return w.Value, nil
+	return w.Value, w.WrittenAt, nil
 }
 
 func (s *RedisStateStore) Set(ctx context.Context, key fwkdl.StateKey, endpointID string, value any) error {
 	logger := ctrl.LoggerFrom(ctx)
-	data, err := gobEncode(value)
+	data, err := gobEncode(value, time.Now())
 	if err != nil {
 		return fmt.Errorf("redis-state-store: encode: %w", err)
 	}
@@ -164,12 +167,19 @@ func (s *RedisStateStore) Get(ctx context.Context, key fwkdl.StateKey, endpointI
 	}
 
 	logger := ctrl.LoggerFrom(ctx)
+	now := time.Now()
 	values := make([]any, 0, len(result))
 	for field, data := range result {
-		val, err := gobDecode([]byte(data))
+		val, writtenAt, err := gobDecode([]byte(data))
 		if err != nil {
 			if v := logger.V(logutil.DEBUG); v.Enabled() {
 				v.Info("redis-state-store: decode error", "field", field, "error", err)
+			}
+			continue
+		}
+		if now.Sub(writtenAt) > s.ttl {
+			if v := logger.V(logutil.DEBUG); v.Enabled() {
+				v.Info("redis-state-store: skipping stale entry", "field", field, "age", now.Sub(writtenAt), "ttl", s.ttl)
 			}
 			continue
 		}
@@ -181,7 +191,7 @@ func (s *RedisStateStore) Get(ctx context.Context, key fwkdl.StateKey, endpointI
 
 	aggregated := aggregate(values)
 	if v := logger.V(logutil.DEBUG); v.Enabled() {
-		v.Info("redis-state-store: Get", "key", string(key), "endpoint", endpointID, "replica", s.replicaID, "numReplicas", len(result), "result", fmt.Sprintf("%+v", aggregated))
+		v.Info("redis-state-store: Get", "key", string(key), "endpoint", endpointID, "replica", s.replicaID, "numReplicas", len(values), "result", fmt.Sprintf("%+v", aggregated))
 	}
 	return aggregated, true, nil
 }
