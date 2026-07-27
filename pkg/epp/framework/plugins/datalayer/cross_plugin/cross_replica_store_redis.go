@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -38,7 +39,10 @@ func init() {
 	gob.Register(&attrconcurrency.InFlightLoad{})
 }
 
-const RedisStateStoreType = "redis-state-store"
+const (
+	RedisStateStoreType = "redis-state-store"
+	defaultTTL          = 180 * time.Second
+)
 
 var _ fwkdl.CrossReplicaStore = (*RedisStateStore)(nil)
 
@@ -46,16 +50,19 @@ type redisConfig struct {
 	Address  string `json:"address"`
 	Password string `json:"password"`
 	DB       int    `json:"db"`
+	TTL      string `json:"ttl"`
 }
 
 // RedisStateStore is a CrossReplicaStore backed by Redis for cross-replica
-// state sharing. Each replica writes under its own replicaID key prefix;
-// Get aggregates values across all replicas using the caller-supplied
-// aggregate function.
+// state sharing. Each endpoint's state is stored in a Redis hash keyed by
+// "{stateKey}:{endpointID}", with per-replica fields keyed by replicaID.
+// Get aggregates all replica fields using the caller-supplied aggregate
+// function via a single HGETALL.
 type RedisStateStore struct {
 	typedName fwkplugin.TypedName
 	replicaID string
 	client    *redis.Client
+	ttl       time.Duration
 }
 
 func RedisStateStoreFactory(name string, params *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
@@ -69,6 +76,15 @@ func RedisStateStoreFactory(name string, params *json.Decoder, _ fwkplugin.Handl
 		cfg.Address = "localhost:6379"
 	}
 
+	ttl := defaultTTL
+	if cfg.TTL != "" {
+		parsed, err := time.ParseDuration(cfg.TTL)
+		if err != nil {
+			return nil, fmt.Errorf("redis-state-store: invalid ttl %q: %w", cfg.TTL, err)
+		}
+		ttl = parsed
+	}
+
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "unknown"
@@ -80,10 +96,15 @@ func RedisStateStoreFactory(name string, params *json.Decoder, _ fwkplugin.Handl
 		DB:       cfg.DB,
 	})
 
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		return nil, fmt.Errorf("redis-state-store: failed to connect to Redis at %s: %w", cfg.Address, err)
+	}
+
 	return &RedisStateStore{
 		typedName: fwkplugin.TypedName{Type: RedisStateStoreType, Name: name},
 		replicaID: hostname,
 		client:    client,
+		ttl:       ttl,
 	}, nil
 }
 
@@ -91,12 +112,8 @@ func (s *RedisStateStore) TypedName() fwkplugin.TypedName {
 	return s.typedName
 }
 
-func (s *RedisStateStore) replicaKey(key fwkdl.StateKey, endpointID string) string {
-	return string(key) + ":" + endpointID + ":" + s.replicaID
-}
-
-func (s *RedisStateStore) scanPattern(key fwkdl.StateKey, endpointID string) string {
-	return string(key) + ":" + endpointID + ":*"
+func (s *RedisStateStore) hashKey(key fwkdl.StateKey, endpointID string) string {
+	return string(key) + ":" + endpointID
 }
 
 type gobValue struct{ Value any }
@@ -123,7 +140,11 @@ func (s *RedisStateStore) Set(ctx context.Context, key fwkdl.StateKey, endpointI
 	if err != nil {
 		return fmt.Errorf("redis-state-store: encode: %w", err)
 	}
-	if err := s.client.Set(ctx, s.replicaKey(key, endpointID), data, 0).Err(); err != nil {
+	hk := s.hashKey(key, endpointID)
+	pipe := s.client.Pipeline()
+	pipe.HSet(ctx, hk, s.replicaID, data)
+	pipe.Expire(ctx, hk, s.ttl)
+	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
 	if v := logger.V(logutil.DEBUG); v.Enabled() {
@@ -133,23 +154,23 @@ func (s *RedisStateStore) Set(ctx context.Context, key fwkdl.StateKey, endpointI
 }
 
 func (s *RedisStateStore) Get(ctx context.Context, key fwkdl.StateKey, endpointID string, aggregate func([]any) any) (any, bool, error) {
-	pattern := s.scanPattern(key, endpointID)
-	keys, err := s.client.Keys(ctx, pattern).Result()
+	hk := s.hashKey(key, endpointID)
+	result, err := s.client.HGetAll(ctx, hk).Result()
 	if err != nil {
-		return nil, false, fmt.Errorf("redis-state-store: keys: %w", err)
+		return nil, false, fmt.Errorf("redis-state-store: hgetall: %w", err)
 	}
-	if len(keys) == 0 {
+	if len(result) == 0 {
 		return nil, false, nil
 	}
 
-	values := make([]any, 0, len(keys))
-	for _, k := range keys {
-		data, err := s.client.Get(ctx, k).Bytes()
+	logger := ctrl.LoggerFrom(ctx)
+	values := make([]any, 0, len(result))
+	for field, data := range result {
+		val, err := gobDecode([]byte(data))
 		if err != nil {
-			continue
-		}
-		val, err := gobDecode(data)
-		if err != nil {
+			if v := logger.V(logutil.DEBUG); v.Enabled() {
+				v.Info("redis-state-store: decode error", "field", field, "error", err)
+			}
 			continue
 		}
 		values = append(values, val)
@@ -158,14 +179,13 @@ func (s *RedisStateStore) Get(ctx context.Context, key fwkdl.StateKey, endpointI
 		return nil, false, nil
 	}
 
-	result := aggregate(values)
-	logger := ctrl.LoggerFrom(ctx)
+	aggregated := aggregate(values)
 	if v := logger.V(logutil.DEBUG); v.Enabled() {
-		v.Info("redis-state-store: Get", "key", string(key), "endpoint", endpointID, "replica", s.replicaID, "numKeys", len(keys), "result", fmt.Sprintf("%+v", result))
+		v.Info("redis-state-store: Get", "key", string(key), "endpoint", endpointID, "replica", s.replicaID, "numReplicas", len(result), "result", fmt.Sprintf("%+v", aggregated))
 	}
-	return result, true, nil
+	return aggregated, true, nil
 }
 
 func (s *RedisStateStore) Delete(ctx context.Context, key fwkdl.StateKey, endpointID string) error {
-	return s.client.Del(ctx, s.replicaKey(key, endpointID)).Err()
+	return s.client.HDel(ctx, s.hashKey(key, endpointID), s.replicaID).Err()
 }
