@@ -410,8 +410,10 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				parentEngineKey := kvblock.BlockHash(ev.ParentHash)
 				key, err := p.index.GetRequestKey(ctx, parentEngineKey)
 				if err != nil {
-					debugLogger.Error(err, "Failed to get request key for parent block",
-						"parentEngineKey", parentEngineKey, "effectiveModelName", effectiveModelName)
+					// Parent block predates this EPP's lifetime — skip the
+					// block so only complete chains (observed from the root)
+					// enter the index. The token-load-scorer handles requests
+					// that hit old cached prefixes via load balancing alone.
 					continue
 				}
 				parentRequestKey = key
