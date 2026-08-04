@@ -207,3 +207,24 @@ func (i *indexer) PodBlockCounts() map[ServerID]int {
 	}
 	return counts
 }
+
+// PodBlocks returns up to limit of the pod's block hashes, most-recently-used
+// first. A non-positive limit returns the whole LRU. Callers that ship the
+// result off-box should always pass a limit: a full LRU is LRUCapacityPerServer
+// entries (31250 by default, ~250KB) per pod.
+func (i *indexer) PodBlocks(pod ServerID, limit int) []blockHash {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+
+	lruCache, exists := i.podToLRU[pod]
+	if !exists {
+		return nil
+	}
+
+	// hashicorp/lru orders Keys() oldest-first, so the hot blocks are the tail.
+	keys := lruCache.Keys()
+	if limit > 0 && len(keys) > limit {
+		keys = keys[len(keys)-limit:]
+	}
+	return keys
+}
