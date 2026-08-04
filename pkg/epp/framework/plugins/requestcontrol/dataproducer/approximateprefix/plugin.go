@@ -35,6 +35,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
 	approxprefixconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/approximateprefix/constants"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixhash"
 	tokenproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
@@ -59,6 +60,8 @@ var (
 	_ requestcontrol.PreRequest     = &dataProducer{}
 	_ plugin.StateDumper            = &dataProducer{}
 	_ fwkdl.CrossReplicaContributor = &dataProducer{}
+	_ fwkdl.EndpointExtractor       = &dataProducer{}
+	_ fwkdl.Registrant              = &dataProducer{}
 )
 
 // prefixBlockStateDK keys the peer-replica block-hash view installed on each
@@ -133,6 +136,36 @@ func (p *dataProducer) CrossReplicaState() fwkdl.CrossReplicaSpec {
 			return merged
 		},
 	}
+}
+
+// RegisterDependencies subscribes to endpoint lifecycle events when
+// cross-replica sync is on.
+//
+// The subscription is what matters, not the events: newCrossReplicaPublisher
+// discovers contributors by walking the datalayer's extractor map, so a plugin
+// that never registers as an extractor is never asked for its state, however
+// correctly it implements CrossReplicaContributor. Registration is skipped when
+// sync is off so the default approx path does not gain an
+// endpoint-notification-source it has no use for.
+func (p *dataProducer) RegisterDependencies(r fwkdl.Registrar) error {
+	if !p.config.SyncCrossReplicaState {
+		return nil
+	}
+	return r.Register(fwkdl.PendingRegistration{
+		Owner:      p.TypedName(),
+		SourceType: sourcenotifications.EndpointNotificationSourceType,
+		Extractor:  p,
+		DefaultSource: sourcenotifications.NewEndpointDataSource(
+			sourcenotifications.EndpointNotificationSourceType,
+			sourcenotifications.EndpointNotificationSourceType),
+	})
+}
+
+// Extract is a no-op. Pod removal is already handled by CleanUpInactivePods;
+// this exists only to satisfy EndpointExtractor so RegisterDependencies can
+// place the plugin in the extractor map. See RegisterDependencies.
+func (p *dataProducer) Extract(_ context.Context, _ fwkdl.EndpointEvent) error {
+	return nil
 }
 
 // parseServerID splits a "namespace/name" endpoint id back into a ServerID.

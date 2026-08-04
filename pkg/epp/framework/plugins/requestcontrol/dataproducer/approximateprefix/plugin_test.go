@@ -32,6 +32,7 @@ import (
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+	sourcenotifications "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/notifications"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/prefixhash"
 )
 
@@ -1078,4 +1079,47 @@ func TestProduceUsesPeerReplicaState(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, 2, info.(*attrprefix.PrefixCacheMatchInfo).MatchBlocks(),
 		"peer state should surface the prefix the local index never saw")
+}
+
+// The cross-replica publisher discovers contributors by walking the datalayer's
+// extractor map, so implementing CrossReplicaContributor is not enough on its
+// own -- the plugin must also register as an endpoint extractor or its state is
+// never published.
+func TestRegistersAsExtractorWhenSyncEnabled(t *testing.T) {
+	tests := []struct {
+		name         string
+		syncEnabled  bool
+		wantRegister bool
+	}{
+		{name: "sync on registers", syncEnabled: true, wantRegister: true},
+		{name: "sync off stays out of the extractor map", syncEnabled: false, wantRegister: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, err := newDataProducer(context.Background(), ApproxPrefixCachePluginType,
+				config{BlockSizeTokens: 1, SyncCrossReplicaState: tt.syncEnabled}, testHandle())
+			assert.NoError(t, err)
+
+			rec := &recordingRegistrar{}
+			assert.NoError(t, p.RegisterDependencies(rec))
+
+			if !tt.wantRegister {
+				assert.Empty(t, rec.registrations)
+				return
+			}
+			assert.Len(t, rec.registrations, 1)
+			assert.Equal(t, sourcenotifications.EndpointNotificationSourceType, rec.registrations[0].SourceType)
+			assert.Same(t, p, rec.registrations[0].Extractor)
+		})
+	}
+}
+
+type recordingRegistrar struct {
+	registrations []fwkdl.PendingRegistration
+}
+
+func (r *recordingRegistrar) Register(reg fwkdl.PendingRegistration) error {
+	r.registrations = append(r.registrations, reg)
+	return nil
 }
