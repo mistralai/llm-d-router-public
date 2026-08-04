@@ -34,6 +34,7 @@ type indexerInterface interface {
 	RemovePod(server ServerID)
 	Pods() []ServerID
 	PodBlockCounts() map[ServerID]int
+	PodBlocks(server ServerID, limit int) []blockHash
 }
 
 // podSet holds a set of pods that may have a specific prefix hash.
@@ -152,6 +153,15 @@ type config struct {
 	MaxPrefixTokensToMatch int `json:"maxPrefixTokensToMatch"`
 	// Max capacity size of the LRU indexer in number of entries per server (pod).
 	LRUCapacityPerServer int `json:"lruCapacityPerServer"`
+	// SyncCrossReplicaState shares each pod's hot block hashes with peer EPP
+	// replicas, so every replica routes on the union of all routing decisions
+	// rather than only the requests it handled itself. Off by default.
+	SyncCrossReplicaState bool `json:"syncCrossReplicaState"`
+	// CrossReplicaBlocksPerPod caps how many of a pod's most-recently-used block
+	// hashes are published per sync. 0 (the default) publishes the whole LRU,
+	// which is up to LRUCapacityPerServer entries per pod per cycle -- set a cap
+	// if that turns out to be too much traffic for the syncer.
+	CrossReplicaBlocksPerPod int `json:"crossReplicaBlocksPerPod"`
 }
 
 // defaultConfig provides sensible defaults for the prefix cache plugins.

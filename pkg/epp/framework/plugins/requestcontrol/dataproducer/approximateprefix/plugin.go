@@ -18,16 +18,19 @@ package approximateprefix
 
 import (
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -52,10 +55,16 @@ const (
 var minBlockSizeTokens = 64
 
 var (
-	_ requestcontrol.DataProducer = &dataProducer{}
-	_ requestcontrol.PreRequest   = &dataProducer{}
-	_ plugin.StateDumper          = &dataProducer{}
+	_ requestcontrol.DataProducer   = &dataProducer{}
+	_ requestcontrol.PreRequest     = &dataProducer{}
+	_ plugin.StateDumper            = &dataProducer{}
+	_ fwkdl.CrossReplicaContributor = &dataProducer{}
 )
+
+// prefixBlockStateDK keys the peer-replica block-hash view installed on each
+// endpoint. Kept separate from the producer's own PrefixCacheMatchInfo key so
+// the local match stays readable alongside the synced one.
+var prefixBlockStateDK = plugin.NewDataKey("PrefixBlockStateDataKey", ApproxPrefixCachePluginType)
 
 // dataProducer is a plugin that produces data consumed by approx prefix cache aware scheduling.
 type dataProducer struct {
@@ -70,6 +79,94 @@ type dataProducer struct {
 // TypedName returns the type and name of the plugin.
 func (p *dataProducer) TypedName() plugin.TypedName {
 	return p.typedName
+}
+
+// Cross-replica syncers serialize state with gob, which needs the concrete
+// type registered before it can round-trip through the any-typed Set/Get.
+func init() {
+	gob.Register(&PrefixBlockState{})
+}
+
+// PrefixBlockState is one replica's view of the block hashes cached on a pod.
+type PrefixBlockState struct {
+	Hashes []blockHash
+}
+
+func (s *PrefixBlockState) Clone() fwkdl.Cloneable {
+	return &PrefixBlockState{Hashes: append([]blockHash(nil), s.Hashes...)}
+}
+
+// CrossReplicaState publishes each pod's hot block hashes so peer replicas can
+// route on the union of all routing decisions.
+//
+// Without it, an all-active pool splits prefix affinity N ways: a replica only
+// indexes the requests it handled itself, so the same prefix lands on a
+// different pod depending on which replica Envoy picked.
+func (p *dataProducer) CrossReplicaState() fwkdl.CrossReplicaSpec {
+	return fwkdl.CrossReplicaSpec{
+		StateKey:     fwkdl.StateKey("prefixblocks:" + p.typedName.Name),
+		AttributeKey: prefixBlockStateDK.WithNonEmptyProducerName(p.typedName.Name).String(),
+		SyncDisabled: !p.config.SyncCrossReplicaState,
+		Supply: func(endpointID string) func() fwkdl.Cloneable {
+			return func() fwkdl.Cloneable {
+				return &PrefixBlockState{
+					Hashes: p.indexerInst.PodBlocks(parseServerID(endpointID), p.config.CrossReplicaBlocksPerPod),
+				}
+			}
+		},
+		Aggregate: func(values []any) any {
+			seen := make(map[blockHash]struct{})
+			merged := &PrefixBlockState{}
+			for _, v := range values {
+				state, ok := v.(*PrefixBlockState)
+				if !ok || state == nil {
+					continue
+				}
+				for _, h := range state.Hashes {
+					if _, dup := seen[h]; dup {
+						continue
+					}
+					seen[h] = struct{}{}
+					merged.Hashes = append(merged.Hashes, h)
+				}
+			}
+			return merged
+		},
+	}
+}
+
+// parseServerID splits a "namespace/name" endpoint id back into a ServerID.
+// The cross-replica publisher keys state by NamespacedName.String().
+func parseServerID(endpointID string) ServerID {
+	ns, name, found := strings.Cut(endpointID, "/")
+	if !found {
+		return ServerID{Name: endpointID}
+	}
+	return ServerID{Namespace: ns, Name: name}
+}
+
+// longestPrefixIn counts leading blocks of each prompt present in hashes,
+// stopping at the first gap -- the same greedy rule matchLongestPrefix applies
+// to the local index.
+func longestPrefixIn(perPromptHashes [][]blockHash, hashes []blockHash) int {
+	if len(hashes) == 0 {
+		return 0
+	}
+	set := make(map[blockHash]struct{}, len(hashes))
+	for _, h := range hashes {
+		set[h] = struct{}{}
+	}
+
+	matched := 0
+	for _, prompt := range perPromptHashes {
+		for _, h := range prompt {
+			if _, ok := set[h]; !ok {
+				break
+			}
+			matched++
+		}
+	}
+	return matched
 }
 
 const maxDebugDumpPods = 100
@@ -238,8 +335,21 @@ func (p *dataProducer) Produce(ctx context.Context, request *fwksched.InferenceR
 		totalBlocks += len(hashes)
 	}
 
+	crossReplicaKey := prefixBlockStateDK.WithNonEmptyProducerName(p.typedName.Name).String()
 	for _, pod := range pods {
 		matchLen := prefixCacheServers[ServerID(pod.GetMetadata().NamespacedName)]
+
+		// A peer replica may have routed this prefix here without us seeing it.
+		// Its view can only add pods we would otherwise score as cold, so take
+		// whichever match is longer.
+		if raw, ok := pod.Get(crossReplicaKey); ok {
+			if remote, ok := raw.(*PrefixBlockState); ok {
+				if n := longestPrefixIn(perPromptHashes, remote.Hashes); n > matchLen {
+					matchLen = n
+				}
+			}
+		}
+
 		pod.Put(p.dk.String(), attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, blockSize))
 	}
 

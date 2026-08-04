@@ -942,3 +942,140 @@ func TestDumpStateEmpty(t *testing.T) {
 	assert.Equal(t, 0, got.TotalPods)
 	assert.Empty(t, got.Pods)
 }
+
+func TestPodBlocksLimitKeepsMostRecent(t *testing.T) {
+	idx := newIndexer(context.Background(), 10, "test", ApproxPrefixCachePluginType)
+	pod := server{ServerID: ServerID{Name: "pod1"}, NumOfGPUBlocks: 10}
+
+	for i := range 6 {
+		idx.Add([]blockHash{blockHash(i)}, pod)
+	}
+
+	// hashicorp/lru orders Keys() oldest-first, so a limit must keep the tail.
+	got := idx.PodBlocks(pod.ServerID, 2)
+	assert.Equal(t, []blockHash{4, 5}, got)
+
+	assert.Len(t, idx.PodBlocks(pod.ServerID, 0), 6, "non-positive limit returns everything")
+	assert.Nil(t, idx.PodBlocks(ServerID{Name: "unknown"}, 2))
+}
+
+func TestLongestPrefixIn(t *testing.T) {
+	tests := []struct {
+		name     string
+		prompts  [][]blockHash
+		remote   []blockHash
+		expected int
+	}{
+		{
+			name:     "stops at first gap",
+			prompts:  [][]blockHash{{1, 2, 3, 4}},
+			remote:   []blockHash{1, 2, 4}, // 3 missing, so 4 must not count
+			expected: 2,
+		},
+		{
+			name:     "full match",
+			prompts:  [][]blockHash{{1, 2, 3}},
+			remote:   []blockHash{1, 2, 3},
+			expected: 3,
+		},
+		{
+			name:     "sums across prompts",
+			prompts:  [][]blockHash{{1, 2}, {7, 8}},
+			remote:   []blockHash{1, 2, 7, 8},
+			expected: 4,
+		},
+		{
+			name:     "no remote state",
+			prompts:  [][]blockHash{{1, 2}},
+			remote:   nil,
+			expected: 0,
+		},
+		{
+			name:     "first block missing",
+			prompts:  [][]blockHash{{1, 2, 3}},
+			remote:   []blockHash{2, 3},
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, longestPrefixIn(tt.prompts, tt.remote))
+		})
+	}
+}
+
+func TestParseServerID(t *testing.T) {
+	assert.Equal(t, ServerID{Namespace: "ns", Name: "pod1"}, parseServerID("ns/pod1"))
+	assert.Equal(t, ServerID{Name: "pod1"}, parseServerID("pod1"))
+}
+
+func TestCrossReplicaStateAggregateDedupes(t *testing.T) {
+	p, err := newDataProducer(context.Background(), ApproxPrefixCachePluginType,
+		config{BlockSizeTokens: 1, SyncCrossReplicaState: true}, testHandle())
+	assert.NoError(t, err)
+
+	spec := p.CrossReplicaState()
+	assert.False(t, spec.SyncDisabled)
+
+	merged := spec.Aggregate([]any{
+		&PrefixBlockState{Hashes: []blockHash{1, 2, 3}},
+		&PrefixBlockState{Hashes: []blockHash{3, 4}}, // 3 overlaps
+		"not a PrefixBlockState",                     // must be skipped, not panic
+	})
+
+	state, ok := merged.(*PrefixBlockState)
+	assert.True(t, ok)
+	assert.ElementsMatch(t, []blockHash{1, 2, 3, 4}, state.Hashes)
+}
+
+func TestCrossReplicaStateDisabledByDefault(t *testing.T) {
+	p, err := newDataProducer(context.Background(), ApproxPrefixCachePluginType,
+		config{BlockSizeTokens: 1}, testHandle())
+	assert.NoError(t, err)
+	assert.True(t, p.CrossReplicaState().SyncDisabled)
+}
+
+func TestProduceUsesPeerReplicaState(t *testing.T) {
+	disableMinBlockSizeClamp(t)
+	p, err := newDataProducer(context.Background(), ApproxPrefixCachePluginType,
+		config{BlockSizeTokens: 1, MaxPrefixBlocksToMatch: defaultMaxPrefixBlocks,
+			LRUCapacityPerServer: defaultLRUCapacityPerServer, SyncCrossReplicaState: true}, testHandle())
+	assert.NoError(t, err)
+
+	endpoint := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{NamespacedName: k8stypes.NamespacedName{Name: "pod1"}},
+		fwkdl.NewMetrics(), fwkdl.NewAttributes())
+
+	req := &fwksched.InferenceRequest{
+		RequestID:   uuid.NewString(),
+		TargetModel: "test-model",
+		Body:        tokenizedBody([]uint32{1, 2}),
+	}
+
+	// Local index is empty, so without peer state this pod scores 0.
+	assert.NoError(t, p.Produce(context.Background(), req, []fwksched.Endpoint{endpoint}))
+	infoKey := attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(ApproxPrefixCachePluginType).String()
+	info, ok := endpoint.Get(infoKey)
+	assert.True(t, ok)
+	assert.Equal(t, 0, info.(*attrprefix.PrefixCacheMatchInfo).MatchBlocks())
+
+	// Replay the hashes a peer replica would have published for this pod.
+	state, err := plugin.ReadPluginStateKey[*SchedulingContextState](
+		p.PluginState(), req.RequestID, plugin.StateKey(ApproxPrefixCachePluginType))
+	assert.NoError(t, err)
+	endpoint.Put(prefixBlockStateDK.WithNonEmptyProducerName(ApproxPrefixCachePluginType).String(),
+		&PrefixBlockState{Hashes: state.PerPromptHashes[0]})
+
+	req2 := &fwksched.InferenceRequest{
+		RequestID:   uuid.NewString(),
+		TargetModel: "test-model",
+		Body:        tokenizedBody([]uint32{1, 2}),
+	}
+	assert.NoError(t, p.Produce(context.Background(), req2, []fwksched.Endpoint{endpoint}))
+
+	info, ok = endpoint.Get(infoKey)
+	assert.True(t, ok)
+	assert.Equal(t, 2, info.(*attrprefix.PrefixCacheMatchInfo).MatchBlocks(),
+		"peer state should surface the prefix the local index never saw")
+}
