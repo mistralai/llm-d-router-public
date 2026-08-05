@@ -64,6 +64,7 @@ import (
 	attrmodels "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/models"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	attrsession "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/session"
+	crossplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/cross_plugin"
 	discoveryfile "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/discovery/file"
 	extractormetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/extractor/metrics"
 	extmodels "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/extractor/models"
@@ -580,6 +581,10 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(mmcacheaffinity.Type, mmcacheaffinity.Factory)
 	fwkplugin.Register(preciseproducer.PluginType, preciseproducer.PluginFactory)
 	fwkplugin.Register(p2psource.PluginType, p2psource.PluginFactory)
+
+	// Cross-replica syncer plugins
+	fwkplugin.Register(crossplugin.LocalSyncerType, crossplugin.LocalSyncerFactory)
+	fwkplugin.Register(crossplugin.RedisStateStoreType, crossplugin.RedisStateStoreFactory)
 
 	// Flow Control plugins
 	fwkplugin.Register(globalstrict.GlobalStrictFairnessPolicyType, globalstrict.GlobalStrictFairnessPolicyFactory)

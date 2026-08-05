@@ -88,6 +88,10 @@ func NewHTTPDataSource[T any](scheme, path string, skipCertVerification bool,
 
 func (s *HTTPDataSource[T]) TypedName() fwkplugin.TypedName { return s.typedName }
 
+// Interval reports the desired scrape period. Zero means every base tick,
+// which is this source's only behaviour today.
+func (s *HTTPDataSource[T]) Interval() time.Duration { return 0 }
+
 // Poll fetches and parses one tick. Exposed for tests; runtime uses Dispatch.
 func (s *HTTPDataSource[T]) Poll(ctx context.Context, ep fwkdl.Endpoint) (T, error) {
 	target := s.getEndpoint(ep.GetMetadata())
