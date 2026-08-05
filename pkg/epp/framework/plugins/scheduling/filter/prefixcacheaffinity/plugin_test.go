@@ -291,3 +291,145 @@ func TestFactory_DefaultsToPrefillThroughput(t *testing.T) {
 	assert.Error(t, err, "default throughput source needs a non-zero peakPrefillThroughput")
 	assert.Contains(t, err.Error(), "peakPrefillThroughput must be > 0")
 }
+
+// --- break-even (matchedTokens) penalty mode ---------------------------------
+//
+// makeEndpoint builds PrefixCacheMatchInfo(match, 100, 16), so an endpoint with
+// match=90 holds 90*16 = 1440 tokens of the request. With
+// PeakPrefillThroughput=1000, in-flight tokens map to TTFT as tokens ms.
+
+func matchedTokensPlugin(maxPenaltyMs float64) *Plugin {
+	return newTestPlugin(Config{
+		AffinityThreshold:     0.80,
+		MaxTTFTPenaltyMs:      maxPenaltyMs,
+		TTFTSource:            TTFTSourcePrefillThroughput,
+		PeakPrefillThroughput: 1000,
+		PenaltyMode:           PenaltyModeMatchedTokens,
+	})
+}
+
+func TestBreakEven_KeepsPinWhenGapBelowMatchedTokens(t *testing.T) {
+	p := matchedTokensPlugin(18000)
+	// sticky holds 1440 tokens; it is only 1000 tokens more loaded than the
+	// best alternative, so the cache still pays for itself.
+	eps := []fwksched.Endpoint{
+		makeEndpoint("sticky", 90, -1, 2000),
+		makeEndpoint("free", 10, -1, 1000),
+	}
+	got := p.Filter(context.Background(), nil, eps)
+	assert.Len(t, got, 1, "pin should hold: gap 1000 < matched 1440")
+}
+
+func TestBreakEven_ReleasesPinWhenGapExceedsMatchedTokens(t *testing.T) {
+	p := matchedTokensPlugin(18000)
+	// Same cache value, but the sticky endpoint is now 4000 tokens more
+	// loaded, which outweighs the 1440 tokens of prefill it would save.
+	eps := []fwksched.Endpoint{
+		makeEndpoint("sticky", 90, -1, 5000),
+		makeEndpoint("free", 10, -1, 1000),
+	}
+	got := p.Filter(context.Background(), nil, eps)
+	assert.Len(t, got, 2, "pin should break: gap 4000 > matched 1440")
+}
+
+func TestBreakEven_ScalesWithCacheValue(t *testing.T) {
+	// The point of the mode: the bar moves with how much the request has
+	// cached. Same 4000-token gap, larger prefix -> pin now worth keeping.
+	p := matchedTokensPlugin(18000)
+	eps := []fwksched.Endpoint{
+		makeEndpoint("sticky", 100, -1, 5000), // 100*16 = 1600... still < 4000
+		makeEndpoint("free", 10, -1, 1000),
+	}
+	assert.Len(t, p.Filter(context.Background(), nil, eps), 2,
+		"1600 matched tokens does not cover a 4000 gap")
+
+	// A bigger block size is what makes a prefix genuinely expensive to lose.
+	big := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{NamespacedName: types.NamespacedName{Name: "sticky-big", Namespace: "default"}},
+		&fwkdl.Metrics{}, fwkdl.NewAttributes())
+	big.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(), attrprefix.NewPrefixCacheMatchInfo(90, 100, 128))
+	big.Put(attrconcurrency.InFlightLoadDataKey.String(), &attrconcurrency.InFlightLoad{Tokens: 5000})
+	eps = []fwksched.Endpoint{big, makeEndpoint("free", 10, -1, 1000)}
+	assert.Len(t, p.Filter(context.Background(), nil, eps), 1,
+		"90*128 = 11520 matched tokens covers a 4000 gap")
+}
+
+func TestBreakEven_CeilingStillApplies(t *testing.T) {
+	// A large cached prefix would justify an unbounded queue; MaxTTFTPenaltyMs
+	// caps it. gap 4000 tokens = 4000ms at PPT 1000, over the 100ms ceiling.
+	p := matchedTokensPlugin(100)
+	big := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{NamespacedName: types.NamespacedName{Name: "sticky", Namespace: "default"}},
+		&fwkdl.Metrics{}, fwkdl.NewAttributes())
+	big.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(), attrprefix.NewPrefixCacheMatchInfo(90, 100, 1024))
+	big.Put(attrconcurrency.InFlightLoadDataKey.String(), &attrconcurrency.InFlightLoad{Tokens: 5000})
+	eps := []fwksched.Endpoint{big, makeEndpoint("free", 10, -1, 1000)}
+	assert.Len(t, p.Filter(context.Background(), nil, eps), 2,
+		"ceiling should fire even though the prefix is worth more than the gap")
+}
+
+func TestBreakEven_NoMatchInfoIsNoOp(t *testing.T) {
+	// A sticky endpoint with no readable match attribute yields 0 matched
+	// tokens. That must not be read as "cache worth nothing, always release".
+	p := matchedTokensPlugin(18000)
+	sticky := fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{NamespacedName: types.NamespacedName{Name: "sticky", Namespace: "default"}},
+		&fwkdl.Metrics{}, fwkdl.NewAttributes())
+	sticky.Put(attrprefix.PrefixCacheMatchInfoDataKey.String(), attrprefix.NewPrefixCacheMatchInfo(90, 100, 0))
+	sticky.Put(attrconcurrency.InFlightLoadDataKey.String(), &attrconcurrency.InFlightLoad{Tokens: 9000})
+	eps := []fwksched.Endpoint{sticky, makeEndpoint("free", 10, -1, 1000)}
+	assert.Len(t, p.Filter(context.Background(), nil, eps), 1,
+		"missing block size should leave the pin alone, not release it")
+}
+
+func TestStaticModeUnchanged(t *testing.T) {
+	// Regression: the default must behave exactly as before.
+	p := newTestPlugin(Config{
+		AffinityThreshold:     0.80,
+		MaxTTFTPenaltyMs:      1000,
+		TTFTSource:            TTFTSourcePrefillThroughput,
+		PeakPrefillThroughput: 1000,
+		PenaltyMode:           PenaltyModeStatic,
+	})
+	// gap 4000 tokens = 4000ms > 1000ms ceiling -> release.
+	eps := []fwksched.Endpoint{
+		makeEndpoint("sticky", 90, -1, 5000),
+		makeEndpoint("free", 10, -1, 1000),
+	}
+	assert.Len(t, p.Filter(context.Background(), nil, eps), 2)
+
+	// Under the ceiling -> hold, regardless of matched tokens.
+	eps = []fwksched.Endpoint{
+		makeEndpoint("sticky", 90, -1, 1500),
+		makeEndpoint("free", 10, -1, 1000),
+	}
+	assert.Len(t, p.Filter(context.Background(), nil, eps), 1)
+}
+
+func TestFactory_DefaultPenaltyModeIsStatic(t *testing.T) {
+	p, err := Factory("test", nil, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, PenaltyModeStatic, p.(*Plugin).config.PenaltyMode)
+}
+
+func TestConfigValidate_MatchedTokensRejectsLatencyPredictor(t *testing.T) {
+	c := Config{
+		AffinityThreshold: 0.80,
+		MaxTTFTPenaltyMs:  18000,
+		TTFTSource:        TTFTSourceLatencyPredictor,
+		PenaltyMode:       PenaltyModeMatchedTokens,
+	}
+	err := c.validate()
+	assert.Error(t, err, "ms and tokens are not commensurable")
+	assert.Contains(t, err.Error(), "requires ttftSource")
+}
+
+func TestConfigValidate_RejectsUnknownPenaltyMode(t *testing.T) {
+	c := Config{
+		AffinityThreshold:     0.80,
+		TTFTSource:            TTFTSourcePrefillThroughput,
+		PeakPrefillThroughput: 1000,
+		PenaltyMode:           PenaltyMode("nonsense"),
+	}
+	assert.Error(t, c.validate())
+}

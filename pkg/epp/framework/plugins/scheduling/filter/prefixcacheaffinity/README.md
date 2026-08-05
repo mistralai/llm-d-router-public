@@ -76,6 +76,29 @@ Can be instantiated multiple times with different thresholds (e.g., 0.99 for glo
 | `maxTTFTPenaltyMs` | `float64` | No | `18000` | Max TTFT penalty (ms) before breaking stickiness. 0 = always stick |
 | `ttftSource` | `string` | No | `prefillThroughput` | TTFT source for the load gate: `prefillThroughput` or `latencyPredictor` |
 | `peakPrefillThroughput` | `float64` | No | `15928` | Peak prefill throughput (tokens/sec), used to estimate TTFT when `ttftSource` is `prefillThroughput` |
+| `penaltyMode` | `string` | No | `static` | What the load gate compares against: `static` or `matchedTokens` |
+
+### `penaltyMode: matchedTokens`
+
+`static` requires a per-deployment constant, and the correct value moves with prompt
+length. `matchedTokens` derives the bar from the request instead: staying costs the
+extra queued work, leaving costs re-prefilling what the sticky endpoint already holds.
+
+```
+release if  inFlightTokens(bestSticky) - inFlightTokens(bestNonSticky) > matchedTokens(bestSticky)
+where       matchedTokens = MatchBlocks * BlockSizeTokens
+```
+
+Both sides are token counts read from `PrefixCacheMatchInfo` and `InFlightLoad`, which
+the filter already consumes, so no throughput constant enters the decision.
+`maxTTFTPenaltyMs` still applies as an absolute ceiling when non-zero, bounding the
+worst case for a request whose cached prefix is large enough to justify an arbitrarily
+long queue.
+
+Requires `ttftSource: prefillThroughput`; the predictor path returns milliseconds with
+no token interpretation, so that combination is rejected at startup. An endpoint with
+no readable match attribute yields zero matched tokens and the break-even test is
+skipped, rather than releasing on a missing signal.
 
 The `peakPrefillThroughput` default of `15928` tokens/sec is calibrated for Qwen 32B on
 2x H100 80GB (TP=2) with vLLM 0.19, measured as the prefill throughput of a single
