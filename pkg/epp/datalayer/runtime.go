@@ -57,6 +57,8 @@ type Runtime struct {
 	syncer       fwkdl.CrossReplicaSyncer
 	syncInterval time.Duration
 
+	crossReplicaPub *crossReplicaPublisher
+
 	pendingMu            sync.Mutex
 	pendingRegistrations []fwkdl.PendingRegistration // code-registered (source-type, extractor) pairs, resolved by Configure()
 
@@ -244,17 +246,11 @@ func (r *Runtime) Configure(cfg *Config, logger logr.Logger) error {
 		markBound(srcName, extType)
 	}
 
-	// Register the cross-replica publisher as a polling source so the datalayer
-	// drives it per endpoint at its own interval, like any other dispatcher.
-	if pub := newCrossReplicaPublisher(r.syncer, r.extractors, r.syncInterval); pub != nil {
-		period, err := periodTicks(pub.Interval(), r.pollingInterval)
-		if err != nil {
-			return fmt.Errorf("cross-replica publisher: %w", err)
-		}
-		if err := r.dispatchers.Register(newIntervalDispatcher(pub, period)); err != nil {
-			return fmt.Errorf("register cross-replica publisher: %w", err)
-		}
-	}
+	// Build the cross-replica publisher (if a syncer is configured and at least
+	// one extractor opts in). Stored on the runtime and injected directly into
+	// each endpoint's collector — not registered as a polling data source,
+	// because it is core runtime infrastructure, not a user-configurable plugin.
+	r.crossReplicaPub = newCrossReplicaPublisher(r.syncer, r.extractors, r.syncInterval)
 
 	logger.Info("Datalayer runtime configured",
 		"pollers", r.dispatchers.Count(),
@@ -425,12 +421,16 @@ func (r *Runtime) NewEndpoint(ctx context.Context, endpointMetadata *fwkdl.Endpo
 
 	endpoint := fwkdl.NewEndpoint(endpointMetadata, nil)
 
-	dispatchers := make([]fwkdl.PollingDispatcher, 0, r.dispatchers.Count())
+	dispatchers := make([]fwkdl.PollingDispatcher, 0, r.dispatchers.Count()+1)
 	for _, d := range r.dispatchers.Dispatchers() {
 		if id, ok := d.(*intervalDispatcher); ok {
 			d = newIntervalDispatcher(id.PollingDispatcher, id.period)
 		}
 		dispatchers = append(dispatchers, d)
+	}
+	if r.crossReplicaPub != nil {
+		period, _ := periodTicks(r.crossReplicaPub.Interval(), r.pollingInterval)
+		dispatchers = append(dispatchers, newIntervalDispatcher(r.crossReplicaPub, period))
 	}
 	if len(dispatchers) == 0 {
 		logger.Info("No polling sources configured, creating endpoint without collector")

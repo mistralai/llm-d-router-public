@@ -243,13 +243,14 @@ type DataLayerConfig struct {
 	// +optional
 	// CrossReplicaSyncerPluginRef names the plugin instance to use as the cross-EPP
 	// cross-replica syncer. The reference is to the name of an entry in the
-	// top-level Plugins section. If omitted, no cross-replica syncer is used
-	// and plugins that read cross-replica state fall back to local data.
+	// top-level Plugins section. No default is set: when omitted, no cross-replica
+	// syncing occurs and plugins that read cross-replica state fall back to
+	// local-only data.
 	CrossReplicaSyncerPluginRef string `json:"crossReplicaSyncerPluginRef,omitempty"`
 	// +optional
 	// CrossReplicaSyncInterval is the cadence at which each replica publishes
 	// its local per-endpoint state to the cross-replica syncer. It is rounded
-	// to a multiple of the datalayer base tick. If omitted, a default is used.
+	// to a multiple of the datalayer base tick. Defaults to 200ms when omitted.
 	CrossReplicaSyncInterval *metav1.Duration `json:"crossReplicaSyncInterval,omitempty"`
 }
 
