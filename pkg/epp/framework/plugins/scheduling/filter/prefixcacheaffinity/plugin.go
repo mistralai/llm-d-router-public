@@ -58,6 +58,22 @@ const (
 	TTFTSourcePrefillThroughput TTFTSource = "prefillThroughput"
 )
 
+// PenaltyMode selects what the load gate compares the sticky-vs-non-sticky
+// penalty against.
+type PenaltyMode string
+
+const (
+	// PenaltyModeStatic compares against the fixed MaxTTFTPenaltyMs. Historical
+	// behaviour, and the default.
+	PenaltyModeStatic PenaltyMode = "static"
+	// PenaltyModeMatchedTokens compares the in-flight token gap against the
+	// tokens the best sticky endpoint already holds for this request -- the
+	// prefill that breaking the pin would forfeit. Requires
+	// TTFTSourcePrefillThroughput. MaxTTFTPenaltyMs still applies as an
+	// absolute ceiling when non-zero.
+	PenaltyModeMatchedTokens PenaltyMode = "matchedTokens"
+)
+
 type Config struct {
 	// AffinityThreshold is the prefix cache score threshold. Endpoints with
 	// score >= this value are considered "sticky" (prompt is cached). Default: 0.80.
@@ -70,8 +86,15 @@ type Config struct {
 	// MaxTTFTPenaltyMs is the max TTFT penalty (ms) before breaking stickiness.
 	// If the best sticky endpoint's TTFT exceeds the best non-sticky endpoint's
 	// TTFT by more than this value, all endpoints are kept. Set to 0 to always
-	// stick. Default: 18000.
+	// stick. Under PenaltyModeMatchedTokens this becomes an absolute ceiling
+	// rather than the primary test. Default: 18000.
 	MaxTTFTPenaltyMs float64 `json:"maxTTFTPenaltyMs,omitempty"`
+
+	// PenaltyMode selects what the load gate compares against. The static
+	// default needs a per-deployment constant that goes stale as prompt length
+	// moves; matchedTokens derives the bar from the request itself. Default:
+	// static.
+	PenaltyMode PenaltyMode `json:"penaltyMode,omitempty"`
 
 	// TTFTSource selects where the load gate reads per-endpoint TTFT from.
 	// TTFTSourcePrefillThroughput (default) estimates it from in-flight tokens and
@@ -95,6 +118,7 @@ var DefaultConfig = Config{
 	ExplorationProbability: 0,
 	MaxTTFTPenaltyMs:       18000,
 	TTFTSource:             TTFTSourcePrefillThroughput,
+	PenaltyMode:            PenaltyModeStatic,
 
 	// Calibrated for Qwen 32B on 2x H100 80GB (TP=2), vLLM 0.19; see README.
 	PeakPrefillThroughput: 15928,
@@ -148,6 +172,17 @@ func (c *Config) validate() error {
 	if !c.usesLatencyPredictor() && c.MaxTTFTPenaltyMs > 0 && c.PeakPrefillThroughput == 0 {
 		return errors.New("peakPrefillThroughput must be > 0 when ttftSource is prefillThroughput")
 	}
+	switch c.PenaltyMode {
+	case PenaltyModeStatic, PenaltyModeMatchedTokens:
+	default:
+		return fmt.Errorf("penaltyMode must be %q or %q, got %q", PenaltyModeStatic, PenaltyModeMatchedTokens, c.PenaltyMode)
+	}
+	// matchedTokens compares two token counts. The predictor path yields
+	// milliseconds from a model with no token interpretation, so the two are
+	// not commensurable; reject rather than silently compare unlike units.
+	if c.PenaltyMode == PenaltyModeMatchedTokens && c.usesLatencyPredictor() {
+		return fmt.Errorf("penaltyMode %q requires ttftSource %q", PenaltyModeMatchedTokens, TTFTSourcePrefillThroughput)
+	}
 	return nil
 }
 
@@ -193,15 +228,35 @@ func (p *Plugin) Filter(ctx context.Context, _ *fwksched.InferenceRequest, endpo
 		return endpoints
 	}
 
-	// TTFT load gate: break stickiness if sticky endpoints are too slow.
-	if p.config.MaxTTFTPenaltyMs > 0 && len(nonSticky) > 0 {
-		bestStickyTTFT := p.bestTTFT(sticky)
-		bestNonStickyTTFT := p.bestTTFT(nonSticky)
-		if bestStickyTTFT-bestNonStickyTTFT > p.config.MaxTTFTPenaltyMs {
+	// Load gate: break stickiness if the sticky endpoints are too slow.
+	if len(nonSticky) > 0 {
+		bestSticky, bestStickyTTFT := p.bestByTTFT(sticky)
+		bestNonSticky, bestNonStickyTTFT := p.bestByTTFT(nonSticky)
+		penalty := bestStickyTTFT - bestNonStickyTTFT
+
+		// Absolute ceiling. Under matchedTokens this still bounds the worst
+		// case: a request with an enormous cached prefix would otherwise
+		// justify an arbitrarily long queue.
+		if p.config.MaxTTFTPenaltyMs > 0 && penalty > p.config.MaxTTFTPenaltyMs {
 			logger.V(logutil.DEBUG).Info("PrefixCacheAffinityFilter: TTFT load gate broken",
 				"bestStickyTTFT", bestStickyTTFT, "bestNonStickyTTFT", bestNonStickyTTFT,
-				"penalty", bestStickyTTFT-bestNonStickyTTFT, "maxPenalty", p.config.MaxTTFTPenaltyMs)
+				"penalty", penalty, "maxPenalty", p.config.MaxTTFTPenaltyMs)
 			return endpoints
+		}
+
+		// Break-even test: staying costs the extra queued work, leaving costs
+		// re-prefilling what the sticky endpoint already holds. Both are token
+		// counts, so no throughput constant is involved.
+		if p.config.PenaltyMode == PenaltyModeMatchedTokens {
+			matched := p.matchedTokens(bestSticky)
+			if matched > 0 {
+				gap := p.inFlightTokens(bestSticky) - p.inFlightTokens(bestNonSticky)
+				if gap > matched {
+					logger.V(logutil.DEBUG).Info("PrefixCacheAffinityFilter: break-even gate broken",
+						"tokenGap", gap, "matchedTokens", matched)
+					return endpoints
+				}
+			}
 		}
 	}
 
@@ -239,13 +294,42 @@ func (p *Plugin) prefixCacheScore(ep fwksched.Endpoint) float64 {
 
 // bestTTFT returns the lowest per-endpoint TTFT (ms) across endpoints.
 func (p *Plugin) bestTTFT(endpoints []fwksched.Endpoint) float64 {
+	_, ttft := p.bestByTTFT(endpoints)
+	return ttft
+}
+
+// bestByTTFT returns the endpoint with the lowest TTFT and that TTFT. The
+// endpoint itself is needed by the break-even gate, which reads per-endpoint
+// matched tokens rather than a scalar. Returns (nil, MaxFloat64) for an empty
+// set.
+func (p *Plugin) bestByTTFT(endpoints []fwksched.Endpoint) (fwksched.Endpoint, float64) {
+	var bestEP fwksched.Endpoint
 	best := math.MaxFloat64
 	for _, ep := range endpoints {
 		if ttft := p.endpointTTFT(ep); ttft < best {
-			best = ttft
+			best, bestEP = ttft, ep
 		}
 	}
-	return best
+	return bestEP, best
+}
+
+// matchedTokens returns how many tokens of this request the endpoint already
+// holds: the prefill that breaking the pin would forfeit. Zero when the match
+// attribute is absent or carries no block size, which makes the break-even
+// gate a no-op rather than releasing on a missing signal.
+func (p *Plugin) matchedTokens(ep fwksched.Endpoint) int64 {
+	if ep == nil {
+		return 0
+	}
+	raw, ok := ep.Get(p.prefixMatchDataKey.String())
+	if !ok {
+		return 0
+	}
+	info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
+	if !ok || info == nil {
+		return 0
+	}
+	return int64(info.MatchBlocks()) * int64(info.BlockSizeTokens())
 }
 
 // endpointTTFT returns the predicted TTFT (ms) for an endpoint, either from the
