@@ -506,7 +506,7 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 	r.draining = &atomic.Bool{}
 	r.serverRunner = serverRunner
 	r.healthGRPCPort = opts.GRPCHealthPort
-	r.healthGRPCServer = newHealthGRPCServer(ctrl.Log.WithName("health"), ds, isLeader, r.draining, opts.EnableLeaderElection, supporters)
+	r.healthGRPCServer = newHealthGRPCServer(ctrl.Log.WithName("health"), ds, isLeader, r.draining, opts.EnableLeaderElection, supporters, pluginReadinessCheckers(r.PluginHandle.GetAllPlugins()))
 	return mgr, ds, nil
 }
 
@@ -830,7 +830,7 @@ func (r *Runner) setupMetricsCollection(opts *runserver.Options) datalayer.Endpo
 
 // newHealthGRPCServer builds the gRPC health server. draining may be nil (graceful
 // drain disabled); when non-nil and set, non-liveness checks report NOT_SERVING.
-func newHealthGRPCServer(logger logr.Logger, ds datastore.Datastore, isLeader, draining *atomic.Bool, leaderElectionEnabled bool, supporters []appProtocolSupporter) *grpc.Server {
+func newHealthGRPCServer(logger logr.Logger, ds datastore.Datastore, isLeader, draining *atomic.Bool, leaderElectionEnabled bool, supporters []appProtocolSupporter, readinessCheckers []fwkplugin.ReadinessChecker) *grpc.Server {
 	srv := grpc.NewServer()
 	healthPb.RegisterHealthServer(srv, &healthServer{
 		logger:                logger,
@@ -838,9 +838,20 @@ func newHealthGRPCServer(logger logr.Logger, ds datastore.Datastore, isLeader, d
 		isLeader:              isLeader,
 		leaderElectionEnabled: leaderElectionEnabled,
 		supporters:            supporters,
+		readinessCheckers:     readinessCheckers,
 		draining:              draining,
 	})
 	return srv
+}
+
+func pluginReadinessCheckers(plugins []fwkplugin.Plugin) []fwkplugin.ReadinessChecker {
+	checkers := make([]fwkplugin.ReadinessChecker, 0)
+	for _, p := range plugins {
+		if checker, ok := p.(fwkplugin.ReadinessChecker); ok {
+			checkers = append(checkers, checker)
+		}
+	}
+	return checkers
 }
 
 func extractDeploymentName(podName string) (string, error) {
@@ -1084,6 +1095,7 @@ func (r *Runner) runWithFileDiscovery(ctx context.Context, opts *runserver.Optio
 		isLeader:              isLeader,
 		leaderElectionEnabled: false,
 		supporters:            ps,
+		readinessCheckers:     pluginReadinessCheckers(r.PluginHandle.GetAllPlugins()),
 	})
 
 	g := newRunnableGroup()
