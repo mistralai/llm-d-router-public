@@ -315,6 +315,7 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	}
 	// Prepare per request data by running DataProducer plugins.
 	err = d.runDataProducerPlugins(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods)
+	producersOK := err == nil
 	if err != nil {
 		// Don't fail the request if DataProducer plugins fail.
 		logger.Error(err, "failed to prepare per request data")
@@ -368,7 +369,27 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	if err := d.repackage(ctx, reqCtx, inferenceRequestBody); err != nil {
 		return reqCtx, err
 	}
+	// Skipped when a DataProducer failed: on timeout its goroutine is abandoned
+	// mid-run and may still be reading these fields, so nil-ing them would race.
+	if producersOK {
+		releaseRequestBody(inferenceRequestBody)
+	}
 	return reqCtx, nil
+}
+
+// releaseRequestBody nils heavy fields so GC can collect them during the long
+// inference wait instead of retaining them via SchedulingRequest.Body. Only
+// Stream, Model and MaxOutputTokens are read past this point.
+func releaseRequestBody(body *fwkrh.InferenceRequestBody) {
+	body.Payload = nil
+	body.ChatCompletions = nil
+	body.Completions = nil
+	body.Messages = nil
+	body.Responses = nil
+	body.Conversations = nil
+	body.Embeddings = nil
+	body.Generate = nil
+	body.TokenizedPrompt = nil
 }
 
 func (d *Director) modelRewriteIfNeeded(ctx context.Context, reqCtx *handlers.RequestContext, inferenceRequestBody *fwkrh.InferenceRequestBody) error {
