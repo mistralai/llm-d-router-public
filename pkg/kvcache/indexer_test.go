@@ -46,6 +46,8 @@ func (m *mockTokenProcessor) BlockSize() int {
 	return 16
 }
 
+func (m *mockTokenProcessor) SetBlockSize(_ int) {}
+
 const (
 	testModel = "test-model"
 	testPodA  = "pod-a"

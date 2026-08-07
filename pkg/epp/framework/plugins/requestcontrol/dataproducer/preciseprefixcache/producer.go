@@ -108,6 +108,7 @@ type Producer struct {
 	speculativeTTL     time.Duration
 	speculativeEnabled bool
 
+	tokenProcessor  kvblock.TokenProcessor
 	blockSizeTokens int
 
 	// Plugin-lifetime, not request-scoped: SubscriberManager binds each
@@ -213,6 +214,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		speculativeCache:   speculativeCache,
 		speculativeTTL:     speculativeTTL,
 		speculativeEnabled: config.SpeculativeIndexing,
+		tokenProcessor:     tokenProcessor,
 		blockSizeTokens:    tokenProcessor.BlockSize(),
 		subscriberCtx:      ctx,
 	}, nil
@@ -287,6 +289,20 @@ func sortedCapped(in []string, limit int) []string {
 	return out
 }
 
+// autoTuneBlockSize reads CacheBlockSize from endpoint metrics and updates
+// the producer and its shared token processor when the metric differs.
+func (p *Producer) autoTuneBlockSize(endpoints []scheduling.Endpoint) {
+	if len(endpoints) == 0 {
+		return
+	}
+	m := endpoints[0].GetMetrics()
+	if m == nil || m.CacheBlockSize <= 0 || m.CacheBlockSize == p.blockSizeTokens {
+		return
+	}
+	p.blockSizeTokens = m.CacheBlockSize
+	p.tokenProcessor.SetBlockSize(m.CacheBlockSize)
+}
+
 // Produces declares the PrefixCacheMatchInfoDataKey published per endpoint,
 // name-bound to this producer instance.
 func (p *Producer) Produces() map[plugin.DataKey]any {
@@ -323,6 +339,8 @@ func (p *Producer) Produce(ctx context.Context,
 			span.SetAttributes(attribute.String("gen_ai.request.id", request.RequestID))
 		}
 	}
+
+	p.autoTuneBlockSize(endpoints)
 
 	perPromptKeys, mmBlockIndices, err := computeBlockKeys(ctx, p.kvCacheIndexer, request, p.blockSizeTokens)
 	if err != nil {
