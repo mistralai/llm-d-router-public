@@ -182,6 +182,16 @@ type PodEntry struct {
 	HasGroup bool
 	// GroupIdx identifies the vLLM KV cache group for HMA events.
 	GroupIdx GroupID
+	// DataParallelRank is the data-parallel rank that announced the block, or
+	// nil when the engine is not running data-parallel. Ranks sharing a pod
+	// hold independent KV caches, so the rank is part of the entry's identity.
+	//
+	// This is a pointer with omitempty so a non-DP entry marshals exactly as it
+	// did before the field existed. RedisIndex uses the JSON encoding as a hash
+	// field name (see encodeRedisPodField), so any change to the non-DP
+	// encoding would strand entries written by other replicas during a rolling
+	// upgrade.
+	DataParallelRank *int `json:",omitempty"`
 }
 
 // String returns a string representation of the PodEntry.
@@ -192,6 +202,9 @@ func (e *PodEntry) String() string {
 	}
 	if e.HasGroup {
 		suffix += fmt.Sprintf("[group=%d]", e.GroupIdx)
+	}
+	if e.DataParallelRank != nil {
+		suffix += fmt.Sprintf("[dp=%d]", *e.DataParallelRank)
 	}
 	return fmt.Sprintf("%s@%s%s", e.PodIdentifier, e.DeviceTier, suffix)
 }
