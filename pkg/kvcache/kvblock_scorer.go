@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 )
 
@@ -50,8 +51,12 @@ func DefaultKVBlockScorerConfig() *KVBlockScorerConfig {
 type KVBlockScorer interface {
 	// Strategy returns the scoring strategy type.
 	Strategy() KVScoringStrategy
-	// Score scores the blocks based on the scoring strategy.
-	// It returns a map of pod names to their scores.
+	// Score scores the blocks based on the scoring strategy and returns a map
+	// of scoring key to score. A key is a pod identifier, suffixed with
+	// "@dp<rank>" when the entry came from a data-parallel engine, since ranks
+	// sharing a pod cache independently and are scored independently. Callers
+	// that address pods rather than ranks must run the result through
+	// CollapseDPScoresToPods first.
 	Score(ctx context.Context, keys []kvblock.BlockHash,
 		keyToPods map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error)
 }
@@ -86,10 +91,6 @@ func (s *LongestPrefixScorer) Strategy() KVScoringStrategy {
 	return LongestPrefixMatch
 }
 
-// noDataParallelRank stands in for an entry with no data-parallel rank so the
-// scoring identity can stay a comparable struct. Real ranks are non-negative.
-const noDataParallelRank = -1
-
 // podRank is the identity a consecutive prefix chain is tracked against.
 //
 // Data-parallel ranks sharing a pod hold independent KV caches, so the chain
@@ -104,7 +105,7 @@ type podRank struct {
 
 // entryPodRank returns the scoring identity of an index entry.
 func entryPodRank(entry kvblock.PodEntry) podRank {
-	rank := noDataParallelRank
+	rank := routing.NoDataParallelRank
 	if entry.DataParallelRank != nil {
 		rank = *entry.DataParallelRank
 	}
@@ -176,17 +177,46 @@ func (s *LongestPrefixScorer) Score(
 		}
 	}
 
-	// Collapse to a pod-level score. Callers address endpoints by "ip:port"
-	// (see the precise-prefix-cache producer), so the returned key must stay a
-	// bare pod identifier: encoding the rank into it would make every lookup
-	// miss and silently drop the deployment back to load-only routing. A pod's
-	// score is its best rank's, since the request is served by one rank.
-	podScores := make(map[string]float64, len(rankScores))
+	// Emit one score per (pod, DP rank), with the rank encoded in the key so
+	// callers that steer to a specific rank can recover it. Callers that
+	// address whole pods must collapse the keys first -- see
+	// CollapseDPScoresToPods.
+	scores := make(map[string]float64, len(rankScores))
 	for pr, score := range rankScores {
-		if cur, exists := podScores[pr.podIdentifier]; !exists || score > cur {
-			podScores[pr.podIdentifier] = score
+		key, err := routing.BuildDPScoringKey(pr.podIdentifier, pr.dataParallelRank)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build scoring key for pod %q: %w", pr.podIdentifier, err)
 		}
+		scores[key] = score
 	}
 
-	return podScores, nil
+	return scores, nil
+}
+
+// CollapseDPScoresToPods reduces rank-qualified scores from KVBlockScorer.Score
+// to one score per pod, keeping each pod's best rank and reporting which rank
+// that was. Pods with no data-parallel rank are absent from winningRanks.
+//
+// Every consumer that addresses pods rather than ranks must call this. A raw
+// "<pod>@dp<rank>" key will not match a plain "ip:port" endpoint address, and
+// the lookup miss is silent: the endpoint simply scores zero and the request
+// falls back to load-only routing with nothing logged.
+func CollapseDPScoresToPods(scores map[string]float64) (podScores map[string]float64, winningRanks map[string]int) {
+	podScores = make(map[string]float64, len(scores))
+	winningRanks = make(map[string]int)
+
+	for key, score := range scores {
+		podIdentifier, rank := routing.ParseDPScoringKey(key)
+		if cur, exists := podScores[podIdentifier]; exists && score <= cur {
+			continue
+		}
+		podScores[podIdentifier] = score
+		if rank == routing.NoDataParallelRank {
+			delete(winningRanks, podIdentifier)
+			continue
+		}
+		winningRanks[podIdentifier] = rank
+	}
+
+	return podScores, winningRanks
 }
