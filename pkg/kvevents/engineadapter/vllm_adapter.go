@@ -79,8 +79,9 @@ func (v *VLLMAdapter) ParseMessage(msg *kvevents.RawMessage) (string, string, kv
 	}
 
 	batch := kvevents.EventBatch{
-		Timestamp: vllmBatch.TS,
-		Events:    genericEvents,
+		Timestamp:        vllmBatch.TS,
+		Events:           genericEvents,
+		DataParallelRank: vllmBatch.DataParallelRank,
 	}
 
 	return podID, modelName, batch, nil

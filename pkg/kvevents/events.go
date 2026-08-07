@@ -52,6 +52,11 @@ type GenericEvent interface {
 type EventBatch struct {
 	Timestamp float64
 	Events    []GenericEvent
+	// DataParallelRank is the data-parallel rank of the engine that emitted the
+	// batch, or nil when the engine is not running data-parallel. Engines that
+	// share one pod across several DP ranks announce blocks independently per
+	// rank, so the rank is part of the block's identity.
+	DataParallelRank *int
 }
 
 // RawMessage holds the raw transport-level data from a received pub/sub message.
