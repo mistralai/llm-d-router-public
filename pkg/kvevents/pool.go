@@ -372,13 +372,13 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			deviceTier := normalizeDeviceTier(ev.DeviceTier)
 
 			// Scope for reference-counting this store against duplicate removes.
-			// Mirrors the index eviction identity (pod, tier, group); DP rank is
-			// the sentinel until PR #370 makes the index DP-aware.
+			// Mirrors the index eviction identity (pod, tier, group, DP rank) —
+			// keep the two in lockstep, see noDataParallelRank.
 			storeScope := blockScope{
 				podIdentifier:    podIdentifier,
 				deviceTier:       deviceTier,
 				groupIdx:         groupIdxOrNoGroup(ev.GroupIdx),
-				dataParallelRank: noDataParallelRank,
+				dataParallelRank: dataParallelRankOrNone(batch.DataParallelRank),
 			}
 
 			// Use LoRA name as model identifier if available, otherwise fall back to base model name.
@@ -388,7 +388,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			}
 
 			// Create PodEntry for this specific event's device tier.
-			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+			podEntries := []kvblock.PodEntry{{
+				PodIdentifier:    podIdentifier,
+				DeviceTier:       deviceTier,
+				DataParallelRank: batch.DataParallelRank,
+			}}
 			if ev.GroupIdx != nil {
 				g := kvblock.GroupID(*ev.GroupIdx)
 				p.groupCatalog.Learn(podIdentifier, g, kvblock.GroupMetadata{
@@ -496,7 +500,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			deviceTier := normalizeDeviceTier(ev.DeviceTier)
 
 			// Create PodEntry for this specific event's device tier.
-			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+			podEntries := []kvblock.PodEntry{{
+				PodIdentifier:    podIdentifier,
+				DeviceTier:       deviceTier,
+				DataParallelRank: batch.DataParallelRank,
+			}}
 			if ev.GroupIdx != nil {
 				podEntries[0].HasGroup = true
 				podEntries[0].GroupIdx = kvblock.GroupID(*ev.GroupIdx)
@@ -510,7 +518,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				podIdentifier:    podIdentifier,
 				deviceTier:       deviceTier,
 				groupIdx:         groupIdxOrNoGroup(ev.GroupIdx),
-				dataParallelRank: noDataParallelRank,
+				dataParallelRank: dataParallelRankOrNone(batch.DataParallelRank),
 			}
 			hashesToEvict := p.dedup.filterRemove(removeScope, ev.BlockHashes)
 

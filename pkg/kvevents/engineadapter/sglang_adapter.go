@@ -86,8 +86,9 @@ func (s *SGLangAdapter) ParseMessage(msg *kvevents.RawMessage) (string, string, 
 	}
 
 	eventBatch := kvevents.EventBatch{
-		Timestamp: batch.TS,
-		Events:    genericEvents,
+		Timestamp:        batch.TS,
+		Events:           genericEvents,
+		DataParallelRank: batch.DataParallelRank,
 	}
 
 	return podID, modelName, eventBatch, nil
