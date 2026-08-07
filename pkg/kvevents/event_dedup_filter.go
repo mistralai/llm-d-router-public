@@ -25,19 +25,19 @@ import "sync"
 // genuine group.
 const noGroupIdx = -1
 
-// noDataParallelRank is the sentinel data-parallel rank used in a dedup scope.
+// noDataParallelRank is the sentinel data-parallel rank used in a dedup scope
+// when the announcing engine is not running data-parallel. It mirrors the
+// "no rank" index identity (kvblock.PodEntry.DataParallelRank=nil), so non-DP
+// reference counts share a single scope exactly as they did before DP
+// awareness existed. Real DP ranks are non-negative, so the sentinel cannot
+// collide with a genuine rank.
 //
-// On current main the index identity (kvblock.PodEntry) is pod-level and does
-// NOT distinguish data-parallel ranks, so every scope uses this sentinel and
-// reference counts aggregate across ranks — which is exactly what the pod-level
-// index requires (a block is still resident on the pod until every rank has
-// removed it). The value matches PR #370's NoDataParallelRank (-1) convention.
-//
-// TODO(#370): once DataParallelRank is propagated onto EventBatch and into
-// PodEntry, source the rank from the event in pool.go so the dedup scope
-// becomes DP-aware in lockstep with the (then DP-aware) index identity. No
-// change to this file is required — only the scope construction at the call
-// sites.
+// When the engine IS data-parallel the scope carries the real rank. This must
+// stay in lockstep with the index eviction identity: PodEntry is DP-aware, so a
+// block stored by rank 0 is a distinct entry from the same block stored by
+// rank 1 and each is reference-counted independently. Making the scope
+// DP-aware while the index stayed pod-level (or the reverse) would let one
+// rank's remove evict a block another rank still holds.
 const noDataParallelRank = -1
 
 // groupIdxOrNoGroup maps an optional event group index to the dedup-scope int,
@@ -47,6 +47,15 @@ func groupIdxOrNoGroup(groupIdx *int) int {
 		return noGroupIdx
 	}
 	return *groupIdx
+}
+
+// dataParallelRankOrNone maps an optional event data-parallel rank to the
+// dedup-scope int, substituting noDataParallelRank for a non-DP engine.
+func dataParallelRankOrNone(dataParallelRank *int) int {
+	if dataParallelRank == nil {
+		return noDataParallelRank
+	}
+	return *dataParallelRank
 }
 
 // blockScope identifies the set of block reference counts that share a single
