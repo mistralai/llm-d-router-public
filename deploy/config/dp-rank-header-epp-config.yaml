@@ -1,0 +1,66 @@
+# Sample EPP config: Data Parallel where all ranks share one HTTP port.
+#
+# This is epp-precise-prefix-cache-config.yaml plus dp-rank-header-handler.
+# Use it for vLLM's Internal LB and Hybrid LB modes, where the ranks of a pod
+# sit behind a single HTTP port and there is no per-rank endpoint to route to.
+# The scheduler picks a pod, then dp-rank-header-handler pins the request to
+# the rank holding the best prefix match by setting x-data-parallel-rank,
+# bypassing vLLM's internal queue-based balancing.
+#
+# For External LB, where each rank is its own endpoint on its own port, use
+# dp-epp-config.yaml instead. Leaving dp-rank-header-handler in is harmless
+# there: no rank is recorded during scoring, so no header is emitted.
+#
+# Ranks are learned from KV events, so this requires the precise producer --
+# the approximate prefix cache does not track which rank cached a block. Note
+# that vLLM offsets its ZMQ publisher port by the rank (base port + N), so each
+# rank still publishes on its own socket even though they share an HTTP port.
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+  - type: token-producer
+    parameters:
+      modelName: hf-repo/model-name           # set to the model used in the vLLM deployment
+      vllm:
+        url: http://localhost:8000
+  - type: endpoint-notification-source
+  - type: metrics-data-source
+  - type: core-metrics-extractor
+  - type: single-profile-handler
+  - type: decode-filter
+  - type: precise-prefix-cache-producer
+    parameters:
+      tokenProcessorConfig:
+        blockSize: 64
+      indexerConfig:
+        kvBlockIndexConfig:
+          enableMetrics: true       # enable kv-block index metrics (prometheus)
+  - type: prefix-cache-scorer
+    parameters:
+      # Without this the framework quietly creates an approximate producer for
+      # this scorer, which has no rank information: scoring silently falls back
+      # to heuristics and no rank is ever pinned.
+      prefixMatchInfoProducerName: precise-prefix-cache-producer
+  - type: kv-cache-utilization-scorer
+  - type: queue-scorer
+  - type: max-score-picker
+  - type: dp-rank-header-handler    # sets x-data-parallel-rank after scheduling
+dataLayer:
+  sources:
+    - pluginRef: metrics-data-source
+      extractors:
+        - pluginRef: core-metrics-extractor
+    - pluginRef: endpoint-notification-source
+      extractors:
+        - pluginRef: precise-prefix-cache-producer
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: decode-filter
+      - pluginRef: prefix-cache-scorer
+        weight: 2.0
+      - pluginRef: kv-cache-utilization-scorer
+        weight: 1.0
+      - pluginRef: queue-scorer
+        weight: 1.0
+      - pluginRef: max-score-picker
