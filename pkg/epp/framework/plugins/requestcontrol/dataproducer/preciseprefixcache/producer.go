@@ -36,6 +36,7 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -350,6 +351,11 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	}
 
 	aggregatedScores := make(map[string]float64)
+	// Winning data-parallel rank per pod, with the single-prompt score that won
+	// it. Scores sum across prompts but one rank serves the request, so the
+	// rank that scored best on any single prompt is the one to steer to.
+	winningRanks := make(map[string]int)
+	bestRankScores := make(map[string]float64)
 	totalBlocks := 0
 	lookups := make([]promptLookup, 0, len(perPromptKeys))
 	for _, blockKeys := range perPromptKeys {
@@ -358,16 +364,37 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 			span.SetStatus(codes.Error, err.Error())
 			return fmt.Errorf("failed to lookup block keys: %w", err)
 		}
-		scores, err := p.kvBlockScorer.Score(ctx, blockKeys, keyToPods)
+		rankScores, err := p.kvBlockScorer.Score(ctx, blockKeys, keyToPods)
 		if err != nil {
 			span.SetStatus(codes.Error, err.Error())
 			return fmt.Errorf("failed to score block keys: %w", err)
 		}
+		// Scores arrive keyed by "<pod>@dp<rank>" for data-parallel engines but
+		// are matched below against bare "ip:port" endpoint addresses, so they
+		// have to be collapsed before use.
+		scores, promptRanks := kvcache.CollapseDPScoresToPods(rankScores)
 		for pod, score := range scores {
 			aggregatedScores[pod] += score
+			rank, isDP := promptRanks[pod]
+			if !isDP {
+				continue
+			}
+			if cur, seen := bestRankScores[pod]; !seen || score > cur {
+				bestRankScores[pod] = score
+				winningRanks[pod] = rank
+			}
 		}
 		totalBlocks += len(blockKeys)
 		lookups = append(lookups, promptLookup{keys: blockKeys, keyToPods: keyToPods})
+	}
+
+	// Hand the winning ranks to the pre-request stage, which pins the request
+	// to the rank of whichever endpoint scheduling selects. Nothing is emitted
+	// for non-DP engines: there is no rank, and vLLM has none to pin to.
+	if encoded, err := routing.EncodeWinningRanks(winningRanks); err == nil {
+		request.Headers[routing.DataParallelWinningRanksHeader] = encoded
+	} else if !errors.Is(err, routing.ErrEmptyWinningRanks) {
+		logger.Error(err, "failed to encode data-parallel winning ranks")
 	}
 
 	maxMatch := 0
