@@ -86,9 +86,35 @@ func (s *LongestPrefixScorer) Strategy() KVScoringStrategy {
 	return LongestPrefixMatch
 }
 
-// fillMaxWeights populates dst with the maximum weight per podID across all
-// device tiers for the given entries. The caller must clear dst before calling.
-func fillMaxWeights(dst map[string]float64, entries []kvblock.PodEntry, mediumWeights map[string]float64) {
+// noDataParallelRank stands in for an entry with no data-parallel rank so the
+// scoring identity can stay a comparable struct. Real ranks are non-negative.
+const noDataParallelRank = -1
+
+// podRank is the identity a consecutive prefix chain is tracked against.
+//
+// Data-parallel ranks sharing a pod hold independent KV caches, so the chain
+// has to be walked per rank. If rank 0 holds blocks 0-9 and rank 1 holds blocks
+// 10-19, no engine can serve the prefix from cache even though the pod
+// collectively holds all twenty blocks; scoring the pod as a whole would claim
+// a twenty-block match that neither rank can honour.
+type podRank struct {
+	podIdentifier    string
+	dataParallelRank int
+}
+
+// entryPodRank returns the scoring identity of an index entry.
+func entryPodRank(entry kvblock.PodEntry) podRank {
+	rank := noDataParallelRank
+	if entry.DataParallelRank != nil {
+		rank = *entry.DataParallelRank
+	}
+	return podRank{podIdentifier: entry.PodIdentifier, dataParallelRank: rank}
+}
+
+// fillMaxWeights populates dst with the maximum weight per (pod, DP rank)
+// across all device tiers for the given entries. The caller must clear dst
+// before calling.
+func fillMaxWeights(dst map[podRank]float64, entries []kvblock.PodEntry, mediumWeights map[string]float64) {
 	for _, entry := range entries {
 		weight := 1.0
 		if mediumWeights != nil {
@@ -96,8 +122,9 @@ func fillMaxWeights(dst map[string]float64, entries []kvblock.PodEntry, mediumWe
 				weight = w
 			}
 		}
-		if cur, exists := dst[entry.PodIdentifier]; !exists || weight > cur {
-			dst[entry.PodIdentifier] = weight
+		key := entryPodRank(entry)
+		if cur, exists := dst[key]; !exists || weight > cur {
+			dst[key] = weight
 		}
 	}
 }
@@ -112,25 +139,25 @@ func (s *LongestPrefixScorer) Score(
 		return make(map[string]float64), nil
 	}
 
-	podScores := make(map[string]float64)
+	rankScores := make(map[podRank]float64)
 
 	// Scratch map reused across iterations to avoid per-key allocation.
-	curWeights := make(map[string]float64)
+	curWeights := make(map[podRank]float64)
 
 	// Build weight index for the first key in a single pass over entries.
 	fillMaxWeights(curWeights, keyToPods[keys[0]], s.MediumWeights)
 
-	// activePods tracks pods still in the consecutive prefix chain.
-	// Using a plain map and in-place deletion avoids allocating new sets
-	// on every iteration.
-	activePods := make(map[string]struct{}, len(curWeights))
-	for pod, w := range curWeights {
-		activePods[pod] = struct{}{}
-		podScores[pod] = w
+	// activeRanks tracks the (pod, DP rank) pairs still in the consecutive
+	// prefix chain. Using a plain map and in-place deletion avoids allocating
+	// new sets on every iteration.
+	activeRanks := make(map[podRank]struct{}, len(curWeights))
+	for pr, w := range curWeights {
+		activeRanks[pr] = struct{}{}
+		rankScores[pr] = w
 	}
 
 	for i := 1; i < len(keys); i++ {
-		if len(activePods) == 0 {
+		if len(activeRanks) == 0 {
 			break
 		}
 
@@ -138,17 +165,28 @@ func (s *LongestPrefixScorer) Score(
 		clear(curWeights)
 		fillMaxWeights(curWeights, keyToPods[keys[i]], s.MediumWeights)
 
-		// In-place intersection: delete pods from activePods that are not
-		// in the current key, and accumulate scores for those that remain.
-		for pod := range activePods {
-			if w, exists := curWeights[pod]; exists {
-				podScores[pod] += w
+		// In-place intersection: delete ranks that are not in the current key,
+		// and accumulate scores for those that remain.
+		for pr := range activeRanks {
+			if w, exists := curWeights[pr]; exists {
+				rankScores[pr] += w
 			} else {
-				delete(activePods, pod)
+				delete(activeRanks, pr)
 			}
 		}
 	}
 
-	// Return the map containing the final score for each pod encountered.
+	// Collapse to a pod-level score. Callers address endpoints by "ip:port"
+	// (see the precise-prefix-cache producer), so the returned key must stay a
+	// bare pod identifier: encoding the rank into it would make every lookup
+	// miss and silently drop the deployment back to load-only routing. A pod's
+	// score is its best rank's, since the request is served by one rank.
+	podScores := make(map[string]float64, len(rankScores))
+	for pr, score := range rankScores {
+		if cur, exists := podScores[pr.podIdentifier]; !exists || score > cur {
+			podScores[pr.podIdentifier] = score
+		}
+	}
+
 	return podScores, nil
 }
