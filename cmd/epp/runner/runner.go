@@ -586,6 +586,11 @@ func (r *Runner) registerInTreePlugins() {
 	// Beta
 	fwkplugin.Register(dataparallel.DataParallelProfileHandlerType, fwkplugin.StabilityBeta, dataparallel.ProfileHandlerFactory)
 
+	// dataparallel rank header handler, for vLLM Internal/Hybrid LB where every
+	// rank shares one HTTP port
+	// Alpha
+	fwkplugin.Register(dataparallel.DPRankHeaderHandlerType, fwkplugin.StabilityAlpha, dataparallel.DPRankHeaderHandlerFactory)
+
 	// extra scheduling scorers
 	// Beta
 	fwkplugin.Register(loadaware.LoadAwareType, fwkplugin.StabilityBeta, loadaware.Factory)
