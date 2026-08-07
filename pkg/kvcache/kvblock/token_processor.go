@@ -72,6 +72,10 @@ type TokenProcessor interface {
 
 	// BlockSize returns the number of tokens per block used by this processor.
 	BlockSize() int
+
+	// SetBlockSize updates the number of tokens per block. Callers use this
+	// to auto-tune the block size from engine metrics at runtime.
+	SetBlockSize(size int)
 }
 
 // chunkedTokenDatabase is a concrete implementation of TokenDatabase.
@@ -178,6 +182,11 @@ func (db *chunkedTokenDatabase) prefixHashes(
 // BlockSize returns the number of tokens per block.
 func (db *chunkedTokenDatabase) BlockSize() int {
 	return db.BlockSizeTokens
+}
+
+// SetBlockSize updates the number of tokens per block.
+func (db *chunkedTokenDatabase) SetBlockSize(size int) {
+	db.BlockSizeTokens = size
 }
 
 // chunkTokens splits the input slice of tokens into chunks of size blockSize.
