@@ -204,11 +204,17 @@ func (k *Indexer) ScoreTokens(
 		attribute.Int("llm_d.kv_cache.blocks_found", blocksFound),
 	)
 
-	podScores, err := k.kvBlockScorer.Score(ctx, blockKeys, keyToPods)
+	scores, err := k.kvBlockScorer.Score(ctx, blockKeys, keyToPods)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("failed to query kvblock scorer: %w", err)
 	}
+
+	// This API is pod-level: callers pass pod identifiers in and match the
+	// returned keys against them, so data-parallel ranks are folded away here.
+	// Steering to a specific rank goes through the precise prefix cache
+	// producer, which keeps the winning rank.
+	podScores, _ := CollapseDPScoresToPods(scores)
 
 	return podScores, nil
 }
