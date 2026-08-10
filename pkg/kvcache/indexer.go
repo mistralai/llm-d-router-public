@@ -120,12 +120,14 @@ func (k *Indexer) KVBlockIndex() kvblock.Index {
 // ComputeBlockKeysFromTokens computes the KV-block keys for a pre-tokenized
 // prompt. Callers tokenize and truncate externally. extraFeatures provides
 // per-block multimodal data that taints the hash; nil means text-only.
+// blockSizeTokens is the chunking granularity; pass 0 to fall back to the
+// processor's configured value.
 func (k *Indexer) ComputeBlockKeysFromTokens(ctx context.Context, tokens []uint32, modelName string,
-	extraFeatures []*kvblock.BlockExtraFeatures,
+	extraFeatures []*kvblock.BlockExtraFeatures, blockSizeTokens int,
 ) ([]kvblock.BlockHash, error) {
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvcache.ComputeBlockKeysFromTokens")
 
-	blockKeys, err := k.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, extraFeatures)
+	blockKeys, err := k.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, extraFeatures, blockSizeTokens)
 	if err != nil {
 		traceLogger.Error(err, "blockKey conversion failed")
 		return nil, fmt.Errorf("blockKey conversion failed: %w", err)
@@ -161,7 +163,7 @@ func (k *Indexer) ScoreTokens(
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvcache.ScoreTokens")
 
-	blockKeys, err := k.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, extraFeatures)
+	blockKeys, err := k.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, extraFeatures, k.tokenProcessor.BlockSize())
 	if err != nil {
 		return nil, fmt.Errorf("blockKey conversion failed: %w", err)
 	}

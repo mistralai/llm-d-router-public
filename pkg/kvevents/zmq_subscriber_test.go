@@ -242,7 +242,7 @@ func TestZMQSubscribers_SameTopicUsesServingEndpointIdentity(t *testing.T) {
 		tokens[i] = uint32(i + 1) // #nosec G115 -- test data
 	}
 	keys, err := tokenProcessor.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, tokens, "TestModel", nil)
+		kvblock.EmptyBlockHash, tokens, "TestModel", nil, 0)
 	require.NoError(t, err)
 	require.NotEmpty(t, keys)
 	firstKey := keys[0]

@@ -41,10 +41,12 @@ import (
 
 type fakeKVCacheIndexer struct {
 	computeFromTokens func(ctx context.Context, tokens []uint32, model string, extra []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error)
+	blockSizeTokens   int
 	index             *fakeKVBlockIndex
 }
 
-func (f *fakeKVCacheIndexer) ComputeBlockKeysFromTokens(ctx context.Context, tokens []uint32, model string, extra []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+func (f *fakeKVCacheIndexer) ComputeBlockKeysFromTokens(ctx context.Context, tokens []uint32, model string, extra []*kvblock.BlockExtraFeatures, blockSizeTokens int) ([]kvblock.BlockHash, error) {
+	f.blockSizeTokens = blockSizeTokens
 	if f.computeFromTokens != nil {
 		return f.computeFromTokens(ctx, tokens, model, extra)
 	}
@@ -145,7 +147,7 @@ func newProducerWithIndexer(ctx context.Context, idx kvCacheIndexer, scorer kvca
 		kvEventsConfig:  &kvevents.Config{},
 		dk:              attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"),
 		pluginState:     plugin.NewPluginState(ctx),
-		blockSizeTokens: testBlockSize,
+		configBlockSizeTokens: testBlockSize,
 	}
 }
 
@@ -790,7 +792,7 @@ func TestDumpState(t *testing.T) {
 		subscribersManager: &fakeSubscriberManager{ids: []string{"ns/pod-b", "ns/pod-a"}},
 		speculativeCache:   specCache,
 		speculativeEnabled: true,
-		blockSizeTokens:    64,
+		configBlockSizeTokens: 64,
 	}
 
 	payload, err := p.DumpState()

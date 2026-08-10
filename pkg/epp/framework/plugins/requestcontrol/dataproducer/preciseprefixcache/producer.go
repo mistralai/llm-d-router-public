@@ -63,6 +63,9 @@ type PluginConfig struct {
 	// eviction. Go duration string; defaults to defaultSpeculativeTTL when
 	// empty.
 	SpeculativeTTL string `json:"speculativeTTL"`
+	// AutoTune derives the block size from engine metrics instead of using
+	// tokenProcessorConfig.blockSizeTokens. Mirrors the approx producer.
+	AutoTune *bool `json:"autoTune"`
 }
 
 var (
@@ -108,7 +111,8 @@ type Producer struct {
 	speculativeTTL     time.Duration
 	speculativeEnabled bool
 
-	blockSizeTokens int
+	configBlockSizeTokens int
+	autoTune              bool
 
 	// Plugin-lifetime, not request-scoped: SubscriberManager binds each
 	// subscriber's goroutine to the ctx passed at registration.
@@ -213,7 +217,8 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		speculativeCache:   speculativeCache,
 		speculativeTTL:     speculativeTTL,
 		speculativeEnabled: config.SpeculativeIndexing,
-		blockSizeTokens:    tokenProcessor.BlockSize(),
+		configBlockSizeTokens: tokenProcessor.BlockSize(),
+		autoTune:              config.AutoTune == nil || *config.AutoTune,
 		subscriberCtx:      ctx,
 	}, nil
 }
@@ -272,7 +277,7 @@ func (p *Producer) DumpState() (json.RawMessage, error) {
 		SpeculativeEntries:      speculativeEntries,
 		TotalSpeculativeEntries: totalSpeculativeEntries,
 		MaxSpeculativeEntries:   maxDumpSpeculativeEntries,
-		BlockSizeTokens:         p.blockSizeTokens,
+		BlockSizeTokens:         p.configBlockSizeTokens,
 	})
 }
 
@@ -285,6 +290,26 @@ func sortedCapped(in []string, limit int) []string {
 		out = out[:limit]
 	}
 	return out
+}
+
+// GetBlockSize returns the block size in tokens, optionally auto-tuned from
+// endpoint metrics. Mirrors the approx producer's getter: it is pure, so the
+// value is computed per request and passed into the hashing call rather than
+// stored, which keeps the shared TokenProcessor free of mutable state.
+//
+// The ZMQ ingestion path resolves the same value independently from
+// BlockStored.block_size, so admission and lookup agree without either side
+// mutating the other.
+func (p *Producer) GetBlockSize(endpoints []scheduling.Endpoint) int {
+	blockSize := p.configBlockSizeTokens
+	if p.autoTune && len(endpoints) > 0 {
+		if endpoint := endpoints[0]; endpoint.GetMetrics() != nil {
+			if metric := endpoint.GetMetrics().CacheBlockSize; metric > 0 {
+				blockSize = metric
+			}
+		}
+	}
+	return blockSize
 }
 
 // Produces declares the PrefixCacheMatchInfoDataKey published per endpoint,
@@ -324,7 +349,9 @@ func (p *Producer) Produce(ctx context.Context,
 		}
 	}
 
-	perPromptKeys, mmBlockIndices, err := computeBlockKeys(ctx, p.kvCacheIndexer, request, p.blockSizeTokens)
+	blockSizeTokens := p.GetBlockSize(endpoints)
+
+	perPromptKeys, mmBlockIndices, err := computeBlockKeys(ctx, p.kvCacheIndexer, request, blockSizeTokens)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("failed to compute block keys: %w", err)
@@ -334,12 +361,12 @@ func (p *Producer) Produce(ctx context.Context,
 		return nil
 	}
 
-	return p.produceFromBlockKeys(ctx, span, request, endpoints, perPromptKeys, mmBlockIndices)
+	return p.produceFromBlockKeys(ctx, span, request, endpoints, perPromptKeys, mmBlockIndices, blockSizeTokens)
 }
 
 func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint,
-	perPromptKeys [][]kvblock.BlockHash, mmBlockIndices []int,
+	perPromptKeys [][]kvblock.BlockHash, mmBlockIndices []int, blockSizeTokens int,
 ) error {
 	logger := log.FromContext(ctx).WithName(p.typedName.String())
 	endpointSet := extractEndpointSet(endpoints)
@@ -389,7 +416,7 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 				cachedBlocksByTier[tier] += count
 			}
 		}
-		info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTokens).
+		info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, blockSizeTokens).
 			WithCachedBlockCount(cachedBlocks).
 			WithCachedBlocksByTier(cachedBlocksByTier)
 		if len(mmBlockIndices) > 0 {

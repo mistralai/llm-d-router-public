@@ -29,7 +29,7 @@ import (
 
 // kvCacheIndexer is the subset of kvcache.Indexer that the producer relies on.
 type kvCacheIndexer interface {
-	ComputeBlockKeysFromTokens(ctx context.Context, tokens []uint32, modelName string, extraFeatures []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error)
+	ComputeBlockKeysFromTokens(ctx context.Context, tokens []uint32, modelName string, extraFeatures []*kvblock.BlockExtraFeatures, blockSizeTokens int) ([]kvblock.BlockHash, error)
 	KVBlockIndex() kvblock.Index
 }
 
@@ -87,7 +87,7 @@ func computeBlockKeysForTokens(ctx context.Context, idx kvCacheIndexer,
 		mmBlockIndices = multimodalBlockIndices(mmFeatures, blockSizeTokens)
 	}
 	extraFeatures = foldCacheSalt(extraFeatures, cacheSalt, len(tokens)/blockSizeTokens)
-	keys, err := idx.ComputeBlockKeysFromTokens(ctx, tokens, model, extraFeatures)
+	keys, err := idx.ComputeBlockKeysFromTokens(ctx, tokens, model, extraFeatures, blockSizeTokens)
 	return keys, mmBlockIndices, err
 }
 

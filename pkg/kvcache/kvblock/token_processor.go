@@ -65,12 +65,15 @@ type TokenProcessor interface {
 	// nil means text-only (no taint). When non-nil, its length must match the
 	// number of token chunks.
 	// It returns a slice of generated Keys.
+	// blockSizeTokens is the chunking granularity; callers pass the engine's
+	// real block size so the processor holds no mutable state of its own.
 	TokensToKVBlockKeys(
 		parentKey BlockHash, tokens []uint32, modelName string,
-		extraFeatures []*BlockExtraFeatures,
+		extraFeatures []*BlockExtraFeatures, blockSizeTokens int,
 	) ([]BlockHash, error)
 
-	// BlockSize returns the number of tokens per block used by this processor.
+	// BlockSize returns the configured block size, used as the fallback when
+	// the engine has not reported one.
 	BlockSize() int
 }
 
@@ -181,8 +184,7 @@ func (db *chunkedTokenDatabase) BlockSize() int {
 }
 
 // chunkTokens splits the input slice of tokens into chunks of size blockSize.
-func (db *chunkedTokenDatabase) chunkTokens(tokens []uint32) [][]uint32 {
-	bs := db.BlockSizeTokens
+func (db *chunkedTokenDatabase) chunkTokens(tokens []uint32, bs int) [][]uint32 {
 	var chunks [][]uint32
 	for i := 0; i < len(tokens); i += bs {
 		end := i + bs
@@ -199,8 +201,11 @@ func (db *chunkedTokenDatabase) chunkTokens(tokens []uint32) [][]uint32 {
 // TokensToKVBlockKeys converts tokens into kv_block.Keys.
 func (db *chunkedTokenDatabase) TokensToKVBlockKeys(
 	parentKey BlockHash, tokens []uint32, modelName string,
-	extraFeatures []*BlockExtraFeatures,
+	extraFeatures []*BlockExtraFeatures, blockSizeTokens int,
 ) ([]BlockHash, error) {
+	if blockSizeTokens <= 0 {
+		blockSizeTokens = db.BlockSizeTokens
+	}
 	var currentParentHash uint64
 	if parentKey != EmptyBlockHash {
 		currentParentHash = uint64(parentKey)
@@ -208,7 +213,7 @@ func (db *chunkedTokenDatabase) TokensToKVBlockKeys(
 		currentParentHash = db.getInitHash(modelName)
 	}
 
-	chunks := db.chunkTokens(tokens)
+	chunks := db.chunkTokens(tokens, blockSizeTokens)
 	if len(chunks) == 0 {
 		return nil, nil
 	}
@@ -217,7 +222,7 @@ func (db *chunkedTokenDatabase) TokensToKVBlockKeys(
 		extraFeatures = make([]*BlockExtraFeatures, len(chunks))
 	} else if len(extraFeatures) != len(chunks) {
 		return nil, fmt.Errorf("extraFeatures length %d does not match token chunk count %d (blockSizeTokens=%d, tokens=%d)",
-			len(extraFeatures), len(chunks), db.BlockSizeTokens, len(tokens))
+			len(extraFeatures), len(chunks), blockSizeTokens, len(tokens))
 	}
 
 	ph := db.prefixHashes(currentParentHash, chunks, extraFeatures)

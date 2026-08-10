@@ -432,7 +432,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			// granularity. ParseRawExtraKeys returns one entry per engine block, but
 			// TokensToKVBlockKeys expects one entry per canonical block.
 			if extraFeatures != nil {
-				canonicalBlockCount := len(ev.Tokens) / p.tokenProcessor.BlockSize()
+				canonicalBlockCount := len(ev.Tokens) / engineBlockSize(ev, p.tokenProcessor)
 				if canonicalBlockCount == 0 {
 					// Tokens don't fill a complete canonical block; no realignment needed
 					// since TokensToKVBlockKeys will produce zero keys anyway.
@@ -469,7 +469,8 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 
 			// Compute request keys at canonical block size (= BlockSize)
 			requestKeys, err := p.tokenProcessor.TokensToKVBlockKeys(
-				parentRequestKey, ev.Tokens, effectiveModelName, extraFeatures)
+				parentRequestKey, ev.Tokens, effectiveModelName, extraFeatures,
+				engineBlockSize(ev, p.tokenProcessor))
 			if err != nil {
 				debugLogger.Error(err, "Failed to generate request keys",
 					"podIdentifier", podIdentifier, "effectiveModelName", effectiveModelName)
@@ -567,4 +568,17 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)
 		}
 	}
+}
+
+// engineBlockSize returns the block size the engine used for this event,
+// falling back to the processor's configured value when the engine does not
+// report one. Admission must hash at the same granularity the request path
+// looks up with, and BlockStored is the authoritative source: the scraped
+// vllm:cache_config_info reports min() across KV-cache groups, while hashing
+// happens at gcd().
+func engineBlockSize(ev *BlockStoredEvent, tp kvblock.TokenProcessor) int {
+	if ev.BlockSize > 0 {
+		return ev.BlockSize
+	}
+	return tp.BlockSize()
 }

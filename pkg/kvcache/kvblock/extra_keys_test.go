@@ -201,9 +201,9 @@ func TestMMFeatures_DifferentImagesProduceDifferentHashes(t *testing.T) {
 		{MMHashes: []kvblock.MMHash{{Hash: "image_hash_B"}}},
 	}
 
-	keysA, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", featA)
+	keysA, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", featA, 0)
 	require.NoError(t, err)
-	keysB, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", featB)
+	keysB, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", featB, 0)
 	require.NoError(t, err)
 
 	assert.NotEqual(t, keysA[0], keysB[0],
@@ -221,12 +221,12 @@ func TestMMFeatures_NilFeaturesSameAsTextOnly(t *testing.T) {
 	}
 
 	// nil extraFeatures = text-only
-	keysNil, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", nil)
+	keysNil, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", nil, 0)
 	require.NoError(t, err)
 
 	// Explicit nil entry per block = also text-only
 	keysExplicitNil, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model",
-		[]*kvblock.BlockExtraFeatures{nil})
+		[]*kvblock.BlockExtraFeatures{nil}, 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, keysNil[0], keysExplicitNil[0],
@@ -245,7 +245,7 @@ func TestMMFeatures_OnlyAffectOverlappingBlocks(t *testing.T) {
 	}
 
 	// Text-only baseline
-	keysTextOnly, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", nil)
+	keysTextOnly, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, keysTextOnly, 4)
 
@@ -256,7 +256,7 @@ func TestMMFeatures_OnlyAffectOverlappingBlocks(t *testing.T) {
 		{MMHashes: []kvblock.MMHash{{Hash: "image_X"}}}, // block 2: image
 		nil, // block 3: text
 	}
-	keysWithImage, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", features)
+	keysWithImage, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", features, 0)
 	require.NoError(t, err)
 	require.Len(t, keysWithImage, 4)
 
@@ -280,7 +280,7 @@ func TestMMFeatures_MismatchedLengthReturnsError(t *testing.T) {
 	tokens := make([]uint32, 32)                   // 2 chunks
 	features := []*kvblock.BlockExtraFeatures{nil} // 1 entry — mismatch
 
-	_, err = processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", features)
+	_, err = processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "model", features, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not match token chunk count")
 }

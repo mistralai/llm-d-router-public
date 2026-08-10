@@ -87,7 +87,7 @@ func TestProcessRawMessage_UsesSubscriberSourceEndpoint(t *testing.T) {
 	}
 
 	keys, err := tokenProcessor.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, makeTokens(16), "test-model", nil)
+		kvblock.EmptyBlockHash, makeTokens(16), "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, keys, 1)
 
@@ -113,7 +113,7 @@ func TestProcessRawMessage_FallsBackToTopicEndpoint(t *testing.T) {
 	})
 
 	keys, err := tokenProcessor.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, makeTokens(16), "test-model", nil)
+		kvblock.EmptyBlockHash, makeTokens(16), "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, keys, 1)
 
@@ -177,7 +177,7 @@ func TestCanonicalWritePath_ManyToOne(t *testing.T) {
 
 	// Compute expected canonical keys independently
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+		kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, canonicalKeys, 2)
 
@@ -225,7 +225,7 @@ func TestCanonicalWritePath_OneToMany(t *testing.T) {
 
 	// Compute expected canonical keys independently
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+		kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, canonicalKeys, 4)
 
@@ -295,7 +295,7 @@ func TestCanonicalEviction_Eager(t *testing.T) {
 	pool.processEventBatch(ctx, batch, "pod-a", "test-model")
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+		kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, canonicalKeys, 2)
 
@@ -358,7 +358,7 @@ func TestCanonicalWritePath_CrossEngineScoring(t *testing.T) {
 
 	// Both produce the same 2 canonical keys
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+		kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, canonicalKeys, 2)
 
@@ -504,7 +504,7 @@ func TestCanonicalWritePath_ExtraKeysOneToMany(t *testing.T) {
 
 	// Compute expected canonical keys (no extra features for text-only)
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+		kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, canonicalKeys, 8)
 
@@ -546,7 +546,7 @@ func TestCanonicalWritePath_ExtraKeysManyToOne(t *testing.T) {
 
 	// Compute expected canonical keys (no extra features for text-only)
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+		kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, canonicalKeys, 2)
 
@@ -582,7 +582,7 @@ func TestBlockStoredEvent_OffloadingEmptyTokens(t *testing.T) {
 	pool.processEventBatch(ctx, gpuBatch, "pod-a", "test-model")
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+		kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, canonicalKeys, 4)
 
@@ -667,7 +667,7 @@ func TestBlockStoredEvent_EvictionOrderGPUThenCPU(t *testing.T) {
 	pool.processEventBatch(ctx, gpuBatch, "pod-a", "test-model")
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+		kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, canonicalKeys, 4)
 
@@ -765,7 +765,7 @@ func TestHMAGroupMetadataAndEntryOnBlockStored(t *testing.T) {
 	require.NotNil(t, meta.SlidingWindowSize)
 	assert.Equal(t, 128, *meta.SlidingWindowSize)
 
-	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.NotEmpty(t, canonicalKeys)
 
@@ -806,7 +806,7 @@ func TestHMAGroupLevelEviction_BlockRemoved(t *testing.T) {
 		pool.processEventBatch(ctx, batch, "pod-hma", "test-model")
 	}
 
-	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 
 	// Verify both groups present
@@ -892,7 +892,7 @@ func TestAllBlocksCleared_Dispatch(t *testing.T) {
 	pool.processEventBatch(ctx, storeBatch(900), "pod-kept", "test-model")
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
-		kvblock.EmptyBlockHash, tokens, "test-model", nil)
+		kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.NotEmpty(t, canonicalKeys)
 
@@ -944,7 +944,7 @@ func TestPool_AllBlocksClearedResetsDedup(t *testing.T) {
 		},
 	}, "pod-clr", "test-model")
 
-	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 
 	// A single remove must now fully evict: if the pre-clear count of 2 had
@@ -988,7 +988,7 @@ func TestPool_DuplicateStoreSurvivesFirstRemove(t *testing.T) {
 	store() // overlapping chunk A announces these constituent hashes
 	store() // overlapping chunk B re-announces the same hashes
 
-	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, canonicalKeys, 4)
 
@@ -1047,7 +1047,7 @@ func TestPool_DuplicateCPUOffloadRemovalSurvivesFirstRemove(t *testing.T) {
 	cpuStore()
 	cpuStore()
 
-	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 	require.Len(t, canonicalKeys, 4)
 

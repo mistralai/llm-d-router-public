@@ -175,7 +175,7 @@ func TestTokenProcessorConfig_JSONUnmarshal_EndToEnd(t *testing.T) {
 			for i := range tokens {
 				tokens[i] = uint32(i + 1) // #nosec G115 -- test data, i is small
 			}
-			keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+			keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 			require.NoError(t, err)
 			assert.Len(t, keys, tc.wantBlockCount)
 		})
@@ -264,7 +264,7 @@ func TestBlockSizeTokensPrecedence(t *testing.T) {
 		tokens[i] = uint32(i + 1) // #nosec G115 -- test data, i is small
 	}
 
-	keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 
 	// Should create 2 blocks (32/16) not 4 blocks (32/8)
@@ -300,7 +300,7 @@ func TestBackwardCompatibility_BlockSize(t *testing.T) {
 		tokens[i] = uint32(i + 1) // #nosec G115 -- test data, i is small
 	}
 
-	keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil, 0)
 	require.NoError(t, err)
 
 	assert.Len(t, keys, 4, "BlockSize=8 should produce 4 blocks from 32 tokens")
@@ -320,11 +320,11 @@ func TestGetInitHash_ConsistentHashesForSameModel(t *testing.T) {
 	tokens := []uint32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16} // Full block
 
 	// Get keys multiple times with no parent (should use init hash)
-	keys1, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil)
+	keys1, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil, 0)
 	require.NoError(t, err)
-	keys2, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil)
+	keys2, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil, 0)
 	require.NoError(t, err)
-	keys3, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil)
+	keys3, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil, 0)
 	require.NoError(t, err)
 
 	require.NotEmpty(t, keys1, "Should generate keys")
@@ -362,7 +362,7 @@ func TestGetInitHash_DifferentHashesForDifferentModels(t *testing.T) {
 
 	// Get first key hash for each model (derived from init hash)
 	for _, modelName := range models {
-		keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil)
+		keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil, 0)
 		require.NoError(t, err)
 		require.NotEmpty(t, keys, "Should generate keys for model: %s", modelName)
 
@@ -404,7 +404,7 @@ func TestGetInitHash_DifferentSeedsProduceDifferentHashes(t *testing.T) {
 
 		processor, err := kvblock.NewChunkedTokenDatabase(config)
 		require.NoError(t, err)
-		keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil)
+		keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil, 0)
 		require.NoError(t, err)
 		require.NotEmpty(t, keys, "Should generate keys for seed: %s", seed)
 
@@ -445,7 +445,7 @@ func TestGetInitHash_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil)
+			keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil, 0)
 			if err == nil && len(keys) > 0 {
 				results <- uint64(keys[0])
 			}
@@ -489,7 +489,7 @@ func TestGetInitHash_Deterministic(t *testing.T) {
 
 		processor, err := kvblock.NewChunkedTokenDatabase(config)
 		require.NoError(t, err)
-		keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil)
+		keys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, nil, 0)
 		require.NoError(t, err)
 		require.NotEmpty(t, keys, "Should generate keys for instance %d", i)
 
@@ -793,9 +793,9 @@ func TestHeterogeneousBlockSizeSupport(t *testing.T) {
 		proc32 := newProcessor(t, 32)
 		proc16 := newProcessor(t, 16)
 
-		keys32, err := proc32.TokensToKVBlockKeys(parentKey, tokens, modelName, nil)
+		keys32, err := proc32.TokensToKVBlockKeys(parentKey, tokens, modelName, nil, 0)
 		require.NoError(t, err)
-		keys16, err := proc16.TokensToKVBlockKeys(parentKey, tokens, modelName, nil)
+		keys16, err := proc16.TokensToKVBlockKeys(parentKey, tokens, modelName, nil, 0)
 		require.NoError(t, err)
 		assert.NotEqual(t, keys32[0], keys16[0])
 	})
@@ -804,9 +804,9 @@ func TestHeterogeneousBlockSizeSupport(t *testing.T) {
 		proc256 := newProcessor(t, 256)
 		proc16 := newProcessor(t, 16)
 
-		keys256, err := proc256.TokensToKVBlockKeys(parentKey, tokens, modelName, nil)
+		keys256, err := proc256.TokensToKVBlockKeys(parentKey, tokens, modelName, nil, 0)
 		require.NoError(t, err)
-		keys16, err := proc16.TokensToKVBlockKeys(parentKey, tokens, modelName, nil)
+		keys16, err := proc16.TokensToKVBlockKeys(parentKey, tokens, modelName, nil, 0)
 		require.NoError(t, err)
 		assert.Equal(t, 2, len(keys256))
 		assert.Equal(t, 32, len(keys16))
@@ -819,7 +819,7 @@ func TestHeterogeneousBlockSizeSupport(t *testing.T) {
 		for i := range partialTokens {
 			partialTokens[i] = uint32(i + 1) // #nosec G115 -- test data, i is small
 		}
-		keys, err := proc256.TokensToKVBlockKeys(parentKey, partialTokens, modelName, nil)
+		keys, err := proc256.TokensToKVBlockKeys(parentKey, partialTokens, modelName, nil, 0)
 		require.NoError(t, err)
 		// 300 / 256 = 1 full block, 44 leftover tokens are discarded
 		require.Len(t, keys, 1)
@@ -829,9 +829,9 @@ func TestHeterogeneousBlockSizeSupport(t *testing.T) {
 		proc256 := newProcessor(t, 256)
 		proc16 := newProcessor(t, 16)
 
-		storageKeys, err := proc256.TokensToKVBlockKeys(parentKey, tokens, modelName, nil)
+		storageKeys, err := proc256.TokensToKVBlockKeys(parentKey, tokens, modelName, nil, 0)
 		require.NoError(t, err)
-		gpuKeys, err := proc16.TokensToKVBlockKeys(parentKey, tokens, modelName, nil)
+		gpuKeys, err := proc16.TokensToKVBlockKeys(parentKey, tokens, modelName, nil, 0)
 		require.NoError(t, err)
 
 		gpuKeySet := make(map[kvblock.BlockHash]struct{}, len(gpuKeys))
@@ -849,9 +849,9 @@ func TestHeterogeneousBlockSizeSupport(t *testing.T) {
 		proc256 := newProcessor(t, 256)
 
 		nonEmptyParent := kvblock.BlockHash(999999)
-		keysWithParent, err := proc256.TokensToKVBlockKeys(nonEmptyParent, tokens, modelName, nil)
+		keysWithParent, err := proc256.TokensToKVBlockKeys(nonEmptyParent, tokens, modelName, nil, 0)
 		require.NoError(t, err)
-		keysWithoutParent, err := proc256.TokensToKVBlockKeys(parentKey, tokens, modelName, nil)
+		keysWithoutParent, err := proc256.TokensToKVBlockKeys(parentKey, tokens, modelName, nil, 0)
 		require.NoError(t, err)
 
 		require.Len(t, keysWithParent, 2)
@@ -859,4 +859,45 @@ func TestHeterogeneousBlockSizeSupport(t *testing.T) {
 		assert.NotEqual(t, keysWithParent[0], keysWithoutParent[0],
 			"different parent keys should produce different first hashes")
 	})
+}
+
+// The ZMQ admission path hashes at the engine's block size and the request
+// path hashes at the size resolved from metrics. Keys only match when the two
+// agree, so pin that: same size => identical keys, different size => none.
+func TestTokensToKVBlockKeys_BlockSizeGovernsMatching(t *testing.T) {
+	db, err := kvblock.NewChunkedTokenDatabase(&kvblock.TokenProcessorConfig{BlockSizeTokens: 32})
+	require.NoError(t, err)
+
+	tokens := make([]uint32, 256)
+	for i := range tokens {
+		tokens[i] = uint32(i)
+	}
+
+	admitted, err := db.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "m", nil, 128)
+	require.NoError(t, err)
+	require.NotEmpty(t, admitted)
+
+	sameSize, err := db.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "m", nil, 128)
+	require.NoError(t, err)
+	assert.Equal(t, admitted, sameSize, "same block size must produce identical keys")
+
+	otherSize, err := db.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "m", nil, 32)
+	require.NoError(t, err)
+	assert.NotEqual(t, admitted, otherSize, "a different block size must not collide")
+	for _, k := range otherSize {
+		assert.NotContains(t, admitted, k, "keys from different block sizes must never match")
+	}
+}
+
+// A caller that does not know the engine's block size falls back to config.
+func TestTokensToKVBlockKeys_ZeroFallsBackToConfigured(t *testing.T) {
+	db, err := kvblock.NewChunkedTokenDatabase(&kvblock.TokenProcessorConfig{BlockSizeTokens: 64})
+	require.NoError(t, err)
+
+	tokens := make([]uint32, 128)
+	explicit, err := db.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "m", nil, 64)
+	require.NoError(t, err)
+	fallback, err := db.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "m", nil, 0)
+	require.NoError(t, err)
+	assert.Equal(t, explicit, fallback)
 }
