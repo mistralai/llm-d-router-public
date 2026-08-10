@@ -398,8 +398,12 @@ func (r *Runtime) findSourceByType(sourceType string, gvkFilter *schema.GroupVer
 }
 
 // Start is called to enable the Runtime to start processing data collection. It wires
-// Kubernetes notifications into the manager.
+// Kubernetes notifications into the manager and starts cross-replica syncing.
 func (r *Runtime) Start(ctx context.Context, mgr ctrl.Manager) error {
+	if r.crossReplicaPub != nil {
+		go r.runCrossReplicaSync(ctx)
+	}
+
 	return r.notification.ForEach(func(srcName string, src fwkdl.NotificationSource) error {
 		var extractors []fwkdl.NotificationExtractor
 		if rawExts, ok := r.extractors.Get(srcName); ok {
@@ -452,19 +456,18 @@ func (r *Runtime) NewEndpoint(ctx context.Context, endpointMetadata *fwkdl.Endpo
 
 	r.dispatchEndpointEvent(ctx, logger, fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: endpoint})
 
-	// Start an independent ticker for cross-replica sync, decoupled from the
-	// collector's base tick so the configured sync interval is honoured even
-	// when the metric-scrape interval is much longer.
-	if r.crossReplicaPub != nil {
-		go r.runCrossReplicaSync(ctx, endpoint)
-	}
-
 	return endpoint
 }
 
-// runCrossReplicaSync publishes local per-endpoint state to the syncer on
-// its own ticker. Runs for the lifetime of the endpoint (cancelled via ctx).
-func (r *Runtime) runCrossReplicaSync(ctx context.Context, ep fwkdl.Endpoint) {
+// runCrossReplicaSync publishes every endpoint's local state to the syncer on
+// its own ticker, decoupled from the collector's base tick so the configured
+// sync interval is honoured even when the metric-scrape interval is longer.
+//
+// A single loop serves all endpoints. Unlike a PollingDispatcher there is no
+// per-endpoint connection to establish, so nothing here needs to be per
+// endpoint; iterating the live set each tick also means endpoints released in
+// the meantime stop being published, with no goroutine to tear down.
+func (r *Runtime) runCrossReplicaSync(ctx context.Context) {
 	ticker := time.NewTicker(r.crossReplicaPub.Interval())
 	defer ticker.Stop()
 	for {
@@ -472,7 +475,9 @@ func (r *Runtime) runCrossReplicaSync(ctx context.Context, ep fwkdl.Endpoint) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = r.crossReplicaPub.Dispatch(ctx, ep)
+			r.collectors.RangeEndpoints(func(ep fwkdl.Endpoint) {
+				_ = r.crossReplicaPub.Dispatch(ctx, ep)
+			})
 		}
 	}
 }

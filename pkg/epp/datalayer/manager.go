@@ -223,6 +223,20 @@ func (cm *collectorManager) Remove(key types.NamespacedName) (*Collector, bool) 
 	return c, c != nil
 }
 
+// RangeEndpoints calls f for each registered endpoint whose collector has
+// started. Endpoints registered or removed concurrently may or may not be
+// visited, which is the guarantee sync.Map.Range already gives.
+func (cm *collectorManager) RangeEndpoints(f func(ep fwkdl.Endpoint)) {
+	cm.m.Range(func(_, v any) bool {
+		if c, ok := v.(*Collector); ok {
+			if ep := c.Endpoint(); ep != nil {
+				f(ep)
+			}
+		}
+		return true
+	})
+}
+
 // StopAll calls Stop on every registered collector.
 func (cm *collectorManager) StopAll() {
 	cm.m.Range(func(_, v any) bool {

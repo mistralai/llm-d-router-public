@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/llm-d/llm-d-router/pkg/epp/datalayer/mocks"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 )
@@ -130,4 +131,81 @@ func TestCrossReplicaPublisher_ConfiguredInterval(t *testing.T) {
 	pub := newCrossReplicaPublisher(&fakeSyncer{}, em, 500*time.Millisecond)
 	require.NotNil(t, pub)
 	assert.Equal(t, 500*time.Millisecond, pub.Interval())
+}
+
+// startedCollector returns a Collector bound to ep. RangeEndpoints only sees
+// collectors that have been started, which is what registers the endpoint.
+func startedCollector(t *testing.T, ep fwkdl.Endpoint) *Collector {
+	t.Helper()
+	c := NewCollector()
+	require.NoError(t, c.Start(context.Background(), mocks.NewTicker(), ep, sources))
+	t.Cleanup(c.Stop)
+	return c
+}
+
+// endpointIDs returns the distinct endpoint IDs the syncer has seen.
+func (s *fakeSyncer) endpointIDs() map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]int{}
+	for _, c := range s.sets {
+		out[c.endpointID]++
+	}
+	return out
+}
+
+// One loop serves every registered endpoint, rather than one goroutine each.
+func TestRunCrossReplicaSync_PublishesAllEndpoints(t *testing.T) {
+	syncer := &fakeSyncer{}
+	r := NewRuntime(time.Second)
+	r.crossReplicaPub = &crossReplicaPublisher{
+		syncer:       syncer,
+		contributors: []fwkdl.CrossReplicaContributor{fakeContributor{key: "inflight:test"}},
+		interval:     time.Millisecond,
+	}
+	for _, name := range []string{"ep-a", "ep-b", "ep-c"} {
+		ep := testEndpoint("ns", name)
+		require.True(t, r.collectors.Register(ep.GetMetadata().GetID(), startedCollector(t, ep)))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.runCrossReplicaSync(ctx)
+
+	require.Eventually(t, func() bool {
+		ids := syncer.endpointIDs()
+		return ids["ns/ep-a"] > 0 && ids["ns/ep-b"] > 0 && ids["ns/ep-c"] > 0
+	}, 2*time.Second, 5*time.Millisecond, "every registered endpoint should be published")
+}
+
+// Releasing an endpoint stops its publishing without tearing down a goroutine,
+// so removed endpoints cannot keep writing stale state.
+func TestRunCrossReplicaSync_StopsAfterRelease(t *testing.T) {
+	syncer := &fakeSyncer{}
+	r := NewRuntime(time.Second)
+	r.crossReplicaPub = &crossReplicaPublisher{
+		syncer:       syncer,
+		contributors: []fwkdl.CrossReplicaContributor{fakeContributor{key: "inflight:test"}},
+		interval:     time.Millisecond,
+	}
+	ep := testEndpoint("ns", "ep-gone")
+	key := ep.GetMetadata().GetID()
+	require.True(t, r.collectors.Register(key, startedCollector(t, ep)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.runCrossReplicaSync(ctx)
+
+	require.Eventually(t, func() bool {
+		return syncer.endpointIDs()["ns/ep-gone"] > 0
+	}, 2*time.Second, 5*time.Millisecond, "endpoint should publish while registered")
+
+	r.collectors.Remove(key)
+	// Let any tick already in flight drain before sampling the baseline.
+	time.Sleep(50 * time.Millisecond)
+	baseline := syncer.endpointIDs()["ns/ep-gone"]
+
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, baseline, syncer.endpointIDs()["ns/ep-gone"],
+		"released endpoint must stop publishing")
 }
