@@ -167,6 +167,35 @@ var (
 		Help: metricsutil.HelpMsgWithStability(
 			"Total number of ZMQ subscriber errors", compbasemetrics.ALPHA),
 	}, []string{podIdentifierLabel, "operation"})
+	// EventsDropped counts KV-event messages lost in transit, detected as gaps
+	// in the per-topic sequence numbers vLLM stamps on each message. ZMQ SUB
+	// drops silently at the high-water mark, so this is the only signal that
+	// messages went missing. It matters because a lost BlockRemoved strands a
+	// dedup reference count that nothing will ever decrement.
+	EventsDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_events_dropped_total",
+		Help: metricsutil.HelpMsgWithStability(
+			"Total number of KV-event messages lost in transit, counted from sequence-number gaps",
+			compbasemetrics.ALPHA),
+	}, []string{podIdentifierLabel})
+	// DedupPodBuckets tracks the number of per-pod buckets held by the KV-event
+	// dedup filter. It should track the number of live engine pods; growth past
+	// that means buckets for departed pods are being retained.
+	DedupPodBuckets = prometheus.NewGauge(prometheus.GaugeOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_events_dedup_pod_buckets",
+		Help: metricsutil.HelpMsgWithStability(
+			"Number of per-pod buckets currently held by the KV-event dedup filter",
+			compbasemetrics.ALPHA),
+	})
+	// DedupTrackedBlocks tracks total reference-count entries across all pod
+	// buckets. Heap profiles cannot measure this: Go maps grow by bucket-array
+	// doubling, so byte-level growth is a staircase that hides the entry count.
+	DedupTrackedBlocks = prometheus.NewGauge(prometheus.GaugeOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_events_dedup_tracked_blocks",
+		Help: metricsutil.HelpMsgWithStability(
+			"Total block reference-count entries held across all dedup filter pod buckets",
+			compbasemetrics.ALPHA),
+	})
 	// PoolQueueDepth tracks the total number of messages queued across all
 	// worker shards of the event processing pool.
 	PoolQueueDepth = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -190,6 +219,7 @@ func Collectors() []prometheus.Collector {
 		LookupRequests, LookupHits, LookupLatency, MaxPodHitCount,
 		DedupRemovedHashesSuppressed, DedupRemovedHashesForwarded,
 		SubscriberActive, SubscriberReconnections, MessagesReceived, ZMQErrors,
+		EventsDropped, DedupPodBuckets, DedupTrackedBlocks,
 		PoolQueueDepth, PoolCapacity,
 	}
 }
@@ -201,6 +231,7 @@ func Collectors() []prometheus.Collector {
 func CleanupSubscriber(podIdentifier string) {
 	SubscriberReconnections.DeleteLabelValues(podIdentifier)
 	MessagesReceived.DeleteLabelValues(podIdentifier)
+	EventsDropped.DeleteLabelValues(podIdentifier)
 	ZMQErrors.DeletePartialMatch(prometheus.Labels{podIdentifierLabel: podIdentifier})
 }
 

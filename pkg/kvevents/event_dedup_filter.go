@@ -14,7 +14,11 @@
 
 package kvevents
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
+)
 
 // noGroupIdx is the sentinel groupIdx used in a dedup scope when an event
 // carries no KV-cache group. It mirrors the "no group" PodEntry state
@@ -113,10 +117,21 @@ func (s blockScope) key(blockHash uint64) dedupKey {
 type eventDedupFilter struct {
 	mu   sync.Mutex
 	refs map[string]map[dedupKey]int // podIdentifier -> per-block reference count
+	// tracked is the total entry count across every bucket, maintained
+	// incrementally so publishing the size stays O(1) on the event hot path.
+	// It cannot be derived from a heap profile: Go maps grow by bucket-array
+	// doubling, so allocated bytes are a staircase that hides the entry count.
+	tracked int
 }
 
 func newEventDedupFilter() *eventDedupFilter {
 	return &eventDedupFilter{refs: make(map[string]map[dedupKey]int)}
+}
+
+// observeSizeLocked publishes bucket and entry counts. Caller must hold f.mu.
+func (f *eventDedupFilter) observeSizeLocked() {
+	metrics.DedupPodBuckets.Set(float64(len(f.refs)))
+	metrics.DedupTrackedBlocks.Set(float64(f.tracked))
 }
 
 // trackStore records one reference for each stored block hash within scope.
@@ -134,9 +149,14 @@ func (f *eventDedupFilter) trackStore(scope blockScope, blockHashes []uint64) {
 		bucket = make(map[dedupKey]int)
 		f.refs[scope.podIdentifier] = bucket
 	}
+	// Diff len() around the loop rather than probing each key: exact, and it
+	// keeps the added cost O(1) instead of a second lookup per hash.
+	before := len(bucket)
 	for _, h := range blockHashes {
 		bucket[scope.key(h)]++
 	}
+	f.tracked += len(bucket) - before
+	f.observeSizeLocked()
 }
 
 // filterRemove decrements the reference count for each removed block hash and
@@ -153,6 +173,7 @@ func (f *eventDedupFilter) filterRemove(scope blockScope, blockHashes []uint64) 
 	defer f.mu.Unlock()
 
 	bucket := f.refs[scope.podIdentifier]
+	sizeBefore := len(bucket)
 	kept := make([]uint64, 0, len(blockHashes))
 	for _, h := range blockHashes {
 		if bucket == nil {
@@ -173,16 +194,21 @@ func (f *eventDedupFilter) filterRemove(scope blockScope, blockHashes []uint64) 
 		}
 		bucket[k] = count // still referenced -> suppress this remove
 	}
+	f.tracked -= sizeBefore - len(bucket)
 	if bucket != nil && len(bucket) == 0 {
 		delete(f.refs, scope.podIdentifier)
 	}
+	f.observeSizeLocked()
 	return kept
 }
 
 // clear drops all reference counts for a pod. It is invoked on
 // AllBlocksCleared, in lockstep with the index's pod-wide eager clear, so the
 // filter does not retain stale references after the engine resets its prefix
-// cache.
+// cache, and on pod departure via Pool.ClearPod, where the index is likewise
+// cleared for the same pod. Both callers pair it with an Index clear: a
+// reference count only gates whether a BlockRemoved evicts an index entry, so
+// once the pod has no index entries the counts protect nothing.
 func (f *eventDedupFilter) clear(podIdentifier string) {
 	if f == nil {
 		return
@@ -190,5 +216,7 @@ func (f *eventDedupFilter) clear(podIdentifier string) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.tracked -= len(f.refs[podIdentifier])
 	delete(f.refs, podIdentifier)
+	f.observeSizeLocked()
 }

@@ -960,6 +960,54 @@ func TestPool_AllBlocksClearedResetsDedup(t *testing.T) {
 	}
 }
 
+// TestPool_ClearPodDropsDedupBucket verifies ClearPod releases a departed
+// pod's reference counts. Without it the bucket is retained for the lifetime
+// of the process -- references are only released when a matching wire
+// BlockRemoved drives the count to zero, and a pod that has gone away sends
+// no further events. It is also a correctness guard: address:port is
+// reusable, so a new pod landing on the same identity would inherit the stale
+// counts and see its legitimate removes suppressed.
+func TestPool_ClearPodDropsDedupBucket(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newTestPool(t, 16)
+
+	tokens := makeTokens(64)
+	engineKeys := makeEngineKeys(4, 860)
+
+	// Two stores -> reference count 2 -> a single remove would be suppressed.
+	for range 2 {
+		pool.processEventBatch(ctx, &EventBatch{
+			Events: []GenericEvent{
+				&BlockStoredEvent{BlockHashes: engineKeys, Tokens: tokens, ParentHash: 0},
+			},
+		}, "pod-gone", "test-model")
+	}
+	require.NotEmpty(t, pool.dedup.refs["pod-gone"], "precondition: references tracked")
+
+	pool.ClearPod("pod-gone")
+
+	assert.Empty(t, pool.dedup.refs["pod-gone"], "bucket must be released on pod departure")
+	assert.Zero(t, pool.dedup.tracked, "entry count must be decremented, not just the bucket dropped")
+
+	// A pod reusing the identity must start clean: one store, one remove, gone.
+	pool.processEventBatch(ctx, &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{BlockHashes: engineKeys, Tokens: tokens, ParentHash: 0},
+		},
+	}, "pod-gone", "test-model")
+	pool.processEventBatch(ctx, &EventBatch{
+		Events: []GenericEvent{&BlockRemovedEvent{BlockHashes: engineKeys}},
+	}, "pod-gone", "test-model")
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	for _, ck := range canonicalKeys {
+		result, err := idx.Lookup(ctx, []kvblock.BlockHash{ck}, nil)
+		require.NoError(t, err)
+		assert.Empty(t, result[ck], "single remove must evict; a stale count would suppress it")
+	}
+}
+
 // TestPool_DuplicateStoreSurvivesFirstRemove is the end-to-end proof through
 // processEventBatch with a real index: two overlapping chunks announce the same
 // blocks, so the first BlockRemoved must not evict them and the second must.

@@ -79,6 +79,10 @@ type subscriberManager interface {
 		remoteSocket bool,
 	) error
 	RemoveSubscriber(ctx context.Context, podIdentifier string)
+	// ClearPodState drops KV-event bookkeeping held for a departed pod.
+	// Takes the event-stream identity ("address:port"), which differs from
+	// the subscriber key used by EnsureSubscriber/RemoveSubscriber.
+	ClearPodState(podIdentifier string)
 	GetActiveSubscribers() ([]string, []string)
 	Shutdown(ctx context.Context)
 }

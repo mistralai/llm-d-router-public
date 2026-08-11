@@ -760,6 +760,7 @@ type fakeSubscriberManager struct {
 	ids             []string
 	sourceEndpoints []string
 	endpoints       []string
+	clearedPods     []string
 }
 
 func (f *fakeSubscriberManager) EnsureSubscriber(
@@ -773,6 +774,9 @@ func (f *fakeSubscriberManager) EnsureSubscriber(
 	return nil
 }
 func (f *fakeSubscriberManager) RemoveSubscriber(_ context.Context, _ string) {}
+func (f *fakeSubscriberManager) ClearPodState(podIdentifier string) {
+	f.clearedPods = append(f.clearedPods, podIdentifier)
+}
 func (f *fakeSubscriberManager) GetActiveSubscribers() ([]string, []string) {
 	return f.ids, f.endpoints
 }

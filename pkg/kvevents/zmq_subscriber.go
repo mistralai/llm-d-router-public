@@ -39,6 +39,14 @@ type zmqSubscriber struct {
 	endpoint       string
 	remote         bool
 	topicFilter    string
+
+	// lastSeq is the last sequence number seen per topic, used to detect
+	// messages lost in transit. ZMQ SUB drops silently at the high-water
+	// mark, so a sequence gap is the only evidence. Owned by the receive
+	// goroutine; a subscriber runs exactly one at a time, so no lock.
+	// Deliberately survives reconnects: messages published while
+	// disconnected are genuinely lost and should be counted.
+	lastSeq map[string]uint64
 }
 
 // newZMQSubscriber creates a new ZMQ subscriber.
@@ -50,6 +58,7 @@ func newZMQSubscriber(pool *Pool, podIdentifier, sourceEndpoint, endpoint, topic
 		endpoint:       endpoint,
 		remote:         remote,
 		topicFilter:    topicFilter,
+		lastSeq:        make(map[string]uint64),
 	}
 }
 
@@ -143,6 +152,20 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			continue
 		}
 		seq := binary.BigEndian.Uint64(seqBytes)
+
+		// A gap means the transport lost messages. It is not merely lost
+		// visibility: a dropped BlockRemoved leaves a dedup reference count
+		// that nothing will ever decrement, so the filter's per-pod bucket
+		// grows without bound. A non-increasing seq means the publisher
+		// restarted (or the message is a duplicate); resync without counting.
+		if last, seen := z.lastSeq[topic]; seen && seq > last+1 {
+			missed := seq - last - 1
+			metrics.EventsDropped.WithLabelValues(z.podIdentifier).Add(float64(missed))
+			debugLogger.Info("Detected KV-event sequence gap; dedup reference counts for this pod may be stranded",
+				"topic", topic, "expectedSeq", last+1, "gotSeq", seq, "missed", missed,
+				"podIdentifier", z.podIdentifier, "endpoint", z.endpoint)
+		}
+		z.lastSeq[topic] = seq
 
 		debugLogger.V(logging.TRACE).Info("Received message from zmq subscriber",
 			"topic", topic,

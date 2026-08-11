@@ -288,6 +288,49 @@ func TestProducer_ExtractEndpoint_DeleteClearsIndex(t *testing.T) {
 	assert.Empty(t, ids)
 }
 
+// EventDelete must clear the dedup reference counts alongside the index, and
+// with the same identity. A dedup reference only gates whether a BlockRemoved
+// evicts an index entry, so clearing the index while retaining the references
+// strands a per-pod bucket that nothing will ever drain -- and a pod that
+// later reuses this address:port would inherit the stale counts. Regression
+// guard: TestProducer_ExtractEndpoint_DeleteClearsIndex proves only that the
+// index was cleared.
+func TestProducer_ExtractEndpoint_DeleteClearsDedupWithIndexIdentity(t *testing.T) {
+	ctx := discardCtx(t)
+
+	var clearedIndexPod string
+	fakeIndex := &fakeKVBlockIndex{
+		clearFn: func(_ context.Context, podIdentifier string) error {
+			clearedIndexPod = podIdentifier
+			return nil
+		},
+	}
+
+	cfg := kvevents.DefaultConfig()
+	cfg.DiscoverPods = true
+	cfg.PodDiscoveryConfig = kvevents.DefaultPodReconcilerConfig()
+	cfg.PodDiscoveryConfig.SocketPort = 5557
+
+	subs := &fakeSubscriberManager{}
+	p := &Producer{
+		typedName:          plugin.TypedName{Type: PluginType, Name: PluginType},
+		subscribersManager: subs,
+		kvEventsConfig:     cfg,
+		kvCacheIndexer:     &fakeKVCacheIndexer{index: fakeIndex},
+		subscriberCtx:      context.Background(),
+	}
+
+	ep := newEndpoint("pod-dedup-clear", "10.0.0.42")
+	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: ep}))
+	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{Type: fwkdl.EventDelete, Endpoint: ep}))
+
+	require.Equal(t, []string{"10.0.0.42:8080"}, subs.clearedPods,
+		"dedup state must be cleared on pod departure")
+	assert.Equal(t, clearedIndexPod, subs.clearedPods[0],
+		"dedup and index must be cleared with the same identity; the event stream "+
+			"keys on address:port, so passing the subscriber key would silently clear nothing")
+}
+
 // Delete by NamespacedName must work even when the event has no address.
 func TestProducer_ExtractEndpoint_DeleteWithMissingAddressRemovesExistingSubscriber(t *testing.T) {
 	ctx := discardCtx(t)

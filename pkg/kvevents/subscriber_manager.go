@@ -130,6 +130,17 @@ func (sm *SubscriberManager) RemoveSubscriber(ctx context.Context, podIdentifier
 	cleanupSubscriberMetrics(podIdentifier, entry.done)
 }
 
+// ClearPodState drops the pool's dedup reference counts for a departed pod.
+//
+// Separate from RemoveSubscriber because the two are keyed differently:
+// subscribers are tracked by the Kubernetes object name, while dedup
+// references are keyed by the event stream's source endpoint
+// ("address:port"). Passing the subscriber key here would silently clear
+// nothing.
+func (sm *SubscriberManager) ClearPodState(podIdentifier string) {
+	sm.pool.ClearPod(podIdentifier)
+}
+
 // cleanupSubscriberMetrics drops the per-pod series for a removed subscriber
 // once its goroutine has exited. Cancellation is asynchronous, so cleaning up
 // eagerly would let a final message or error increment resurrect the series.

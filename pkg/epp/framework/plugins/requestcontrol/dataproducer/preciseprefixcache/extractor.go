@@ -53,7 +53,15 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 	case fwkdl.EventDelete:
 		p.subscribersManager.RemoveSubscriber(ctx, endpointKey)
 		if meta.Address != "" {
-			if err := p.kvCacheIndexer.KVBlockIndex().Clear(ctx, fmt.Sprintf("%s:%s", meta.Address, meta.Port)); err != nil {
+			// Both clears take the event-stream identity, not endpointKey.
+			// They must stay paired: a dedup reference only gates whether a
+			// BlockRemoved evicts an index entry, so clearing the index while
+			// retaining the references leaks a bucket that nothing will ever
+			// drain, and a pod later reusing this address:port would inherit
+			// the stale counts.
+			podID := fmt.Sprintf("%s:%s", meta.Address, meta.Port)
+			p.subscribersManager.ClearPodState(podID)
+			if err := p.kvCacheIndexer.KVBlockIndex().Clear(ctx, podID); err != nil {
 				logger.Error(err, "Failed to clear index entries for removed endpoint",
 					"endpoint", endpointKey, "address", meta.Address, "port", meta.Port)
 			}

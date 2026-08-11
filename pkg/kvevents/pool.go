@@ -199,6 +199,22 @@ func (p *Pool) Shutdown(ctx context.Context) {
 	logger.Info("event processing pool shut down.")
 }
 
+// ClearPod drops every dedup reference count held for podIdentifier.
+//
+// The dedup filter only releases a reference when a matching wire
+// BlockRemoved drives its count to zero, so references for a pod that has
+// gone away are never reclaimed and its bucket is retained for the lifetime
+// of the process. Callers invoke this on pod departure, alongside
+// Index.Clear, mirroring the AllBlocksCleared path which already clears both
+// in lockstep.
+//
+// podIdentifier must be the same identity the event stream uses (the
+// subscriber's source endpoint, "address:port") — not the Kubernetes object
+// name — or the call silently clears nothing.
+func (p *Pool) ClearPod(podIdentifier string) {
+	p.dedup.clear(podIdentifier)
+}
+
 // AddTask is called by the subscriber to add a message to the processing queue.
 // It hashes the sharding key to select a queue, ensuring messages for the
 // same source endpoint always go to the same worker (ordered queue).
