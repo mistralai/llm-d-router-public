@@ -42,11 +42,12 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	rcplugins "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol"
+	preciseprefixcacheconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/preciseprefixcache/constants"
 	tokenproducer "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 )
 
 // PluginType is the registered type name of the precise-prefix-cache-producer.
-const PluginType = "precise-prefix-cache-producer"
+const PluginType = preciseprefixcacheconstants.PluginType
 
 // PluginConfig configures the precise-prefix-cache-producer. Nested fields
 // mirror the llm-d-kv-cache configuration shape (see that repo's
@@ -77,6 +78,7 @@ type subscriberManager interface {
 	EnsureSubscriber(
 		ctx context.Context,
 		podIdentifier, sourceEndpoint, endpoint, replayEndpoint, topicFilter string,
+		dataParallelRank *int,
 		remoteSocket bool,
 	) error
 	RemoveSubscriber(ctx context.Context, podIdentifier string)
@@ -193,7 +195,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	subscribersManager := kvevents.NewSubscriberManager(pool)
 	if config.KVEventsConfig.ZMQEndpoint != "" {
 		if err := subscribersManager.EnsureSubscriber(ctx, "local-subscriber", "",
-			config.KVEventsConfig.ZMQEndpoint, "", config.KVEventsConfig.TopicFilter, false); err != nil {
+			config.KVEventsConfig.ZMQEndpoint, "", config.KVEventsConfig.TopicFilter, nil, false); err != nil {
 			return nil, fmt.Errorf("failed to create local subscriber for global socket mode: %w", err)
 		}
 	}
@@ -350,12 +352,7 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		keyToPods map[kvblock.BlockHash][]kvblock.PodEntry
 	}
 
-	aggregatedScores := make(map[string]float64)
-	// Winning data-parallel rank per pod, with the single-prompt score that won
-	// it. Scores sum across prompts but one rank serves the request, so the
-	// rank that scored best on any single prompt is the one to steer to.
-	winningRanks := make(map[string]int)
-	bestRankScores := make(map[string]float64)
+	aggregatedRankScores := make(map[string]float64)
 	totalBlocks := 0
 	lookups := make([]promptLookup, 0, len(perPromptKeys))
 	for _, blockKeys := range perPromptKeys {
@@ -369,32 +366,18 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 			span.SetStatus(codes.Error, err.Error())
 			return fmt.Errorf("failed to score block keys: %w", err)
 		}
-		// Scores arrive keyed by "<pod>@dp<rank>" for data-parallel engines but
-		// are matched below against bare "ip:port" endpoint addresses, so they
-		// have to be collapsed before use.
-		scores, promptRanks := kvcache.CollapseDPScoresToPods(rankScores)
-		for pod, score := range scores {
-			aggregatedScores[pod] += score
-			rank, isDP := promptRanks[pod]
-			if !isDP {
-				continue
-			}
-			if cur, seen := bestRankScores[pod]; !seen || score > cur {
-				bestRankScores[pod] = score
-				winningRanks[pod] = rank
-			}
+		for scoringKey, score := range rankScores {
+			aggregatedRankScores[scoringKey] += score
 		}
 		totalBlocks += len(blockKeys)
 		lookups = append(lookups, promptLookup{keys: blockKeys, keyToPods: keyToPods})
 	}
 
-	// Hand the winning ranks to the pre-request stage, which pins the request
-	// to the rank of whichever endpoint scheduling selects. Nothing is emitted
-	// for non-DP engines: there is no rank, and vLLM has none to pin to.
-	if encoded, err := routing.EncodeWinningRanks(winningRanks); err == nil {
-		request.Headers[routing.DataParallelWinningRanksHeader] = encoded
-	} else if !errors.Is(err, routing.ErrEmptyWinningRanks) {
-		logger.Error(err, "failed to encode data-parallel winning ranks")
+	// Scores must be summed per rank before collapsing because one rank serves
+	// every prompt in the request.
+	aggregatedScores, winningRanks := kvcache.CollapseDPScoresToPods(aggregatedRankScores)
+	if request != nil && len(winningRanks) > 0 {
+		request.PutAttribute(preciseprefixcacheconstants.WinningRanksDataKey, winningRanks)
 	}
 
 	maxMatch := 0
@@ -410,9 +393,13 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		}
 		cachedBlocks := 0
 		cachedBlocksByTier := map[string]int{}
+		winningRank := routing.NoDataParallelRank
+		if rank, ok := winningRanks[addr]; ok {
+			winningRank = rank
+		}
 		for _, lu := range lookups {
-			cachedBlocks += matchedBlockCount(lu.keys, lu.keyToPods, addr)
-			for tier, count := range matchedBlockCountByTier(lu.keys, lu.keyToPods, addr) {
+			cachedBlocks += matchedBlockCount(lu.keys, lu.keyToPods, addr, winningRank)
+			for tier, count := range matchedBlockCountByTier(lu.keys, lu.keyToPods, addr, winningRank) {
 				cachedBlocksByTier[tier] += count
 			}
 		}

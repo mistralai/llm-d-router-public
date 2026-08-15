@@ -127,6 +127,10 @@ func (t *tracedIndex) Clear(ctx context.Context, podIdentifier string) error {
 	return t.next.Clear(ctx, podIdentifier)
 }
 
+func (t *tracedIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
+	return t.next.ClearRank(ctx, podIdentifier, dataParallelRank)
+}
+
 func keyTypeLabel(keyType KeyType) string {
 	switch keyType {
 	case EngineKey:

@@ -231,3 +231,7 @@ func (f *failingIndex) GetRequestKey(context.Context, kvblock.BlockHash) (kvbloc
 func (f *failingIndex) Clear(context.Context, string) error {
 	return f.err
 }
+
+func (f *failingIndex) ClearRank(context.Context, string, int) error {
+	return f.err
+}

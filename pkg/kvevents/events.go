@@ -70,6 +70,9 @@ type RawMessage struct {
 	Payload []byte
 	// SourceEndpoint is the serving endpoint associated with the subscriber.
 	SourceEndpoint string
+	// ResetDataParallelRank scopes a replay reset to one rank behind a shared
+	// serving endpoint. Nil resets the whole endpoint.
+	ResetDataParallelRank *int
 	// reset clears the message's pod before later messages on the same queue.
 	reset bool
 }
