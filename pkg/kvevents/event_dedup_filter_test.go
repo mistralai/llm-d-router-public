@@ -36,11 +36,9 @@ func TestEventDedupFilter_DuplicateStoreSuppressesFirstRemove(t *testing.T) {
 		"second remove must forward every hash to the index")
 }
 
-// TestEventDedupFilter_AggregatesAcrossSources documents the pod-level intent:
-// because the index identity is rank-agnostic on current main, stores that
-// share a scope (e.g. different data-parallel ranks, both using the sentinel)
-// aggregate into one count, so the block is only evicted once every reference
-// is released.
+// TestEventDedupFilter_AggregatesAcrossSources verifies stores that share one
+// exact scope aggregate into one count, so the block is only evicted once every
+// reference is released.
 func TestEventDedupFilter_AggregatesAcrossSources(t *testing.T) {
 	f := newEventDedupFilter()
 	s := gpuScope("pod-a")
@@ -86,12 +84,8 @@ func TestEventDedupFilter_GroupIndependence(t *testing.T) {
 		"group 1 remove must be independent of the group 0 store")
 }
 
-// TestEventDedupFilter_DataParallelRankIndependence verifies the filter already
-// separates reference counts by data-parallel rank, so it is ready to become
-// DP-aware (see noDataParallelRank / PR #370) once the pool feeds a real rank
-// instead of the sentinel. On current main every scope uses the sentinel, so
-// this dimension is dormant in production but unit-tested here for forward
-// compatibility.
+// TestEventDedupFilter_DataParallelRankIndependence verifies reference counts
+// are separated by data-parallel rank.
 func TestEventDedupFilter_DataParallelRankIndependence(t *testing.T) {
 	f := newEventDedupFilter()
 	dp0 := testScope("pod-a", "gpu", noGroupIdx, 0)
@@ -170,6 +164,23 @@ func TestEventDedupFilter_ClearIsolatesPods(t *testing.T) {
 		"pod-b count must survive pod-a clear (first of two removes suppressed)")
 }
 
+func TestEventDedupFilter_ClearRankPreservesOtherRanks(t *testing.T) {
+	f := newEventDedupFilter()
+	rank0 := testScope("pod-a", "gpu", noGroupIdx, 0)
+	rank1 := testScope("pod-a", "gpu", noGroupIdx, 1)
+
+	f.trackStore(rank0, []uint64{1})
+	f.trackStore(rank0, []uint64{1})
+	f.trackStore(rank1, []uint64{1})
+	f.trackStore(rank1, []uint64{1})
+	f.clearRank("pod-a", 0)
+
+	assert.Equal(t, []uint64{1}, f.filterRemove(rank0, []uint64{1}),
+		"the cleared rank must have fresh reference state")
+	assert.Empty(t, f.filterRemove(rank1, []uint64{1}),
+		"another rank's duplicate reference count must survive")
+}
+
 // TestEventDedupFilter_NilSafe verifies the nil-receiver guards so a Pool
 // without a filter degrades to forwarding every event.
 func TestEventDedupFilter_NilSafe(t *testing.T) {
@@ -178,6 +189,7 @@ func TestEventDedupFilter_NilSafe(t *testing.T) {
 
 	assert.NotPanics(t, func() { f.trackStore(s, []uint64{1}) })
 	assert.NotPanics(t, func() { f.clear("pod-a") })
+	assert.NotPanics(t, func() { f.clearRank("pod-a", 0) })
 	assert.Equal(t, []uint64{1}, f.filterRemove(s, []uint64{1}),
 		"nil filter must forward removes unchanged")
 }

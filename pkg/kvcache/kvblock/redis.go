@@ -349,6 +349,15 @@ func redisEngineKey(engineKey BlockHash) string {
 // off the Lookup/Add hot path. Because it deletes from the shared store, it is
 // correct for multi-replica deployments with no cross-process coordination.
 func (r *RedisIndex) Clear(ctx context.Context, podIdentifier string) error {
+	return r.clear(ctx, podIdentifier, nil)
+}
+
+// ClearRank removes every entry for one data-parallel rank of the pod.
+func (r *RedisIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
+	return r.clear(ctx, podIdentifier, &dataParallelRank)
+}
+
+func (r *RedisIndex) clear(ctx context.Context, podIdentifier string, dataParallelRank *int) error {
 	logger := log.FromContext(ctx).WithName("kvblock.RedisIndex.Clear")
 
 	const scanBatch int64 = 1024
@@ -371,7 +380,8 @@ func (r *RedisIndex) Clear(ctx context.Context, podIdentifier string) error {
 
 			var stale []string
 			for _, field := range fields {
-				if entry, ok := decodeRedisPodField(field); ok && entry.PodIdentifier == podIdentifier {
+				if entry, ok := decodeRedisPodField(field); ok &&
+					entryMatchesClear(entry, podIdentifier, dataParallelRank) {
 					stale = append(stale, field)
 				}
 			}
