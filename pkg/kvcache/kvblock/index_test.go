@@ -158,6 +158,11 @@ func testCommonIndexBehavior(t *testing.T, indexFactory func(t *testing.T) Index
 		index := indexFactory(t)
 		testClearThenReAdd(t, ctx, index)
 	})
+
+	t.Run("ClearRankPreservesSiblingRanks", func(t *testing.T) {
+		index := indexFactory(t)
+		testClearRankPreservesSiblingRanks(t, ctx, index)
+	})
 }
 
 // testClearBasic verifies Clear makes all of a pod's entries invisible to Lookup.
@@ -233,6 +238,25 @@ func testClearThenReAdd(t *testing.T, ctx context.Context, index Index) {
 	hits, err = index.Lookup(ctx, []BlockHash{key}, sets.Set[string]{})
 	require.NoError(t, err)
 	assert.Len(t, hits[key], 1, "re-added pod must be visible after Clear")
+}
+
+func testClearRankPreservesSiblingRanks(t *testing.T, ctx context.Context, index Index) {
+	t.Helper()
+	rank0, rank1 := 0, 1
+	key := BlockHash(0xC1EA0005)
+	entries := []PodEntry{
+		{PodIdentifier: "pod-dp", DeviceTier: "gpu", DataParallelRank: &rank0},
+		{PodIdentifier: "pod-dp", DeviceTier: "gpu", DataParallelRank: &rank1},
+		{PodIdentifier: "pod-dp", DeviceTier: "gpu"},
+		{PodIdentifier: "pod-other", DeviceTier: "gpu", DataParallelRank: &rank0},
+	}
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{key}, entries))
+	require.NoError(t, index.ClearRank(ctx, "pod-dp", rank0))
+
+	hits, err := index.Lookup(ctx, []BlockHash{key}, sets.Set[string]{})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, entries[1:], hits[key],
+		"clearing one rank must preserve sibling ranks, unranked entries, and other pods")
 }
 
 // testBasicAddAndLookup tests basic Add and Lookup functionality.

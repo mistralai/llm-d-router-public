@@ -23,11 +23,13 @@ import (
 	"testing"
 
 	"github.com/jellydator/ttlcache/v3"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/kvcache"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvevents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -36,6 +38,8 @@ import (
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+	preciseprefixcacheconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/preciseprefixcache/constants"
+	dprank "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/profilehandler/dataparallel"
 	"github.com/llm-d/llm-d-router/test/utils"
 )
 
@@ -85,6 +89,10 @@ func (f *fakeKVBlockIndex) Clear(ctx context.Context, podIdentifier string) erro
 	if f.clearFn != nil {
 		return f.clearFn(ctx, podIdentifier)
 	}
+	return nil
+}
+
+func (f *fakeKVBlockIndex) ClearRank(_ context.Context, _ string, _ int) error {
 	return nil
 }
 
@@ -368,6 +376,78 @@ func TestProduce_MultiPromptSkipsEmptyPromptKeys(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 0, info.MatchBlocks())
 	assert.Equal(t, 1, info.TotalBlocks())
+}
+
+func TestProduce_MultiPromptChoosesBestAggregateRank(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	endpoints := freshEndpoints()[:1]
+	const addr = "10.0.0.1:8080"
+	keysA := []kvblock.BlockHash{1, 2, 3, 4}
+	keysB := []kvblock.BlockHash{5, 6, 7}
+
+	idx := &fakeKVCacheIndexer{index: &fakeKVBlockIndex{
+		lookup: func(_ context.Context, keys []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
+			return map[kvblock.BlockHash][]kvblock.PodEntry{}, nil
+		},
+	}}
+	scorer := &fakeKVBlockScorer{score: func(_ context.Context, keys []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
+		if keys[0] == keysA[0] {
+			return map[string]float64{addr + "@dp0": 4, addr + "@dp1": 3}, nil
+		}
+		return map[string]float64{addr + "@dp1": 3}, nil
+	}}
+	p := newProducerWithIndexer(ctx, idx, scorer)
+	req := &scheduling.InferenceRequest{RequestID: "req-dp-aggregate", Headers: map[string]string{}}
+
+	require.NoError(t, p.produceFromBlockKeys(ctx, trace.SpanFromContext(ctx), req, endpoints,
+		[][]kvblock.BlockHash{keysA, keysB}, nil))
+
+	raw, ok := endpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
+	require.True(t, ok)
+	info := raw.(*attrprefix.PrefixCacheMatchInfo)
+	assert.Equal(t, 6, info.MatchBlocks(), "scores must be summed by rank before choosing the pod score")
+	ranks, ok := scheduling.ReadRequestAttribute[map[string]int](req, preciseprefixcacheconstants.WinningRanksDataKey)
+	require.True(t, ok)
+	assert.Equal(t, 1, ranks[addr])
+	dprank.NewDPRankHeaderHandler().PreRequest(ctx, req, &scheduling.SchedulingResult{
+		PrimaryProfileName: "default",
+		ProfileResults: map[string]*scheduling.ProfileRunResult{
+			"default": {TargetEndpoints: endpoints},
+		},
+	})
+	assert.Equal(t, "1", req.Headers[routing.DataParallelRankHeader],
+		"the selected pod must receive the rank that won aggregate scoring")
+}
+
+func TestProduce_CachedBlocksUseWinningRank(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	endpoints := freshEndpoints()[:1]
+	const addr = "10.0.0.1:8080"
+	rank0, rank1 := 0, 1
+	keys := []kvblock.BlockHash{1, 2}
+	keyToPods := map[kvblock.BlockHash][]kvblock.PodEntry{
+		1: {{PodIdentifier: addr, DeviceTier: "gpu", DataParallelRank: &rank0}},
+		2: {{PodIdentifier: addr, DeviceTier: "gpu", DataParallelRank: &rank1}},
+	}
+	idx := &fakeKVCacheIndexer{index: &fakeKVBlockIndex{
+		lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
+			return keyToPods, nil
+		},
+	}}
+	p := newProducerWithIndexer(ctx, idx, &kvcache.LongestPrefixScorer{
+		MediumWeights: map[string]float64{"gpu": 1},
+	})
+	req := &scheduling.InferenceRequest{RequestID: "req-dp-cached", Headers: map[string]string{}}
+
+	require.NoError(t, p.produceFromBlockKeys(ctx, trace.SpanFromContext(ctx), req, endpoints,
+		[][]kvblock.BlockHash{keys}, nil))
+
+	raw, ok := endpoints[0].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
+	require.True(t, ok)
+	info := raw.(*attrprefix.PrefixCacheMatchInfo)
+	assert.Equal(t, 1, info.MatchBlocks())
+	assert.Equal(t, 1, info.CachedBlockCount(), "blocks held by another rank must not extend the prefix")
+	assert.Equal(t, map[string]int{"gpu": 1}, info.CachedBlocksByTier())
 }
 
 // Per-tier contiguous counts are attached per endpoint and summed across
@@ -761,19 +841,24 @@ func TestNewRejectsUnsupportedKVEventEngineType(t *testing.T) {
 }
 
 type fakeSubscriberManager struct {
-	ids             []string
-	sourceEndpoints []string
-	endpoints       []string
+	ids               []string
+	sourceEndpoints   []string
+	endpoints         []string
+	replayEndpoints   []string
+	dataParallelRanks []*int
 }
 
 func (f *fakeSubscriberManager) EnsureSubscriber(
 	_ context.Context,
-	id, sourceEndpoint, endpoint, _, _ string,
+	id, sourceEndpoint, endpoint, replayEndpoint, _ string,
+	dataParallelRank *int,
 	_ bool,
 ) error {
 	f.ids = append(f.ids, id)
 	f.sourceEndpoints = append(f.sourceEndpoints, sourceEndpoint)
 	f.endpoints = append(f.endpoints, endpoint)
+	f.replayEndpoints = append(f.replayEndpoints, replayEndpoint)
+	f.dataParallelRanks = append(f.dataParallelRanks, dataParallelRank)
 	return nil
 }
 func (f *fakeSubscriberManager) RemoveSubscriber(_ context.Context, _ string) {}

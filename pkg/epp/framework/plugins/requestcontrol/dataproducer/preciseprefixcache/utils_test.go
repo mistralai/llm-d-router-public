@@ -92,9 +92,24 @@ func TestMatchedBlockCount(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, matchedBlockCount(keys, tt.keyToPods, tt.podID))
+			assert.Equal(t, tt.want, matchedBlockCount(keys, tt.keyToPods, tt.podID, -1))
 		})
 	}
+}
+
+func TestMatchedBlockCountDoesNotJoinRanks(t *testing.T) {
+	rank0, rank1 := 0, 1
+	const pod = "10.0.0.1:8000"
+	keys := []kvblock.BlockHash{1, 2}
+	keyToPods := map[kvblock.BlockHash][]kvblock.PodEntry{
+		1: {{PodIdentifier: pod, DeviceTier: "gpu", DataParallelRank: &rank0}},
+		2: {{PodIdentifier: pod, DeviceTier: "gpu", DataParallelRank: &rank1}},
+	}
+
+	assert.Equal(t, 1, matchedBlockCount(keys, keyToPods, pod, rank0))
+	assert.Equal(t, 0, matchedBlockCount(keys, keyToPods, pod, rank1))
+	assert.Equal(t, map[string]int{"gpu": 1}, matchedBlockCountByTier(keys, keyToPods, pod, rank0))
+	assert.Empty(t, matchedBlockCountByTier(keys, keyToPods, pod, rank1))
 }
 
 func TestMatchedBlockCountByTier(t *testing.T) {
@@ -174,11 +189,11 @@ func TestMatchedBlockCountByTier(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := matchedBlockCountByTier(keys, tt.keyToPods, tt.podID)
+			got := matchedBlockCountByTier(keys, tt.keyToPods, tt.podID, -1)
 			assert.NotNil(t, got)
 			assert.Equal(t, tt.want, got)
 			// Each tier's contiguous count never exceeds the any-tier count.
-			anyTier := matchedBlockCount(keys, tt.keyToPods, tt.podID)
+			anyTier := matchedBlockCount(keys, tt.keyToPods, tt.podID, -1)
 			for tier, count := range got {
 				assert.LessOrEqual(t, count, anyTier, "tier %q", tier)
 			}

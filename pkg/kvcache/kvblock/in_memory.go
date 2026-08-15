@@ -316,6 +316,15 @@ func (m *InMemoryIndex) evictPodsFromRequestKey(requestKey, engineKey BlockHash,
 // and any stale mapping resolves to an emptied request key that correctly breaks
 // the prefix chain in Lookup.
 func (m *InMemoryIndex) Clear(ctx context.Context, podIdentifier string) error {
+	return m.clear(ctx, podIdentifier, nil)
+}
+
+// ClearRank removes every entry for one data-parallel rank of the pod.
+func (m *InMemoryIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
+	return m.clear(ctx, podIdentifier, &dataParallelRank)
+}
+
+func (m *InMemoryIndex) clear(ctx context.Context, podIdentifier string, dataParallelRank *int) error {
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Clear")
 
 	for _, requestKey := range m.data.Keys() {
@@ -328,7 +337,7 @@ func (m *InMemoryIndex) Clear(ctx context.Context, podIdentifier string) error {
 		podCache.mu.Lock()
 		var matched []PodEntry
 		for _, entry := range podCache.cache.Keys() {
-			if entry.PodIdentifier == podIdentifier {
+			if entryMatchesClear(entry, podIdentifier, dataParallelRank) {
 				matched = append(matched, entry)
 			}
 		}
@@ -341,6 +350,16 @@ func (m *InMemoryIndex) Clear(ctx context.Context, podIdentifier string) error {
 
 	traceLogger.Info("cleared pod from index", "pod", podIdentifier)
 	return nil
+}
+
+func entryMatchesClear(entry PodEntry, podIdentifier string, dataParallelRank *int) bool {
+	if entry.PodIdentifier != podIdentifier {
+		return false
+	}
+	if dataParallelRank == nil {
+		return true
+	}
+	return entry.DataParallelRank != nil && *entry.DataParallelRank == *dataParallelRank
 }
 
 // GetRequestKey returns the last request key (highest index in the chain) associated with the given engineKey.

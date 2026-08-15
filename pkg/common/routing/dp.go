@@ -16,8 +16,6 @@
 package routing
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -39,24 +37,14 @@ const (
 	// the only way to steer when the ranks are not separate endpoints. The
 	// routing sidecar already sets this same header on its prefill leg.
 	DataParallelRankHeader = "x-data-parallel-rank"
-
-	// DataParallelWinningRanksHeader carries per-pod winning ranks from
-	// scheduling to the pre-request stage as a JSON object of pod address to
-	// rank, e.g. {"10.0.0.1:8000":0}. It is internal to the EPP and is removed
-	// before the request is forwarded upstream.
-	DataParallelWinningRanksHeader = "x-llm-d-dp-winning-ranks"
 )
-
-// ErrEmptyWinningRanks reports that there are no winning ranks to transport.
-// Callers should skip emitting the header rather than send an empty object.
-var ErrEmptyWinningRanks = errors.New("winning ranks map is empty")
 
 // ParseDPScoringKey splits a scoring key into its pod identifier and
 // data-parallel rank, returning NoDataParallelRank when the key carries none.
 //
 // Only a suffix of the exact shape "@dp<digits>" is treated as a rank, so a pod
 // identifier that happens to contain "@dp" (for instance "pod@dp-service:8080")
-// is returned unchanged rather than being mis-split. The last such suffix wins,
+// is returned unchanged rather than being split incorrectly. The last such suffix wins,
 // which matters for identifiers that contain both.
 func ParseDPScoringKey(scoringKey string) (podIdentifier string, dataParallelRank int) {
 	idx := strings.LastIndex(scoringKey, DPRankSuffix)
@@ -97,44 +85,4 @@ func BuildDPScoringKey(podIdentifier string, dataParallelRank int) (string, erro
 func StripDPRankSuffix(scoringKey string) string {
 	podIdentifier, _ := ParseDPScoringKey(scoringKey)
 	return podIdentifier
-}
-
-// EncodeWinningRanks serialises a pod-address to rank map for header
-// transport. It returns ErrEmptyWinningRanks for an empty map and rejects
-// negative ranks.
-func EncodeWinningRanks(ranks map[string]int) (string, error) {
-	if len(ranks) == 0 {
-		return "", ErrEmptyWinningRanks
-	}
-	for pod, rank := range ranks {
-		if rank < 0 {
-			return "", fmt.Errorf("invalid negative data-parallel rank %d for pod %q", rank, pod)
-		}
-	}
-	encoded, err := json.Marshal(ranks)
-	if err != nil {
-		return "", err
-	}
-	return string(encoded), nil
-}
-
-// DecodeWinningRanks reverses EncodeWinningRanks. It returns
-// ErrEmptyWinningRanks for empty input and rejects negative ranks.
-func DecodeWinningRanks(encoded string) (map[string]int, error) {
-	if encoded == "" {
-		return nil, ErrEmptyWinningRanks
-	}
-	var ranks map[string]int
-	if err := json.Unmarshal([]byte(encoded), &ranks); err != nil {
-		return nil, err
-	}
-	if len(ranks) == 0 {
-		return nil, ErrEmptyWinningRanks
-	}
-	for pod, rank := range ranks {
-		if rank < 0 {
-			return nil, fmt.Errorf("invalid negative data-parallel rank %d for pod %q", rank, pod)
-		}
-	}
-	return ranks, nil
 }
