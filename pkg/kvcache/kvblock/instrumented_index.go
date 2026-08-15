@@ -74,6 +74,10 @@ func (m *instrumentedIndex) Clear(ctx context.Context, podIdentifier string) err
 	return m.next.Clear(ctx, podIdentifier)
 }
 
+func (m *instrumentedIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
+	return m.next.ClearRank(ctx, podIdentifier, dataParallelRank)
+}
+
 func recordHitMetrics(requestKeys []BlockHash, keyToPods map[BlockHash][]PodEntry) {
 	maxHit := maxContiguousPodHits(requestKeys, keyToPods)
 	metrics.MaxPodHitCount.Add(float64(maxHit))

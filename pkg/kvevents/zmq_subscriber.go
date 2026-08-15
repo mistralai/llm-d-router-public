@@ -42,13 +42,14 @@ var processReplayLimiter = semaphore.NewWeighted(maxConcurrentReplay)
 
 // zmqSubscriber connects to a ZMQ publisher and forwards messages to a pool.
 type zmqSubscriber struct {
-	pool           *Pool
-	podIdentifier  string
-	sourceEndpoint string
-	endpoint       string
-	replayEndpoint string
-	remote         bool
-	topicFilter    string
+	pool             *Pool
+	podIdentifier    string
+	sourceEndpoint   string
+	endpoint         string
+	replayEndpoint   string
+	dataParallelRank *int
+	remote           bool
+	topicFilter      string
 
 	// Replay state persists across reconnections within subscriber lifetime.
 	lastSeq           uint64
@@ -62,16 +63,18 @@ type zmqSubscriber struct {
 func newZMQSubscriber(
 	pool *Pool,
 	podIdentifier, sourceEndpoint, endpoint, replayEndpoint, topicFilter string,
+	dataParallelRank *int,
 	remote bool,
 ) *zmqSubscriber {
 	return &zmqSubscriber{
-		pool:           pool,
-		podIdentifier:  podIdentifier,
-		sourceEndpoint: sourceEndpoint,
-		endpoint:       endpoint,
-		replayEndpoint: replayEndpoint,
-		remote:         remote,
-		topicFilter:    topicFilter,
+		pool:             pool,
+		podIdentifier:    podIdentifier,
+		sourceEndpoint:   sourceEndpoint,
+		endpoint:         endpoint,
+		replayEndpoint:   replayEndpoint,
+		dataParallelRank: dataParallelRank,
+		remote:           remote,
+		topicFilter:      topicFilter,
 	}
 }
 
@@ -184,7 +187,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			logger.Info("Detected event sequence reset, rebuilding index",
 				"lastLiveSeq", z.lastLiveSeq, "currentSeq", seq,
 				"endpoint", z.endpoint)
-			z.pool.resetForSource(topic, z.sourceEndpoint)
+			z.pool.resetForSource(topic, z.sourceEndpoint, z.dataParallelRank)
 			z.lastSeq = 0
 			z.hasLastSeq = false
 			z.lastReplayFailure = time.Time{}
@@ -258,7 +261,7 @@ func (z *zmqSubscriber) canAttemptReplay() bool {
 }
 
 func (z *zmqSubscriber) invalidateReplay(topic string) {
-	z.pool.resetForSource(topic, z.sourceEndpoint)
+	z.pool.resetForSource(topic, z.sourceEndpoint, z.dataParallelRank)
 	z.lastSeq = 0
 	z.hasLastSeq = false
 	z.lastReplayFailure = time.Now()

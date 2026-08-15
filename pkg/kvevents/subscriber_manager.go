@@ -34,11 +34,12 @@ type SubscriberManager struct {
 
 // subscriberEntry represents a single subscriber and its cancellation.
 type subscriberEntry struct {
-	subscriber     *zmqSubscriber
-	cancel         context.CancelFunc
-	endpoint       string
-	sourceEndpoint string
-	replayEndpoint string
+	subscriber       *zmqSubscriber
+	cancel           context.CancelFunc
+	endpoint         string
+	sourceEndpoint   string
+	replayEndpoint   string
+	dataParallelRank *int
 	// done is closed once the subscriber's goroutine has returned.
 	done chan struct{}
 }
@@ -58,6 +59,7 @@ func NewSubscriberManager(pool *Pool) *SubscriberManager {
 func (sm *SubscriberManager) EnsureSubscriber(
 	ctx context.Context,
 	podIdentifier, sourceEndpoint, endpoint, replayEndpoint, topicFilter string,
+	dataParallelRank *int,
 	remoteSocket bool,
 ) error {
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
@@ -68,7 +70,7 @@ func (sm *SubscriberManager) EnsureSubscriber(
 	// Check if subscriber already exists
 	if entry, exists := sm.subscribers[podIdentifier]; exists {
 		if entry.endpoint == endpoint && entry.sourceEndpoint == sourceEndpoint &&
-			entry.replayEndpoint == replayEndpoint {
+			entry.replayEndpoint == replayEndpoint && equalOptionalInt(entry.dataParallelRank, dataParallelRank) {
 			// Subscriber already exists with the same endpoint, nothing to do
 			debugLogger.V(logging.TRACE).Info("Subscriber already exists", "podIdentifier", podIdentifier, "endpoint", endpoint)
 			return nil
@@ -81,7 +83,9 @@ func (sm *SubscriberManager) EnsureSubscriber(
 			"oldSourceEndpoint", entry.sourceEndpoint,
 			"newSourceEndpoint", sourceEndpoint,
 			"oldReplayEndpoint", entry.replayEndpoint,
-			"newReplayEndpoint", replayEndpoint)
+			"newReplayEndpoint", replayEndpoint,
+			"oldDataParallelRank", entry.dataParallelRank,
+			"newDataParallelRank", dataParallelRank)
 		entry.cancel()
 		delete(sm.subscribers, podIdentifier)
 		// The replacement subscriber below reuses podIdentifier, so its series
@@ -91,7 +95,8 @@ func (sm *SubscriberManager) EnsureSubscriber(
 	// Create new subscriber
 	debugLogger.Info("Creating new subscriber", "podIdentifier", podIdentifier, "endpoint", endpoint)
 	subscriber := newZMQSubscriber(
-		sm.pool, podIdentifier, sourceEndpoint, endpoint, replayEndpoint, topicFilter, remoteSocket)
+		sm.pool, podIdentifier, sourceEndpoint, endpoint, replayEndpoint, topicFilter,
+		dataParallelRank, remoteSocket)
 
 	// Create a context and start subscriber
 	subCtx, cancel := context.WithCancel(ctx)
@@ -103,17 +108,25 @@ func (sm *SubscriberManager) EnsureSubscriber(
 
 	// Update subscribers
 	sm.subscribers[podIdentifier] = &subscriberEntry{
-		subscriber:     subscriber,
-		cancel:         cancel,
-		endpoint:       endpoint,
-		sourceEndpoint: sourceEndpoint,
-		replayEndpoint: replayEndpoint,
-		done:           done,
+		subscriber:       subscriber,
+		cancel:           cancel,
+		endpoint:         endpoint,
+		sourceEndpoint:   sourceEndpoint,
+		replayEndpoint:   replayEndpoint,
+		dataParallelRank: dataParallelRank,
+		done:             done,
 	}
 	metrics.SubscriberActive.Set(float64(len(sm.subscribers)))
 
 	debugLogger.Info("Subscriber created and started", "podIdentifier", podIdentifier, "endpoint", endpoint)
 	return nil
+}
+
+func equalOptionalInt(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 // RemoveSubscriber removes a subscriber for the given pod identifier.
