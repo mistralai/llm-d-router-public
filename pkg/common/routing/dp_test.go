@@ -82,37 +82,3 @@ func TestBuildDPScoringKeyRoundTrips(t *testing.T) {
 	_, err = routing.BuildDPScoringKey("10.0.0.1:8000", -3)
 	assert.Error(t, err)
 }
-
-func TestWinningRanksRoundTrip(t *testing.T) {
-	ranks := map[string]int{"10.0.0.1:8000": 0, "10.0.0.2:8000": 3}
-
-	encoded, err := routing.EncodeWinningRanks(ranks)
-	require.NoError(t, err)
-
-	decoded, err := routing.DecodeWinningRanks(encoded)
-	require.NoError(t, err)
-	assert.Equal(t, ranks, decoded)
-}
-
-func TestWinningRanksRejectsEmptyAndNegative(t *testing.T) {
-	_, err := routing.EncodeWinningRanks(nil)
-	assert.ErrorIs(t, err, routing.ErrEmptyWinningRanks)
-
-	_, err = routing.EncodeWinningRanks(map[string]int{})
-	assert.ErrorIs(t, err, routing.ErrEmptyWinningRanks)
-
-	_, err = routing.EncodeWinningRanks(map[string]int{"10.0.0.1:8000": -1})
-	assert.Error(t, err)
-
-	_, err = routing.DecodeWinningRanks("")
-	assert.ErrorIs(t, err, routing.ErrEmptyWinningRanks)
-
-	_, err = routing.DecodeWinningRanks("{}")
-	assert.ErrorIs(t, err, routing.ErrEmptyWinningRanks)
-
-	_, err = routing.DecodeWinningRanks(`{"10.0.0.1:8000":-1}`)
-	assert.Error(t, err)
-
-	_, err = routing.DecodeWinningRanks("not json")
-	assert.Error(t, err)
-}

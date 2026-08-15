@@ -21,10 +21,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	preciseprefixcacheconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/preciseprefixcache/constants"
 )
 
 const dpTestProfile = "default"
@@ -40,49 +40,38 @@ func dpResultForFirstEndpoint() *scheduling.SchedulingResult {
 	}
 }
 
-func runDPRankHandler(headers map[string]string, result *scheduling.SchedulingResult) map[string]string {
+func runDPRankHandler(headers map[string]string, ranks map[string]int, result *scheduling.SchedulingResult) map[string]string {
 	request := &scheduling.InferenceRequest{Headers: headers}
+	if ranks != nil {
+		request.PutAttribute(preciseprefixcacheconstants.WinningRanksDataKey, ranks)
+	}
 	NewDPRankHeaderHandler().PreRequest(context.Background(), request, result)
 	return request.Headers
 }
 
 func TestDPRankHeaderHandlerPinsSelectedEndpointRank(t *testing.T) {
-	encoded, err := routing.EncodeWinningRanks(map[string]int{
+	ranks := map[string]int{
 		"10.0.0.1:8000": 2,
 		"10.0.0.9:8000": 5, // a pod that was not selected
-	})
-	require.NoError(t, err)
+	}
 
-	headers := runDPRankHandler(map[string]string{
-		routing.DataParallelWinningRanksHeader: encoded,
-	}, dpResultForFirstEndpoint())
+	headers := runDPRankHandler(map[string]string{}, ranks, dpResultForFirstEndpoint())
 
 	assert.Equal(t, "2", headers[routing.DataParallelRankHeader],
 		"the rank of the selected endpoint must be pinned")
-	assert.NotContains(t, headers, routing.DataParallelWinningRanksHeader,
-		"the internal winning-ranks header must never reach the model server")
 }
 
-// TestDPRankHeaderHandlerStripsInternalHeaderAlways covers the early returns.
-// The winning-ranks header is an EPP implementation detail, so leaking it
-// upstream on any path would be a bug.
-func TestDPRankHeaderHandlerStripsInternalHeaderAlways(t *testing.T) {
-	encoded, err := routing.EncodeWinningRanks(map[string]int{"10.0.0.1:8000": 2})
-	require.NoError(t, err)
-
+func TestDPRankHeaderHandlerDoesNotPinWithoutSelectedEndpoint(t *testing.T) {
 	tests := []struct {
 		name   string
-		header string
 		result *scheduling.SchedulingResult
 	}{
-		{"nil scheduling result", encoded, nil},
-		{"undecodable header", "not json", dpResultForFirstEndpoint()},
-		{"empty ranks object", "{}", dpResultForFirstEndpoint()},
-		{"no endpoints selected", encoded, &scheduling.SchedulingResult{
+		{"nil scheduling result", nil},
+		{"no endpoints selected", &scheduling.SchedulingResult{
 			PrimaryProfileName: dpTestProfile,
 			ProfileResults:     map[string]*scheduling.ProfileRunResult{dpTestProfile: {}},
 		}},
-		{"missing primary profile result", encoded, &scheduling.SchedulingResult{
+		{"missing primary profile result", &scheduling.SchedulingResult{
 			PrimaryProfileName: dpTestProfile,
 			ProfileResults:     map[string]*scheduling.ProfileRunResult{},
 		}},
@@ -90,11 +79,9 @@ func TestDPRankHeaderHandlerStripsInternalHeaderAlways(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			headers := runDPRankHandler(map[string]string{
-				routing.DataParallelWinningRanksHeader: tt.header,
-			}, tt.result)
+			headers := runDPRankHandler(map[string]string{},
+				map[string]int{"10.0.0.1:8000": 2}, tt.result)
 
-			assert.NotContains(t, headers, routing.DataParallelWinningRanksHeader)
 			assert.NotContains(t, headers, routing.DataParallelRankHeader)
 		})
 	}
@@ -106,7 +93,7 @@ func TestDPRankHeaderHandlerStripsInternalHeaderAlways(t *testing.T) {
 func TestDPRankHeaderHandlerClearsClientSuppliedRank(t *testing.T) {
 	headers := runDPRankHandler(map[string]string{
 		routing.DataParallelRankHeader: "7",
-	}, dpResultForFirstEndpoint())
+	}, nil, dpResultForFirstEndpoint())
 
 	assert.NotContains(t, headers, routing.DataParallelRankHeader,
 		"a client-supplied rank must not survive")
@@ -116,18 +103,15 @@ func TestDPRankHeaderHandlerClearsClientSuppliedRank(t *testing.T) {
 // case: scoring recorded no rank, so nothing is pinned and vLLM keeps its own
 // placement.
 func TestDPRankHeaderHandlerNoOpWithoutRecordedRanks(t *testing.T) {
-	headers := runDPRankHandler(map[string]string{}, dpResultForFirstEndpoint())
+	headers := runDPRankHandler(map[string]string{}, nil, dpResultForFirstEndpoint())
 	assert.Empty(t, headers)
 }
 
 // TestDPRankHeaderHandlerSelectedEndpointHasNoRank covers a pod that was scored
 // but held no data-parallel entries, so there is no rank to pin.
 func TestDPRankHeaderHandlerSelectedEndpointHasNoRank(t *testing.T) {
-	encoded, err := routing.EncodeWinningRanks(map[string]int{"10.0.0.9:8000": 5})
-	require.NoError(t, err)
-
-	headers := runDPRankHandler(map[string]string{
-		routing.DataParallelWinningRanksHeader: encoded,
+	headers := runDPRankHandler(map[string]string{}, map[string]int{
+		"10.0.0.9:8000": 5,
 	}, dpResultForFirstEndpoint())
 
 	assert.NotContains(t, headers, routing.DataParallelRankHeader)

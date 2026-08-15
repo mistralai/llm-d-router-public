@@ -101,6 +101,65 @@ func TestDataParallelRanksAreIndexedIndependently(t *testing.T) {
 	assert.Empty(t, result[probe], "once every rank has removed it the block is gone")
 }
 
+func TestDataParallelAllBlocksClearedPreservesOtherRanks(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newTestPool(t, 16)
+	tokens := makeTokens(64)
+	engineKeys := makeEngineKeys(4, 915)
+	rank0, rank1 := 0, 1
+
+	for _, rank := range []*int{&rank0, &rank1} {
+		pool.processEventBatch(ctx, &EventBatch{
+			Events: []GenericEvent{
+				&BlockStoredEvent{BlockHashes: engineKeys, Tokens: tokens, ParentHash: 0},
+			},
+			DataParallelRank: rank,
+		}, "pod-dp-clear", "test-model")
+	}
+
+	pool.processEventBatch(ctx, &EventBatch{
+		Events:           []GenericEvent{&AllBlocksClearedEvent{}},
+		DataParallelRank: &rank0,
+	}, "pod-dp-clear", "test-model")
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	result, err := idx.Lookup(ctx, []kvblock.BlockHash{canonicalKeys[0]}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []int{1}, ranksOf(result[canonicalKeys[0]]),
+		"a clear from rank 0 must preserve rank 1 entries")
+}
+
+func TestDataParallelReplayResetPreservesOtherRanks(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newTestPool(t, 16)
+	tokens := makeTokens(64)
+	engineKeys := makeEngineKeys(4, 925)
+	rank0, rank1 := 0, 1
+
+	for _, rank := range []*int{&rank0, &rank1} {
+		pool.processEventBatch(ctx, &EventBatch{
+			Events: []GenericEvent{
+				&BlockStoredEvent{BlockHashes: engineKeys, Tokens: tokens, ParentHash: 0},
+			},
+			DataParallelRank: rank,
+		}, "pod-dp-replay", "test-model")
+	}
+
+	pool.processRawMessage(ctx, &RawMessage{
+		SourceEndpoint:        "pod-dp-replay",
+		ResetDataParallelRank: &rank0,
+		reset:                 true,
+	})
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	result, err := idx.Lookup(ctx, []kvblock.BlockHash{canonicalKeys[0]}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []int{1}, ranksOf(result[canonicalKeys[0]]),
+		"replaying rank 0 must preserve rank 1 entries")
+}
+
 // TestNonDataParallelEventsCarryNoRank guards the compatibility path: an engine
 // that is not running data-parallel sends no rank, and its entries must stay
 // rank-less so they encode exactly as they did before DP awareness.

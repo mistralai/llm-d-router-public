@@ -116,6 +116,10 @@ type PodDiscoveryConfig struct {
 	// ReplaySocketPort is the port where vLLM pods expose their ZMQ ROUTER
 	// socket for replay requests. Disabled when not set (0 or negative).
 	ReplaySocketPort int `json:"replaySocketPort,omitempty"`
+	// DataParallelSize is the number of data-parallel ranks behind one serving
+	// endpoint. Each rank publishes KV events on SocketPort + rank.
+	// Default: 1
+	DataParallelSize int `json:"dataParallelSize,omitempty"`
 }
 
 // EffectiveReplayPort returns the replay socket port.
@@ -132,6 +136,7 @@ func DefaultPodReconcilerConfig() *PodDiscoveryConfig {
 	return &PodDiscoveryConfig{
 		PodLabelSelector: defaultPodSelector,
 		SocketPort:       5557,
+		DataParallelSize: 1,
 	}
 }
 
@@ -267,9 +272,14 @@ func (p *Pool) AddTask(task *RawMessage) {
 	p.addQueueDepth(1)
 }
 
-// resetForSource queues a pod reset on the same shard as its event stream.
-func (p *Pool) resetForSource(topic, sourceEndpoint string) {
-	p.AddTask(&RawMessage{Topic: topic, SourceEndpoint: sourceEndpoint, reset: true})
+// resetForSource queues an engine reset on the same shard as its event stream.
+func (p *Pool) resetForSource(topic, sourceEndpoint string, dataParallelRank *int) {
+	p.AddTask(&RawMessage{
+		Topic:                 topic,
+		SourceEndpoint:        sourceEndpoint,
+		ResetDataParallelRank: dataParallelRank,
+		reset:                 true,
+	})
 }
 
 // worker is the main processing loop for a single worker goroutine.
@@ -309,7 +319,11 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 		if podID == "" {
 			podID = p.adapter.ShardingKey(msg)
 		}
-		p.clearPod(ctx, podID)
+		if msg.ResetDataParallelRank == nil {
+			p.clearPod(ctx, podID)
+		} else {
+			p.clearRank(ctx, podID, *msg.ResetDataParallelRank)
+		}
 		return
 	}
 
@@ -332,6 +346,15 @@ func (p *Pool) clearPod(ctx context.Context, podIdentifier string) {
 			"podIdentifier", podIdentifier)
 	}
 	p.dedup.clear(podIdentifier)
+}
+
+func (p *Pool) clearRank(ctx context.Context, podIdentifier string, dataParallelRank int) {
+	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
+	if err := p.index.ClearRank(ctx, podIdentifier, dataParallelRank); err != nil {
+		debugLogger.Error(err, "Failed to clear data-parallel rank from index",
+			"podIdentifier", podIdentifier, "dataParallelRank", dataParallelRank)
+	}
+	p.dedup.clearRank(podIdentifier, dataParallelRank)
 }
 
 // realignExtraFeatures converts per-engine-block extra features to per-canonical-block
@@ -664,9 +687,8 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				"deviceTier", ev.DeviceTier,
 				"modelName", modelName)
 
-			// AllBlocksCleared is pod-wide: vLLM reset its entire prefix cache
-			// (e.g. after an RLHF weight update), so drop every entry for this pod
-			// across all tiers. vLLM and SGLang both emit it with no tier annotation.
+			// AllBlocksCleared resets the emitting engine's entire prefix cache.
+			// A DP rank is one engine and must not clear sibling ranks sharing the pod.
 			// Index.Clear cannot scope by tier, so if an engine ever starts setting
 			// DeviceTier (a tier-scoped reset), this would over-wipe the other tiers.
 			// Surface that here so the regression does not pass silently.
@@ -675,7 +697,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 					"anyway (tier-scoped clear is not supported)",
 					"podIdentifier", podIdentifier, "deviceTier", ev.DeviceTier)
 			}
-			p.clearPod(ctx, podIdentifier)
+			if batch.DataParallelRank == nil {
+				p.clearPod(ctx, podIdentifier)
+			} else {
+				p.clearRank(ctx, podIdentifier, *batch.DataParallelRank)
+			}
 
 		default:
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)

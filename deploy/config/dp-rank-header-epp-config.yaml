@@ -32,6 +32,11 @@ plugins:
     parameters:
       tokenProcessorConfig:
         blockSize: 64
+      kvEventsConfig:
+        discoverPods: true
+        podDiscoveryConfig:
+          socketPort: 5557
+          dataParallelSize: 8       # set to the number of local ranks behind the shared HTTP port
       indexerConfig:
         kvBlockIndexConfig:
           enableMetrics: true       # enable kv-block index metrics (prometheus)
