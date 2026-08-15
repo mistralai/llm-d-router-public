@@ -27,8 +27,8 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 )
 
-func dpEntry(pod string, rank int) kvblock.PodEntry {
-	return kvblock.PodEntry{PodIdentifier: pod, DeviceTier: "gpu", DataParallelRank: &rank}
+func dpEntry(rank int) kvblock.PodEntry {
+	return kvblock.PodEntry{PodIdentifier: podA, DeviceTier: "gpu", DataParallelRank: &rank}
 }
 
 func scoreDP(t *testing.T, hitmap map[kvblock.BlockHash][]kvblock.PodEntry, keys []uint64) map[string]float64 {
@@ -47,10 +47,10 @@ func scoreDP(t *testing.T, hitmap map[kvblock.BlockHash][]kvblock.PodEntry, keys
 func TestLongestPrefixScorerSplitAcrossRanks(t *testing.T) {
 	// rank 0 holds the first two blocks, rank 1 the last two.
 	scored := scoreDP(t, map[kvblock.BlockHash][]kvblock.PodEntry{
-		2001: {dpEntry(podA, 0)},
-		2002: {dpEntry(podA, 0)},
-		2003: {dpEntry(podA, 1)},
-		2004: {dpEntry(podA, 1)},
+		2001: {dpEntry(0)},
+		2002: {dpEntry(0)},
+		2003: {dpEntry(1)},
+		2004: {dpEntry(1)},
 	}, []uint64{2001, 2002, 2003, 2004})
 
 	// Rank 1 never matched the first block so it is not in the chain at all.
@@ -68,9 +68,9 @@ func TestLongestPrefixScorerSplitAcrossRanks(t *testing.T) {
 func TestLongestPrefixScorerBestRankWins(t *testing.T) {
 	// rank 0 holds only the first block; rank 1 holds all three.
 	scored := scoreDP(t, map[kvblock.BlockHash][]kvblock.PodEntry{
-		2101: {dpEntry(podA, 0), dpEntry(podA, 1)},
-		2102: {dpEntry(podA, 1)},
-		2103: {dpEntry(podA, 1)},
+		2101: {dpEntry(0), dpEntry(1)},
+		2102: {dpEntry(1)},
+		2103: {dpEntry(1)},
 	}, []uint64{2101, 2102, 2103})
 
 	assert.InDelta(t, 1.0, scored[podA+"@dp0"], 0.0001)
@@ -89,8 +89,8 @@ func TestLongestPrefixScorerBestRankWins(t *testing.T) {
 // routing with nothing logged.
 func TestLongestPrefixScorerEmitsRankQualifiedKeys(t *testing.T) {
 	scored := scoreDP(t, map[kvblock.BlockHash][]kvblock.PodEntry{
-		2201: {dpEntry(podA, 3)},
-		2202: {dpEntry(podA, 3)},
+		2201: {dpEntry(3)},
+		2202: {dpEntry(3)},
 	}, []uint64{2201, 2202})
 
 	require.Contains(t, scored, podA+"@dp3")
@@ -107,6 +107,16 @@ func TestCollapseDPScoresToPodsYieldsBareKeys(t *testing.T) {
 		assert.NotContains(t, key, "@dp", "a collapsed key must be a bare pod identifier")
 	}
 	assert.Equal(t, 3, winningRanks[podA])
+}
+
+func TestCollapseDPScoresToPodsBreaksRankTiesDeterministically(t *testing.T) {
+	for range 100 {
+		_, winningRanks := kvcache.CollapseDPScoresToPods(map[string]float64{
+			podA + "@dp1": 2.0,
+			podA + "@dp0": 2.0,
+		})
+		assert.Equal(t, 0, winningRanks[podA], "equal scores must prefer the lower rank")
+	}
 }
 
 // TestCollapseDPScoresToPodsPrefersUnrankedWinner covers a pod reporting both
@@ -129,7 +139,7 @@ func TestCollapseDPScoresToPodsPrefersUnrankedWinner(t *testing.T) {
 func TestLongestPrefixScorerMixedRankedAndUnranked(t *testing.T) {
 	scored := scoreDP(t, map[kvblock.BlockHash][]kvblock.PodEntry{
 		2301: {{PodIdentifier: podA, DeviceTier: "gpu"}},
-		2302: {dpEntry(podA, 0)},
+		2302: {dpEntry(0)},
 	}, []uint64{2301, 2302})
 
 	podScores, _ := kvcache.CollapseDPScoresToPods(scored)

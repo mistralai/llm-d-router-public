@@ -414,6 +414,15 @@ func (m *CostAwareMemoryIndex) evictPodsFromRequestKey(
 // prefix chain in Lookup. Reverse-pruning it would need an O(M) scan for no
 // correctness gain.
 func (m *CostAwareMemoryIndex) Clear(ctx context.Context, podIdentifier string) error {
+	return m.clear(ctx, podIdentifier, nil)
+}
+
+// ClearRank removes every entry for one data-parallel rank of the pod.
+func (m *CostAwareMemoryIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
+	return m.clear(ctx, podIdentifier, &dataParallelRank)
+}
+
+func (m *CostAwareMemoryIndex) clear(ctx context.Context, podIdentifier string, dataParallelRank *int) error {
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.CostAwareMemoryIndex.Clear")
 
 	keys := m.snapshotKeyIndex()
@@ -421,7 +430,7 @@ func (m *CostAwareMemoryIndex) Clear(ctx context.Context, podIdentifier string) 
 	const clearChunkSize = 1024
 	for start := 0; start < len(keys); start += clearChunkSize {
 		end := min(start+clearChunkSize, len(keys))
-		m.clearChunk(podIdentifier, keys[start:end])
+		m.clearChunk(podIdentifier, dataParallelRank, keys[start:end])
 	}
 
 	m.data.Wait()
@@ -431,7 +440,7 @@ func (m *CostAwareMemoryIndex) Clear(ctx context.Context, podIdentifier string) 
 
 // clearChunk removes the pod's entries from one chunk of request keys under a
 // single mu hold, bounding how long Clear blocks the Lookup/Add path.
-func (m *CostAwareMemoryIndex) clearChunk(podIdentifier string, keys []string) {
+func (m *CostAwareMemoryIndex) clearChunk(podIdentifier string, dataParallelRank *int, keys []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -446,7 +455,7 @@ func (m *CostAwareMemoryIndex) clearChunk(podIdentifier string, keys []string) {
 		// first keeps the deletion explicit and the iteration simple.
 		var matched []PodEntry
 		podCache.cache.Range(func(k, _ any) bool {
-			if entry, ok := k.(PodEntry); ok && entry.PodIdentifier == podIdentifier {
+			if entry, ok := k.(PodEntry); ok && entryMatchesClear(entry, podIdentifier, dataParallelRank) {
 				matched = append(matched, entry)
 			}
 			return true
