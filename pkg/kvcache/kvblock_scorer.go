@@ -204,13 +204,18 @@ func (s *LongestPrefixScorer) Score(
 func CollapseDPScoresToPods(scores map[string]float64) (podScores map[string]float64, winningRanks map[string]int) {
 	podScores = make(map[string]float64, len(scores))
 	winningRanks = make(map[string]int)
+	selectedRanks := make(map[string]int)
 
 	for key, score := range scores {
 		podIdentifier, rank := routing.ParseDPScoringKey(key)
-		if cur, exists := podScores[podIdentifier]; exists && score <= cur {
-			continue
+		if cur, exists := podScores[podIdentifier]; exists {
+			selectedRank := selectedRanks[podIdentifier]
+			if score < cur || (score == cur && rank >= selectedRank) {
+				continue
+			}
 		}
 		podScores[podIdentifier] = score
+		selectedRanks[podIdentifier] = rank
 		if rank == routing.NoDataParallelRank {
 			delete(winningRanks, podIdentifier)
 			continue

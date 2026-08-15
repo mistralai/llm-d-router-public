@@ -306,7 +306,7 @@ func TestZMQSubscriber_ReceivesMessages(t *testing.T) {
 	// Start subscriber — remote=false means it binds (Listen).
 	endpoint := "tcp://127.0.0.1:15559"
 	subManager := kvevents.NewSubscriberManager(pool)
-	err = subManager.EnsureSubscriber(ctx, "test-pod", "", endpoint, "", "kv@", false)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", "", endpoint, "", "kv@", nil, false)
 	require.NoError(t, err)
 
 	// Give subscriber time to bind.
@@ -358,6 +358,7 @@ func TestZMQSubscribers_SameTopicUsesServingEndpointIdentity(t *testing.T) {
 			zmqEndpoints[i],
 			"",
 			"kv@",
+			nil,
 			false,
 		))
 	}
@@ -432,7 +433,7 @@ func TestZMQSubscriber_ShortSequenceFrameSkipped(t *testing.T) {
 	endpoint := fmt.Sprintf("tcp://%s", ln.Addr().String())
 	ln.Close()
 	subManager := kvevents.NewSubscriberManager(pool)
-	err = subManager.EnsureSubscriber(ctx, "test-pod", "", endpoint, "", "kv@", false)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", "", endpoint, "", "kv@", nil, false)
 	require.NoError(t, err)
 	time.Sleep(100 * time.Millisecond)
 
@@ -506,7 +507,7 @@ func newReplayHarnessWithBehavior(
 
 	subManager := kvevents.NewSubscriberManager(pool)
 	require.NoError(t, subManager.EnsureSubscriber(
-		ctx, "test-pod", "10.0.0.1:8000", pubEndpoint, replayEndpoint, "kv@", false))
+		ctx, "test-pod", "10.0.0.1:8000", pubEndpoint, replayEndpoint, "kv@", nil, false))
 	require.Eventually(t, func() bool { return buffer.requests.Load() == 1 },
 		5*time.Second, 50*time.Millisecond, "proactive replay expected")
 

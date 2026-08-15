@@ -17,17 +17,15 @@ package dataparallel
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
-
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	preciseprefixcacheconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/preciseprefixcache/constants"
 )
 
 // DPRankHeaderHandlerType is the type of the DPRankHeaderHandler plugin.
@@ -74,36 +72,30 @@ func (p *DPRankHeaderHandler) WithName(name string) *DPRankHeaderHandler {
 
 // PreRequest translates the winning ranks recorded during scoring into an
 // x-data-parallel-rank header for the selected endpoint.
-func (p *DPRankHeaderHandler) PreRequest(ctx context.Context, request *scheduling.InferenceRequest,
+func (p *DPRankHeaderHandler) PreRequest(_ context.Context, request *scheduling.InferenceRequest,
 	schedulingResult *scheduling.SchedulingResult,
-) {
-	if request == nil || request.Headers == nil {
-		return
+) error {
+	if request == nil {
+		return nil
 	}
-
-	encoded, present := request.Headers[routing.DataParallelWinningRanksHeader]
-	// The winning-ranks header is internal to the EPP. Drop it unconditionally
-	// so it never reaches the model server, including on every early return
-	// below.
-	delete(request.Headers, routing.DataParallelWinningRanksHeader)
-	// Clear any inbound rank so a client cannot pin itself to a rank.
+	if request.Headers == nil {
+		request.Headers = make(map[string]string)
+	}
+	// A client cannot choose a rank and bypass cache-aware placement.
 	delete(request.Headers, routing.DataParallelRankHeader)
 
-	if !present || schedulingResult == nil {
-		return
+	if schedulingResult == nil {
+		return nil
 	}
-
-	ranks, err := routing.DecodeWinningRanks(encoded)
-	if err != nil {
-		if !errors.Is(err, routing.ErrEmptyWinningRanks) {
-			log.FromContext(ctx).V(1).Error(err, "failed to decode data-parallel winning ranks")
-		}
-		return
+	ranks, present := scheduling.ReadRequestAttribute[map[string]int](
+		request, preciseprefixcacheconstants.WinningRanksDataKey)
+	if !present {
+		return nil
 	}
 
 	endpoint := selectedEndpoint(schedulingResult)
 	if endpoint == nil {
-		return
+		return nil
 	}
 
 	// Built the same way the precise prefix cache producer builds its scoring
@@ -111,11 +103,12 @@ func (p *DPRankHeaderHandler) PreRequest(ctx context.Context, request *schedulin
 	// unpinned and let vLLM pick a rank by queue depth instead.
 	address := fmt.Sprintf("%s:%s", endpoint.Address, endpoint.Port)
 	rank, found := ranks[address]
-	if !found {
-		return
+	if !found || rank < 0 {
+		return nil
 	}
 
 	request.Headers[routing.DataParallelRankHeader] = strconv.Itoa(rank)
+	return nil
 }
 
 // selectedEndpoint returns the metadata of the endpoint the request will be

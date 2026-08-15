@@ -104,6 +104,36 @@ func TestProducer_ExtractEndpoint_AddAndDelete(t *testing.T) {
 	assert.Empty(t, ids)
 }
 
+func TestProducer_ExtractEndpoint_SharedPortCreatesSubscriberPerRank(t *testing.T) {
+	ctx := discardCtx(t)
+	p := newExtractorProducer(true)
+	p.kvEventsConfig.PodDiscoveryConfig.DataParallelSize = 2
+	defer p.subscribersManager.Shutdown(ctx)
+
+	ep := newEndpoint("pod-a", "10.0.0.1")
+	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{
+		Type:     fwkdl.EventAddOrUpdate,
+		Endpoint: ep,
+	}))
+
+	ids, zmqEndpoints := p.subscribersManager.GetActiveSubscribers()
+	gotByID := make(map[string]string, len(ids))
+	for i, id := range ids {
+		gotByID[id] = zmqEndpoints[i]
+	}
+	assert.Equal(t, map[string]string{
+		"ns/pod-a@dp0": "tcp://10.0.0.1:5557",
+		"ns/pod-a@dp1": "tcp://10.0.0.1:5558",
+	}, gotByID)
+
+	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{
+		Type:     fwkdl.EventDelete,
+		Endpoint: ep,
+	}))
+	ids, _ = p.subscribersManager.GetActiveSubscribers()
+	assert.Empty(t, ids, "deleting the physical endpoint must remove every rank subscriber")
+}
+
 // DiscoverPods=false → global-socket mode, per-pod discovery off.
 func TestProducer_ExtractEndpoint_DiscoverPodsDisabledIsNoOp(t *testing.T) {
 	ctx := discardCtx(t)
@@ -220,6 +250,39 @@ func TestProducer_EnsureSubscriber_PassesServingEndpoint(t *testing.T) {
 	assert.Equal(t, []string{"ns/pod-a-rank-3"}, subscribers.ids)
 	assert.Equal(t, []string{"10.0.0.1:8003"}, subscribers.sourceEndpoints)
 	assert.Equal(t, []string{"tcp://10.0.0.1:5560"}, subscribers.endpoints)
+}
+
+func TestProducer_EnsureSubscriber_SharedPortPassesRankAndReplayEndpoints(t *testing.T) {
+	cfg := kvevents.DefaultConfig()
+	cfg.DiscoverPods = true
+	cfg.PodDiscoveryConfig = kvevents.DefaultPodReconcilerConfig()
+	cfg.PodDiscoveryConfig.SocketPort = 5557
+	cfg.PodDiscoveryConfig.ReplaySocketPort = 5657
+	cfg.PodDiscoveryConfig.DataParallelSize = 2
+
+	subscribers := &fakeSubscriberManager{}
+	p := &Producer{
+		typedName:          plugin.TypedName{Type: PluginType, Name: PluginType},
+		subscribersManager: subscribers,
+		kvEventsConfig:     cfg,
+		subscriberCtx:      context.Background(),
+	}
+
+	require.NoError(t, p.ensureSubscriber(context.Background(), &fwkdl.EndpointMetadata{
+		ID:      k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a"},
+		Address: "10.0.0.1",
+		Port:    "8000",
+	}))
+
+	assert.Equal(t, []string{"ns/pod-a@dp0", "ns/pod-a@dp1"}, subscribers.ids)
+	assert.Equal(t, []string{"10.0.0.1:8000", "10.0.0.1:8000"}, subscribers.sourceEndpoints)
+	assert.Equal(t, []string{"tcp://10.0.0.1:5557", "tcp://10.0.0.1:5558"}, subscribers.endpoints)
+	assert.Equal(t, []string{"tcp://10.0.0.1:5657", "tcp://10.0.0.1:5658"}, subscribers.replayEndpoints)
+	require.Len(t, subscribers.dataParallelRanks, 2)
+	require.NotNil(t, subscribers.dataParallelRanks[0])
+	require.NotNil(t, subscribers.dataParallelRanks[1])
+	assert.Equal(t, 0, *subscribers.dataParallelRanks[0])
+	assert.Equal(t, 1, *subscribers.dataParallelRanks[1])
 }
 
 // RankIndex=0 must dial the base SocketPort unchanged.
