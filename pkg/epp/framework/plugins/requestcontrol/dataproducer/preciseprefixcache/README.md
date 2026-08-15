@@ -21,7 +21,7 @@ Pipeline per request:
 - Hash tokens → KV-block keys → `kvblock.Index.Lookup`.
 - Write `PrefixCacheMatchInfo(matchBlocks, totalBlocks, blockSizeTokens)` per endpoint, including the unweighted cached-block count and its per-device-tier breakdown.
 - (`PreRequest`) Speculative-index the selected endpoint(s) with TTL eviction.
-- (`EndpointExtractor`) Per-pod ZMQ subscriber lifecycle on add/delete.
+- (`EndpointExtractor`) Per-pod, per-rank ZMQ subscriber lifecycle on add/delete.
 
 Requires `TokenizedPrompt` on the request — set by a `token-producer`
 upstream. No-op otherwise.
@@ -38,6 +38,30 @@ upstream. No-op otherwise.
 
 Set `kvEventsConfig.engineType` to `sglang` for SGLang KV-events. It defaults
 to `vllm` when omitted.
+
+For vLLM Internal or Hybrid LB, where all local DP ranks share one HTTP
+endpoint, set the local rank count under pod discovery:
+
+```yaml
+kvEventsConfig:
+  discoverPods: true
+  podDiscoveryConfig:
+    socketPort: 5557
+    dataParallelSize: 8
+```
+
+The producer creates subscribers for `socketPort` through
+`socketPort + dataParallelSize - 1`, associates every event stream with the
+shared serving endpoint, and records the winning rank. Also configure
+`dp-rank-header-handler` so the selected rank is sent to vLLM through
+`x-data-parallel-rank`. Leave `dataParallelSize` at its default of `1` for
+non-DP deployments or when every rank is already exposed as a separate serving
+endpoint.
+
+The KV-event `data_parallel_rank` must be the rank accepted by
+`x-data-parallel-rank` on that serving endpoint. A wide-EP deployment where
+events carry global ranks but the shared frontend accepts pod-local ranks needs
+an explicit global-to-local translation and is not supported by this option.
 
 See [llm-d-kv-cache/docs/configuration.md](https://github.com/llm-d/llm-d-kv-cache/blob/main/docs/configuration.md)
 for nested parameter details.

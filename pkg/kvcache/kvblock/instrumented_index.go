@@ -72,6 +72,10 @@ func (m *instrumentedIndex) Clear(ctx context.Context, podIdentifier string) err
 	return m.next.Clear(ctx, podIdentifier)
 }
 
+func (m *instrumentedIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
+	return m.next.ClearRank(ctx, podIdentifier, dataParallelRank)
+}
+
 func recordHitMetrics(keyToPods map[BlockHash][]PodEntry) {
 	podCount := make(map[string]int)
 	for _, pods := range keyToPods {

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -45,10 +46,14 @@ func extractEndpointSet(endpoints []scheduling.Endpoint) sets.Set[string] {
 // not hold. This is the unweighted counterpart of the device-tier-weighted
 // kvblock scorer: every cached block counts as one regardless of device tier,
 // so a pod present at keys[0..n-1] yields n.
-func matchedBlockCount(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) int {
+func matchedBlockCount(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
+	podID string, dataParallelRank int,
+) int {
 	count := 0
 	for _, key := range keys {
-		if !slices.ContainsFunc(keyToPods[key], func(e kvblock.PodEntry) bool { return e.PodIdentifier == podID }) {
+		if !slices.ContainsFunc(keyToPods[key], func(e kvblock.PodEntry) bool {
+			return matchesPodRank(e, podID, dataParallelRank)
+		}) {
 			break
 		}
 		count++
@@ -65,13 +70,15 @@ func matchedBlockCount(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash
 // attrprefix.SpeculativeTierKey: PreRequest inserts them before vLLM has
 // reported placement, so they carry no device tier.
 // Returns a non-nil (possibly empty) map.
-func matchedBlockCountByTier(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) map[string]int {
+func matchedBlockCountByTier(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
+	podID string, dataParallelRank int,
+) map[string]int {
 	counts := map[string]int{}
 	var alive sets.Set[string]
 	for _, key := range keys {
 		tiersAtKey := sets.New[string]()
 		for _, e := range keyToPods[key] {
-			if e.PodIdentifier == podID {
+			if matchesPodRank(e, podID, dataParallelRank) {
 				if e.Speculative {
 					tiersAtKey.Insert(attrprefix.SpeculativeTierKey)
 				} else {
@@ -92,4 +99,14 @@ func matchedBlockCountByTier(keys []kvblock.BlockHash, keyToPods map[kvblock.Blo
 		}
 	}
 	return counts
+}
+
+func matchesPodRank(entry kvblock.PodEntry, podID string, dataParallelRank int) bool {
+	if entry.PodIdentifier != podID {
+		return false
+	}
+	if entry.DataParallelRank == nil {
+		return dataParallelRank == routing.NoDataParallelRank
+	}
+	return *entry.DataParallelRank == dataParallelRank
 }
