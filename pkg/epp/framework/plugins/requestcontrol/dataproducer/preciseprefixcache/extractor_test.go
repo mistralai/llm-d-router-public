@@ -104,6 +104,36 @@ func TestProducer_ExtractEndpoint_AddAndDelete(t *testing.T) {
 	assert.Empty(t, ids)
 }
 
+func TestProducer_ExtractEndpoint_SharedPortCreatesSubscriberPerRank(t *testing.T) {
+	ctx := discardCtx(t)
+	p := newExtractorProducer(true)
+	p.kvEventsConfig.PodDiscoveryConfig.DataParallelSize = 2
+	defer p.subscribersManager.Shutdown(ctx)
+
+	ep := newEndpoint("pod-a", "10.0.0.1")
+	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{
+		Type:     fwkdl.EventAddOrUpdate,
+		Endpoint: ep,
+	}))
+
+	ids, zmqEndpoints := p.subscribersManager.GetActiveSubscribers()
+	gotByID := make(map[string]string, len(ids))
+	for i, id := range ids {
+		gotByID[id] = zmqEndpoints[i]
+	}
+	assert.Equal(t, map[string]string{
+		"ns/pod-a@dp0": "tcp://10.0.0.1:5557",
+		"ns/pod-a@dp1": "tcp://10.0.0.1:5558",
+	}, gotByID)
+
+	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{
+		Type:     fwkdl.EventDelete,
+		Endpoint: ep,
+	}))
+	ids, _ = p.subscribersManager.GetActiveSubscribers()
+	assert.Empty(t, ids, "deleting the physical endpoint must remove every rank subscriber")
+}
+
 // DiscoverPods=false → global-socket mode, per-pod discovery off.
 func TestProducer_ExtractEndpoint_DiscoverPodsDisabledIsNoOp(t *testing.T) {
 	ctx := discardCtx(t)

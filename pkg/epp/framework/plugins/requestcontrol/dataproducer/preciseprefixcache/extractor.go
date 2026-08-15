@@ -51,7 +51,9 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 		}
 		logger.V(logging.DEBUG).Info("Adding subscriber", "endpoint", endpointKey)
 	case fwkdl.EventDelete:
-		p.subscribersManager.RemoveSubscriber(ctx, endpointKey)
+		for _, subscriberID := range p.subscriberIDs(meta) {
+			p.subscribersManager.RemoveSubscriber(ctx, subscriberID)
+		}
 		if meta.Address != "" {
 			if err := p.kvCacheIndexer.KVBlockIndex().Clear(ctx, fmt.Sprintf("%s:%s", meta.Address, meta.Port)); err != nil {
 				logger.Error(err, "Failed to clear index entries for removed endpoint",
@@ -63,27 +65,54 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 	return nil
 }
 
-// ensureSubscriber idempotently installs a KV-events subscriber for the given
-// endpoint, dialing SocketPort + RankIndex to match standard inference-engine port offsetting
-// (one ZMQ PUB socket per DP rank on the same pod IP).
+// ensureSubscriber idempotently installs the KV-events subscribers for an
+// endpoint. Shared-port DP endpoints get one subscriber per configured rank;
+// rank-specific endpoints use their metadata rank.
 func (p *Producer) ensureSubscriber(ctx context.Context, meta *fwkdl.EndpointMetadata) error {
 	if meta == nil || meta.Address == "" {
 		return nil
 	}
-	endpointKey := meta.ID.String()
-	port := p.kvEventsConfig.PodDiscoveryConfig.SocketPort + meta.GetRankIndex()
-	zmqEndpoint := fmt.Sprintf("tcp://%s:%d", meta.Address, port)
 	sourceEndpoint := fmt.Sprintf("%s:%s", meta.Address, meta.Port)
-
 	logger := log.FromContext(ctx).WithName(p.typedName.String())
-	// subscriberCtx is plugin-lifetime; caller ctx would tear subscribers
-	// down on request completion.
-	if err := p.subscribersManager.EnsureSubscriber(p.subscriberCtx, endpointKey,
-		sourceEndpoint, zmqEndpoint, p.kvEventsConfig.TopicFilter, true); err != nil {
-		logger.Error(err, "Failed to ensure KV-events subscriber for endpoint",
-			"endpoint", endpointKey, "address", meta.Address)
-		return fmt.Errorf("ensure subscriber for %s: %w", endpointKey, err)
+	ranks := p.subscriberRanks(meta)
+	ids := p.subscriberIDs(meta)
+	for i, rank := range ranks {
+		port := p.kvEventsConfig.PodDiscoveryConfig.SocketPort + rank
+		zmqEndpoint := fmt.Sprintf("tcp://%s:%d", meta.Address, port)
+		// subscriberCtx is plugin-lifetime; caller ctx would tear subscribers
+		// down on request completion.
+		if err := p.subscribersManager.EnsureSubscriber(p.subscriberCtx, ids[i],
+			sourceEndpoint, zmqEndpoint, p.kvEventsConfig.TopicFilter, true); err != nil {
+			logger.Error(err, "Failed to ensure KV-events subscriber for endpoint",
+				"endpoint", ids[i], "address", meta.Address)
+			return fmt.Errorf("ensure subscriber for %s: %w", ids[i], err)
+		}
+		logger.V(logging.DEBUG).Info("Ensured KV-events subscriber", "endpoint", ids[i], "zmq", zmqEndpoint)
 	}
-	logger.V(logging.DEBUG).Info("Ensured KV-events subscriber", "endpoint", endpointKey, "zmq", zmqEndpoint)
 	return nil
+}
+
+func (p *Producer) subscriberRanks(meta *fwkdl.EndpointMetadata) []int {
+	size := p.kvEventsConfig.PodDiscoveryConfig.DataParallelSize
+	if size <= 1 {
+		return []int{meta.GetRankIndex()}
+	}
+	ranks := make([]int, size)
+	for rank := range size {
+		ranks[rank] = rank
+	}
+	return ranks
+}
+
+func (p *Producer) subscriberIDs(meta *fwkdl.EndpointMetadata) []string {
+	endpointKey := meta.ID.String()
+	ranks := p.subscriberRanks(meta)
+	if len(ranks) == 1 {
+		return []string{endpointKey}
+	}
+	ids := make([]string, len(ranks))
+	for i, rank := range ranks {
+		ids[i] = fmt.Sprintf("%s@dp%d", endpointKey, rank)
+	}
+	return ids
 }

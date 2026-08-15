@@ -40,11 +40,14 @@ const (
 	// routing sidecar already sets this same header on its prefill leg.
 	DataParallelRankHeader = "x-data-parallel-rank"
 
-	// DataParallelWinningRanksHeader carries per-pod winning ranks from
-	// scheduling to the pre-request stage as a JSON object of pod address to
-	// rank, e.g. {"10.0.0.1:8000":0}. It is internal to the EPP and is removed
-	// before the request is forwarded upstream.
+	// DataParallelWinningRanksHeader carries per-pod winning ranks from older
+	// scheduling implementations. It is stripped before forwarding and is not
+	// used for internal transport.
 	DataParallelWinningRanksHeader = "x-llm-d-dp-winning-ranks"
+
+	// DataParallelWinningRanksAttribute carries the winning rank per serving
+	// endpoint between request-control plugins without exposing it upstream.
+	DataParallelWinningRanksAttribute = "llm-d.data-parallel-winning-ranks"
 )
 
 // ErrEmptyWinningRanks reports that there are no winning ranks to transport.
@@ -56,7 +59,7 @@ var ErrEmptyWinningRanks = errors.New("winning ranks map is empty")
 //
 // Only a suffix of the exact shape "@dp<digits>" is treated as a rank, so a pod
 // identifier that happens to contain "@dp" (for instance "pod@dp-service:8080")
-// is returned unchanged rather than being mis-split. The last such suffix wins,
+// is returned unchanged rather than being split incorrectly. The last such suffix wins,
 // which matters for identifiers that contain both.
 func ParseDPScoringKey(scoringKey string) (podIdentifier string, dataParallelRank int) {
 	idx := strings.LastIndex(scoringKey, DPRankSuffix)

@@ -17,11 +17,8 @@ package dataparallel
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
-
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -74,30 +71,25 @@ func (p *DPRankHeaderHandler) WithName(name string) *DPRankHeaderHandler {
 
 // PreRequest translates the winning ranks recorded during scoring into an
 // x-data-parallel-rank header for the selected endpoint.
-func (p *DPRankHeaderHandler) PreRequest(ctx context.Context, request *scheduling.InferenceRequest,
+func (p *DPRankHeaderHandler) PreRequest(_ context.Context, request *scheduling.InferenceRequest,
 	schedulingResult *scheduling.SchedulingResult,
 ) {
-	if request == nil || request.Headers == nil {
+	if request == nil {
 		return
 	}
-
-	encoded, present := request.Headers[routing.DataParallelWinningRanksHeader]
-	// The winning-ranks header is internal to the EPP. Drop it unconditionally
-	// so it never reaches the model server, including on every early return
-	// below.
+	if request.Headers == nil {
+		request.Headers = make(map[string]string)
+	}
+	// Strip values from clients and older router versions before forwarding.
 	delete(request.Headers, routing.DataParallelWinningRanksHeader)
-	// Clear any inbound rank so a client cannot pin itself to a rank.
 	delete(request.Headers, routing.DataParallelRankHeader)
 
-	if !present || schedulingResult == nil {
+	if schedulingResult == nil {
 		return
 	}
-
-	ranks, err := routing.DecodeWinningRanks(encoded)
-	if err != nil {
-		if !errors.Is(err, routing.ErrEmptyWinningRanks) {
-			log.FromContext(ctx).V(1).Error(err, "failed to decode data-parallel winning ranks")
-		}
+	ranks, present := scheduling.ReadRequestAttribute[map[string]int](
+		request, routing.DataParallelWinningRanksAttribute)
+	if !present {
 		return
 	}
 
@@ -111,7 +103,7 @@ func (p *DPRankHeaderHandler) PreRequest(ctx context.Context, request *schedulin
 	// unpinned and let vLLM pick a rank by queue depth instead.
 	address := fmt.Sprintf("%s:%s", endpoint.Address, endpoint.Port)
 	rank, found := ranks[address]
-	if !found {
+	if !found || rank < 0 {
 		return
 	}
 

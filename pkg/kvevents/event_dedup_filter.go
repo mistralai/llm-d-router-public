@@ -61,8 +61,7 @@ func dataParallelRankOrNone(dataParallelRank *int) int {
 // blockScope identifies the set of block reference counts that share a single
 // index eviction identity for one pod. Its fields mirror the dimensions of
 // kvblock.PodEntry that determine which stored entry an eviction targets: pod,
-// device tier, KV-cache group, and (in future, see noDataParallelRank)
-// data-parallel rank.
+// device tier, KV-cache group, and data-parallel rank.
 type blockScope struct {
 	podIdentifier    string
 	deviceTier       string
@@ -188,10 +187,8 @@ func (f *eventDedupFilter) filterRemove(scope blockScope, blockHashes []uint64) 
 	return kept
 }
 
-// clear drops all reference counts for a pod. It is invoked on
-// AllBlocksCleared, in lockstep with the index's pod-wide eager clear, so the
-// filter does not retain stale references after the engine resets its prefix
-// cache.
+// clear drops all reference counts for a pod. It is invoked for a non-DP
+// AllBlocksCleared event in lockstep with the index's pod-wide clear.
 func (f *eventDedupFilter) clear(podIdentifier string) {
 	if f == nil {
 		return
@@ -200,4 +197,23 @@ func (f *eventDedupFilter) clear(podIdentifier string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.refs, podIdentifier)
+}
+
+// clearRank drops reference counts for one data-parallel rank of a pod.
+func (f *eventDedupFilter) clearRank(podIdentifier string, dataParallelRank int) {
+	if f == nil {
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	bucket := f.refs[podIdentifier]
+	for key := range bucket {
+		if key.dataParallelRank == dataParallelRank {
+			delete(bucket, key)
+		}
+	}
+	if len(bucket) == 0 {
+		delete(f.refs, podIdentifier)
+	}
 }

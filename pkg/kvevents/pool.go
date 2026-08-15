@@ -78,6 +78,10 @@ type PodDiscoveryConfig struct {
 	// The reconciler will connect to tcp://<PodIP>:<SocketPort>
 	// Default: 5557
 	SocketPort int `json:"socketPort"`
+	// DataParallelSize is the number of data-parallel ranks behind one serving
+	// endpoint. Each rank publishes KV events on SocketPort + rank.
+	// Default: 1
+	DataParallelSize int `json:"dataParallelSize,omitempty"`
 }
 
 // DefaultPodReconcilerConfig returns a default configuration for the pod reconciler.
@@ -85,6 +89,7 @@ func DefaultPodReconcilerConfig() *PodDiscoveryConfig {
 	return &PodDiscoveryConfig{
 		PodLabelSelector: defaultPodSelector,
 		SocketPort:       5557,
+		DataParallelSize: 1,
 	}
 }
 
@@ -552,9 +557,8 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				"deviceTier", ev.DeviceTier,
 				"modelName", modelName)
 
-			// AllBlocksCleared is pod-wide: vLLM reset its entire prefix cache
-			// (e.g. after an RLHF weight update), so drop every entry for this pod
-			// across all tiers. vLLM and SGLang both emit it with no tier annotation.
+			// AllBlocksCleared resets the emitting engine's entire prefix cache.
+			// A DP rank is one engine and must not clear sibling ranks sharing the pod.
 			// Index.Clear cannot scope by tier, so if an engine ever starts setting
 			// DeviceTier (a tier-scoped reset), this would over-wipe the other tiers.
 			// Surface that here so the regression does not pass silently.
@@ -563,13 +567,18 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 					"anyway (tier-scoped clear is not supported)",
 					"podIdentifier", podIdentifier, "deviceTier", ev.DeviceTier)
 			}
-			if err := p.index.Clear(ctx, podIdentifier); err != nil {
+			var err error
+			if batch.DataParallelRank == nil {
+				err = p.index.Clear(ctx, podIdentifier)
+				p.dedup.clear(podIdentifier)
+			} else {
+				err = p.index.ClearRank(ctx, podIdentifier, *batch.DataParallelRank)
+				p.dedup.clearRank(podIdentifier, *batch.DataParallelRank)
+			}
+			if err != nil {
 				debugLogger.Error(err, "Failed to clear pod from index",
 					"podIdentifier", podIdentifier)
 			}
-			// Reset reference counts for this pod in lockstep with the index's
-			// pod-wide eager clear, so no stale references survive the reset.
-			p.dedup.clear(podIdentifier)
 
 		default:
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)
