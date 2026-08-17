@@ -18,6 +18,7 @@ package server
 
 import (
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -63,8 +64,13 @@ func NewScheme(cfg ControllerConfig) *runtime.Scheme {
 
 // defaultManagerOptions returns the default options used to create the manager.
 func defaultManagerOptions(cfg ControllerConfig, gknn common.GKNN, metricsServerOptions metricsserver.Options, scheme *runtime.Scheme) ctrl.Options {
+	// The request-serving stack has its own drain lifecycle. Waiting for the
+	// controller-runtime default grace period here delays ReleaseOnCancel and
+	// leaves the leader-elected deployment without a serving leader.
+	gracefulShutdownTimeout := time.Duration(0)
 	opt := ctrl.Options{
-		Scheme: scheme,
+		Scheme:                  scheme,
+		GracefulShutdownTimeout: &gracefulShutdownTimeout,
 		Cache: cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
 				&corev1.Pod{}: {

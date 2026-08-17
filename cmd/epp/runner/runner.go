@@ -264,7 +264,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
-	mgr, _, err := r.setup(ctx, cfg, opts, nil)
+	// Request processing must outlive the signal context. The manager uses ctx
+	// to release leadership promptly, while queued and in-flight requests keep
+	// using processingCtx until the ext_proc server has drained.
+	processingCtx, cancelProcessing := newRequestProcessingContext(ctx)
+	defer cancelProcessing()
+
+	mgr, _, err := r.setup(processingCtx, cfg, opts, nil)
 	if err != nil {
 		return err
 	}
@@ -284,6 +290,8 @@ func (r *Runner) runWithGracefulShutdown(ctx context.Context, mgr ctrl.Manager, 
 	// immediately stop the ext_proc/health servers.
 	serveCtx, serveCancel := context.WithCancel(context.Background())
 	defer serveCancel()
+	managerCtx, cancelManager := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelManager()
 
 	serveErr := make(chan error, 1)
 	go func() {
@@ -297,19 +305,22 @@ func (r *Runner) runWithGracefulShutdown(ctx context.Context, mgr ctrl.Manager, 
 		serveErr <- g.Run(serveCtx)
 	}()
 
-	// Flip readiness to NotServing as soon as SIGTERM arrives (concurrently with
-	// the manager's shutdown/lease release), so Kubernetes starts draining us from
-	// the Service endpoints while we keep serving in-flight traffic.
+	// Flip traffic health to NotServing before canceling the manager so the old
+	// leader is drained before its lease is released.
 	go func() {
-		<-ctx.Done()
-		r.draining.Store(true)
-		setupLog.Info("Shutdown signal received: draining (NotServing) while finishing in-flight requests", "drainTimeout", drainTimeout)
+		select {
+		case <-ctx.Done():
+			r.draining.Store(true)
+			setupLog.Info("Shutdown signal received: draining (NotServing) while finishing in-flight requests", "drainTimeout", drainTimeout)
+			cancelManager()
+		case <-serveCtx.Done():
+		}
 	}()
 
 	// Blocks until SIGTERM cancels ctx; returns once the manager has stopped and
 	// released the leader lease (LeaderElectionReleaseOnCancel).
 	setupLog.Info("Controller manager starting")
-	mgrErr := mgr.Start(ctx)
+	mgrErr := mgr.Start(managerCtx)
 	if mgrErr != nil {
 		setupLog.Error(mgrErr, "Error starting controller manager")
 		serveCancel()
@@ -506,7 +517,9 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 	r.draining = &atomic.Bool{}
 	r.serverRunner = serverRunner
 	r.healthGRPCPort = opts.GRPCHealthPort
-	r.healthGRPCServer = newHealthGRPCServer(ctrl.Log.WithName("health"), ds, isLeader, r.draining, opts.EnableLeaderElection, supporters)
+	healthService := newHealthServer(ctrl.Log.WithName("health"), ds, isLeader, r.draining, opts.EnableLeaderElection, supporters)
+	r.serverRunner.HealthServer = healthService
+	r.healthGRPCServer = newHealthGRPCServer(healthService)
 	return mgr, ds, nil
 }
 
@@ -828,19 +841,27 @@ func (r *Runner) setupMetricsCollection(opts *runserver.Options) datalayer.Endpo
 	return r.dlRuntime
 }
 
-// newHealthGRPCServer builds the gRPC health server. draining may be nil (graceful
-// drain disabled); when non-nil and set, non-liveness checks report NOT_SERVING.
-func newHealthGRPCServer(logger logr.Logger, ds datastore.Datastore, isLeader, draining *atomic.Bool, leaderElectionEnabled bool, supporters []appProtocolSupporter) *grpc.Server {
-	srv := grpc.NewServer()
-	healthPb.RegisterHealthServer(srv, &healthServer{
+// newHealthServer builds the shared health implementation used by Kubernetes
+// probes and Envoy's ext_proc active health check.
+func newHealthServer(logger logr.Logger, ds datastore.Datastore, isLeader, draining *atomic.Bool, leaderElectionEnabled bool, supporters []appProtocolSupporter) *healthServer {
+	return &healthServer{
 		logger:                logger,
 		datastore:             ds,
 		isLeader:              isLeader,
 		leaderElectionEnabled: leaderElectionEnabled,
 		supporters:            supporters,
 		draining:              draining,
-	})
+	}
+}
+
+func newHealthGRPCServer(healthService healthPb.HealthServer) *grpc.Server {
+	srv := grpc.NewServer()
+	healthPb.RegisterHealthServer(srv, healthService)
 	return srv
+}
+
+func newRequestProcessingContext(signalCtx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.WithoutCancel(signalCtx))
 }
 
 func extractDeploymentName(podName string) (string, error) {
