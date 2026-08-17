@@ -77,7 +77,10 @@ func (s *healthServer) Check(ctx context.Context, in *healthPb.HealthCheckReques
 	switch in.Service {
 	case ReadinessCheckService:
 		checkName = "readiness"
-		isPassing = isLive && s.isLeader.Load() && protocolMatches && !draining
+		// Kubernetes readiness represents whether this replica is initialized
+		// enough to participate in a rollout. Traffic eligibility remains
+		// leader-gated by the ext_proc health service below.
+		isPassing = isLive && protocolMatches && !draining
 	case "": // Handle overall server health for load balancers that use an empty service name.
 		checkName = "empty service name (considered as overall health)"
 		// The overall health for a load balancer should reflect readiness to accept traffic,

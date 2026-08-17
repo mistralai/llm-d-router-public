@@ -127,13 +127,13 @@ func TestHealthServer_Check(t *testing.T) {
 			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
 		},
 		{
-			name:                  "LeaderElectionEnabled_Readiness_NotLeader",
+			name:                  "LeaderElectionEnabled_Readiness_SyncedStandby",
 			leaderElectionEnabled: true,
 			isLeader:              false,
 			hasSynced:             true,
 			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
 			service:               ReadinessCheckService,
-			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
+			wantStatus:            healthPb.HealthCheckResponse_SERVING,
 		},
 		{
 			name:                  "LeaderElectionEnabled_Readiness_ProtocolMismatch",
@@ -162,6 +162,15 @@ func TestHealthServer_Check(t *testing.T) {
 			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
 			service:               extProcPb.ExternalProcessor_ServiceDesc.ServiceName,
 			wantStatus:            healthPb.HealthCheckResponse_SERVING,
+		},
+		{
+			name:                  "LeaderElectionEnabled_ExtProc_NotLeader",
+			leaderElectionEnabled: true,
+			isLeader:              false,
+			hasSynced:             true,
+			pool:                  &datalayer.EndpointPool{AppProtocol: v1.AppProtocolHTTP},
+			service:               extProcPb.ExternalProcessor_ServiceDesc.ServiceName,
+			wantStatus:            healthPb.HealthCheckResponse_NOT_SERVING,
 		},
 		{
 			name:                  "LeaderElectionEnabled_UnknownService",

@@ -55,12 +55,14 @@ type ExtProcServerRunner struct {
 	// When set, GrpcPort is ignored. Reserving the port in advance of this
 	// runnable starting closes the window in which another process can take a
 	// port that was selected but not yet bound.
-	GrpcListener                     net.Listener
-	GKNN                             common.GKNN
-	ControllerCfg                    ControllerConfig
-	Datastore                        datastore.Datastore
-	SecureServing                    bool
-	HealthChecking                   bool
+	GrpcListener   net.Listener
+	GKNN           common.GKNN
+	ControllerCfg  ControllerConfig
+	Datastore      datastore.Datastore
+	SecureServing  bool
+	HealthChecking bool
+	// HealthServer overrides the default always-serving ext_proc health service.
+	HealthServer                     healthgrpc.HealthServer
 	CertPath                         string
 	EnableCertReload                 bool
 	TLSMinVersion                    uint16
@@ -231,13 +233,15 @@ func (r *ExtProcServerRunner) AsRunnable(logger logr.Logger) manager.Runnable {
 		extProcPb.RegisterExternalProcessorServer(srv, extProcServer)
 
 		if r.HealthChecking {
-			healthcheck := health.NewServer()
-			healthgrpc.RegisterHealthServer(srv,
-				healthcheck,
-			)
-			svcName := extProcPb.ExternalProcessor_ServiceDesc.ServiceName
-			logger.Info("Setting ExternalProcessor service status to SERVING", "serviceName", svcName)
-			healthcheck.SetServingStatus(svcName, healthgrpc.HealthCheckResponse_SERVING)
+			if r.HealthServer != nil {
+				healthgrpc.RegisterHealthServer(srv, r.HealthServer)
+			} else {
+				healthcheck := health.NewServer()
+				healthgrpc.RegisterHealthServer(srv, healthcheck)
+				svcName := extProcPb.ExternalProcessor_ServiceDesc.ServiceName
+				logger.Info("Setting ExternalProcessor service status to SERVING", "serviceName", svcName)
+				healthcheck.SetServingStatus(svcName, healthgrpc.HealthCheckResponse_SERVING)
+			}
 		}
 
 		// Forward to the gRPC runnable.
