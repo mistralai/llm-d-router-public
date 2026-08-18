@@ -376,7 +376,7 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	// Scores must be summed per rank before collapsing because one rank serves
 	// every prompt in the request.
 	aggregatedScores, winningRanks := kvcache.CollapseDPScoresToPods(aggregatedRankScores)
-	if request != nil && len(winningRanks) > 0 {
+	if request != nil && len(winningRanks) > 0 && p.sharedPortDataParallelEnabled() {
 		request.PutAttribute(preciseprefixcacheconstants.WinningRanksDataKey, winningRanks)
 	}
 
@@ -425,4 +425,11 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	logger.V(logging.TRACE).Info("Produce completed",
 		"blockKeys", totalBlocks, "scores", aggregatedScores)
 	return nil
+}
+
+func (p *Producer) sharedPortDataParallelEnabled() bool {
+	return p.kvEventsConfig != nil &&
+		p.kvEventsConfig.DiscoverPods &&
+		p.kvEventsConfig.PodDiscoveryConfig != nil &&
+		p.kvEventsConfig.PodDiscoveryConfig.DataParallelSize > 1
 }
