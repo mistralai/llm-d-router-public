@@ -52,11 +52,15 @@ kvEventsConfig:
 
 The producer creates subscribers for `socketPort` through
 `socketPort + dataParallelSize - 1`, associates every event stream with the
-shared serving endpoint, and records the winning rank. Also configure
-`dp-rank-header-handler` so the selected rank is sent to vLLM through
-`x-data-parallel-rank`. Leave `dataParallelSize` at its default of `1` for
-non-DP deployments or when every rank is already exposed as a separate serving
-endpoint.
+shared serving endpoint, and exposes the winning rank to pre-request plugins.
+Also configure `dp-rank-header-handler` so the selected rank is sent to vLLM
+through `x-data-parallel-rank`.
+
+For External LB, leave `dataParallelSize` at its default of `1` and do not
+configure `dp-rank-header-handler`. Every rank is already exposed as a separate
+serving endpoint, so endpoint selection addresses the rank directly. The
+producer does not expose a winning rank for header injection unless
+`dataParallelSize` is greater than `1`.
 
 The KV-event `data_parallel_rank` must be the rank accepted by
 `x-data-parallel-rank` on that serving endpoint. A wide-EP deployment where

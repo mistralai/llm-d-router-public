@@ -52,7 +52,8 @@ func newProducerForPreRequest(ctx context.Context, speculativeEnabled bool, idx 
 	}
 }
 
-func primaryOnly(name string, endpoint scheduling.Endpoint) *scheduling.SchedulingResult {
+func primaryOnly(endpoint scheduling.Endpoint) *scheduling.SchedulingResult {
+	const name = "default"
 	return &scheduling.SchedulingResult{
 		PrimaryProfileName: name,
 		ProfileResults: map[string]*scheduling.ProfileRunResult{
@@ -79,7 +80,7 @@ func TestPreRequest_SeedsSpeculativeForPrimary(t *testing.T) {
 	req := &scheduling.InferenceRequest{RequestID: "req-pre-1"}
 	p.pluginState.Write(req.RequestID, blockKeysStateKey, &blockKeysState{perPromptKeys: [][]kvblock.BlockHash{blockKeys}})
 
-	_ = p.PreRequest(ctx, req, primaryOnly("default", testEndpoints[0]))
+	require.NoError(t, p.PreRequest(ctx, req, primaryOnly(testEndpoints[0])))
 
 	require.Len(t, calls, 1)
 	assert.Equal(t, blockKeys, calls[0].keys)
@@ -113,7 +114,7 @@ func TestPreRequest_SeedsSpeculativeForWinningRank(t *testing.T) {
 	p.pluginState.Write(req.RequestID, blockKeysStateKey,
 		&blockKeysState{perPromptKeys: [][]kvblock.BlockHash{{0xAA}}})
 
-	p.PreRequest(ctx, req, primaryOnly("default", testEndpoints[0]))
+	require.NoError(t, p.PreRequest(ctx, req, primaryOnly(testEndpoints[0])))
 
 	require.Len(t, calls, 1)
 	require.Len(t, calls[0].entries, 1)
@@ -143,7 +144,7 @@ func TestPreRequest_EmptyBlockKeys_NoAdd(t *testing.T) {
 	req := &scheduling.InferenceRequest{RequestID: "req-pre-empty"}
 	p.pluginState.Write(req.RequestID, blockKeysStateKey, &blockKeysState{perPromptKeys: nil})
 
-	_ = p.PreRequest(ctx, req, primaryOnly("default", testEndpoints[0]))
+	require.NoError(t, p.PreRequest(ctx, req, primaryOnly(testEndpoints[0])))
 
 	assert.Nil(t, p.speculativeCache.Get(req.RequestID))
 }
@@ -203,7 +204,7 @@ func TestPreRequest_SpeculativeDisabled_NoOp(t *testing.T) {
 	p.pluginState.Write(req.RequestID, blockKeysStateKey,
 		&blockKeysState{perPromptKeys: [][]kvblock.BlockHash{{0xDD}}})
 
-	_ = p.PreRequest(ctx, req, primaryOnly("default", testEndpoints[0]))
+	require.NoError(t, p.PreRequest(ctx, req, primaryOnly(testEndpoints[0])))
 
 	assert.Nil(t, p.speculativeCache.Get(req.RequestID))
 }
