@@ -196,6 +196,48 @@ type PodEntry struct {
 	DataParallelRank *int `json:",omitempty"`
 }
 
+// podEntryKey gives the optional rank value identity in in-memory indexes;
+// using PodEntry directly would compare DataParallelRank pointer addresses.
+type podEntryKey struct {
+	podIdentifier       string
+	deviceTier          string
+	speculative         bool
+	hasGroup            bool
+	groupIdx            GroupID
+	dataParallelRank    int
+	hasDataParallelRank bool
+}
+
+func newPodEntryKey(entry PodEntry) podEntryKey {
+	key := podEntryKey{
+		podIdentifier: entry.PodIdentifier,
+		deviceTier:    entry.DeviceTier,
+		speculative:   entry.Speculative,
+		hasGroup:      entry.HasGroup,
+		groupIdx:      entry.GroupIdx,
+	}
+	if entry.DataParallelRank != nil {
+		key.dataParallelRank = *entry.DataParallelRank
+		key.hasDataParallelRank = true
+	}
+	return key
+}
+
+func (k podEntryKey) podEntry() PodEntry {
+	entry := PodEntry{
+		PodIdentifier: k.podIdentifier,
+		DeviceTier:    k.deviceTier,
+		Speculative:   k.speculative,
+		HasGroup:      k.hasGroup,
+		GroupIdx:      k.groupIdx,
+	}
+	if k.hasDataParallelRank {
+		rank := k.dataParallelRank
+		entry.DataParallelRank = &rank
+	}
+	return entry
+}
+
 // String returns a string representation of the PodEntry.
 func (e *PodEntry) String() string {
 	suffix := ""

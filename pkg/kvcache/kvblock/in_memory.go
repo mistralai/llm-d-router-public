@@ -92,9 +92,9 @@ var _ Index = &InMemoryIndex{}
 
 // PodCache represents a cache for pod entries.
 type PodCache struct {
-	// cache is an LRU cache that maps PodEntry to their last access time.
+	// cache is an LRU cache that maps pod entry identities to their last access time.
 	// thread-safe.
-	cache *lru.Cache[PodEntry, struct{}]
+	cache *lru.Cache[podEntryKey, struct{}]
 	// mu protects the cache from concurrent access during check-and-set operations.
 	mu sync.Mutex
 }
@@ -130,10 +130,13 @@ func (m *InMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHash,
 
 			if podIdentifierSet.Len() == 0 {
 				// If no pod identifiers are provided, return all pods
-				podsPerKey[requestKey] = pods.cache.Keys()
+				podsPerKey[requestKey] = collections.SliceMap(pods.cache.Keys(), func(key podEntryKey) PodEntry {
+					return key.podEntry()
+				})
 			} else {
 				// Filter pods based on the provided pod identifiers
-				for _, pod := range pods.cache.Keys() {
+				for _, key := range pods.cache.Keys() {
+					pod := key.podEntry()
 					if podIdentifierSet.Has(pod.PodIdentifier) {
 						podsPerKey[requestKey] = append(podsPerKey[requestKey], pod)
 					}
@@ -188,7 +191,7 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 		//nolint:nestif // double-checked locking pattern
 		if !found {
 			// Create new cache
-			cache, err := lru.New[PodEntry, struct{}](m.podCacheSize)
+			cache, err := lru.New[podEntryKey, struct{}](m.podCacheSize)
 			if err != nil {
 				return fmt.Errorf("failed to create pod cache for key %s: %w", requestKey.String(), err)
 			}
@@ -215,7 +218,7 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 
 		podCache.mu.Lock()
 		for _, entry := range entries {
-			podCache.cache.Add(entry, struct{}{})
+			podCache.cache.Add(newPodEntryKey(entry), struct{}{})
 		}
 		podCache.mu.Unlock()
 
@@ -279,7 +282,7 @@ func (m *InMemoryIndex) evictPodsFromRequestKey(requestKey, engineKey BlockHash,
 
 	podCache.mu.Lock()
 	for _, entry := range entries {
-		podCache.cache.Remove(entry)
+		podCache.cache.Remove(newPodEntryKey(entry))
 	}
 
 	isEmpty := podCache.cache.Len() == 0
@@ -336,7 +339,8 @@ func (m *InMemoryIndex) clear(ctx context.Context, podIdentifier string, dataPar
 
 		podCache.mu.Lock()
 		var matched []PodEntry
-		for _, entry := range podCache.cache.Keys() {
+		for _, key := range podCache.cache.Keys() {
+			entry := key.podEntry()
 			if entryMatchesClear(entry, podIdentifier, dataParallelRank) {
 				matched = append(matched, entry)
 			}
