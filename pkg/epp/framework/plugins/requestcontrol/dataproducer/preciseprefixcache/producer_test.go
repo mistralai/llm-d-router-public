@@ -397,6 +397,8 @@ func TestProduce_MultiPromptChoosesBestAggregateRank(t *testing.T) {
 		return map[string]float64{addr + "@dp1": 3}, nil
 	}}
 	p := newProducerWithIndexer(ctx, idx, scorer)
+	p.kvEventsConfig = kvevents.DefaultConfig()
+	p.kvEventsConfig.PodDiscoveryConfig.DataParallelSize = 2
 	req := &scheduling.InferenceRequest{RequestID: "req-dp-aggregate", Headers: map[string]string{}}
 
 	require.NoError(t, p.produceFromBlockKeys(ctx, trace.SpanFromContext(ctx), req, endpoints,
@@ -409,14 +411,49 @@ func TestProduce_MultiPromptChoosesBestAggregateRank(t *testing.T) {
 	ranks, ok := scheduling.ReadRequestAttribute[map[string]int](req, preciseprefixcacheconstants.WinningRanksDataKey)
 	require.True(t, ok)
 	assert.Equal(t, 1, ranks[addr])
-	dprank.NewDPRankHeaderHandler().PreRequest(ctx, req, &scheduling.SchedulingResult{
+	require.NoError(t, dprank.NewDPRankHeaderHandler().PreRequest(ctx, req, &scheduling.SchedulingResult{
 		PrimaryProfileName: "default",
 		ProfileResults: map[string]*scheduling.ProfileRunResult{
 			"default": {TargetEndpoints: endpoints},
 		},
-	})
+	}))
 	assert.Equal(t, "1", req.Headers[routing.DataParallelRankHeader],
 		"the selected pod must receive the rank that won aggregate scoring")
+}
+
+func TestProduce_ExternalLBDoesNotExposeWinningRank(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	endpoints := freshEndpoints()[:1]
+	const addr = "10.0.0.1:8080"
+	keys := []kvblock.BlockHash{1, 2}
+
+	idx := &fakeKVCacheIndexer{index: &fakeKVBlockIndex{
+		lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
+			return map[kvblock.BlockHash][]kvblock.PodEntry{}, nil
+		},
+	}}
+	scorer := &fakeKVBlockScorer{score: func(_ context.Context, _ []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
+		return map[string]float64{addr + "@dp3": 2}, nil
+	}}
+	p := newProducerWithIndexer(ctx, idx, scorer)
+	p.kvEventsConfig = kvevents.DefaultConfig()
+	req := &scheduling.InferenceRequest{RequestID: "req-external-lb", Headers: map[string]string{}}
+
+	require.NoError(t, p.produceFromBlockKeys(ctx, trace.SpanFromContext(ctx), req, endpoints,
+		[][]kvblock.BlockHash{keys}, nil))
+
+	_, ok := scheduling.ReadRequestAttribute[map[string]int](
+		req, preciseprefixcacheconstants.WinningRanksDataKey)
+	assert.False(t, ok, "rank-specific endpoints must not expose a rank for header injection")
+
+	require.NoError(t, dprank.NewDPRankHeaderHandler().PreRequest(ctx, req, &scheduling.SchedulingResult{
+		PrimaryProfileName: "default",
+		ProfileResults: map[string]*scheduling.ProfileRunResult{
+			"default": {TargetEndpoints: endpoints},
+		},
+	}))
+	assert.NotContains(t, req.Headers, routing.DataParallelRankHeader,
+		"External LB must route by endpoint without an x-data-parallel-rank header")
 }
 
 func TestProduce_CachedBlocksUseWinningRank(t *testing.T) {

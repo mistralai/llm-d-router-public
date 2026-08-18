@@ -52,9 +52,9 @@ func NewDPRankHeaderHandler() *DPRankHeaderHandler {
 // to. The x-data-parallel-rank header is the only way to bypass vLLM's internal
 // queue-based balancing and reach the rank that already holds the KV blocks.
 //
-// It is a no-op under External LB, where each rank is its own endpoint on its
-// own port and the scheduler addresses it directly: no rank is recorded during
-// scoring, so no header is emitted.
+// Configure it only with a precise prefix cache producer using shared-port
+// data parallelism. Under External LB, each rank is already a separate endpoint
+// and must be addressed by that endpoint rather than this header.
 type DPRankHeaderHandler struct {
 	typedName plugin.TypedName
 }
