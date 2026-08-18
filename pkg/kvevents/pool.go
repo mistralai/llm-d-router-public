@@ -117,7 +117,9 @@ type PodDiscoveryConfig struct {
 	// socket for replay requests. Disabled when not set (0 or negative).
 	ReplaySocketPort int `json:"replaySocketPort,omitempty"`
 	// DataParallelSize is the number of data-parallel ranks behind one serving
-	// endpoint. Each rank publishes KV events on SocketPort + rank.
+	// endpoint. Each rank publishes KV events on SocketPort + rank. Values above
+	// one enable shared-port rank steering; leave it at one when ranks are
+	// separate serving endpoints.
 	// Default: 1
 	DataParallelSize int `json:"dataParallelSize,omitempty"`
 }

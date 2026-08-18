@@ -23,6 +23,6 @@ const (
 	PluginType = "precise-prefix-cache-producer"
 )
 
-// WinningRanksDataKey carries the best data-parallel rank per serving endpoint
-// from precise prefix matching to pre-request plugins.
+// WinningRanksDataKey carries the best data-parallel rank per shared serving
+// endpoint from precise prefix matching to pre-request plugins.
 var WinningRanksDataKey = plugin.NewDataKey("DataParallelWinningRanks", PluginType)

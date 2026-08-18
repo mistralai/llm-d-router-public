@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -40,12 +41,15 @@ func dpResultForFirstEndpoint() *scheduling.SchedulingResult {
 	}
 }
 
-func runDPRankHandler(headers map[string]string, ranks map[string]int, result *scheduling.SchedulingResult) map[string]string {
+func runDPRankHandler(t *testing.T, headers map[string]string, ranks map[string]int,
+	result *scheduling.SchedulingResult,
+) map[string]string {
+	t.Helper()
 	request := &scheduling.InferenceRequest{Headers: headers}
 	if ranks != nil {
 		request.PutAttribute(preciseprefixcacheconstants.WinningRanksDataKey, ranks)
 	}
-	NewDPRankHeaderHandler().PreRequest(context.Background(), request, result)
+	require.NoError(t, NewDPRankHeaderHandler().PreRequest(context.Background(), request, result))
 	return request.Headers
 }
 
@@ -55,7 +59,7 @@ func TestDPRankHeaderHandlerPinsSelectedEndpointRank(t *testing.T) {
 		"10.0.0.9:8000": 5, // a pod that was not selected
 	}
 
-	headers := runDPRankHandler(map[string]string{}, ranks, dpResultForFirstEndpoint())
+	headers := runDPRankHandler(t, map[string]string{}, ranks, dpResultForFirstEndpoint())
 
 	assert.Equal(t, "2", headers[routing.DataParallelRankHeader],
 		"the rank of the selected endpoint must be pinned")
@@ -79,7 +83,7 @@ func TestDPRankHeaderHandlerDoesNotPinWithoutSelectedEndpoint(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			headers := runDPRankHandler(map[string]string{},
+			headers := runDPRankHandler(t, map[string]string{},
 				map[string]int{"10.0.0.1:8000": 2}, tt.result)
 
 			assert.NotContains(t, headers, routing.DataParallelRankHeader)
@@ -91,7 +95,7 @@ func TestDPRankHeaderHandlerDoesNotPinWithoutSelectedEndpoint(t *testing.T) {
 // to a rank of its choosing and steering around the router's cache-aware
 // placement.
 func TestDPRankHeaderHandlerClearsClientSuppliedRank(t *testing.T) {
-	headers := runDPRankHandler(map[string]string{
+	headers := runDPRankHandler(t, map[string]string{
 		routing.DataParallelRankHeader: "7",
 	}, nil, dpResultForFirstEndpoint())
 
@@ -99,18 +103,17 @@ func TestDPRankHeaderHandlerClearsClientSuppliedRank(t *testing.T) {
 		"a client-supplied rank must not survive")
 }
 
-// TestDPRankHeaderHandlerNoOpWithoutRecordedRanks is the External LB and non-DP
-// case: scoring recorded no rank, so nothing is pinned and vLLM keeps its own
-// placement.
+// TestDPRankHeaderHandlerNoOpWithoutRecordedRanks covers requests for which the
+// precise producer exposed no shared-port rank.
 func TestDPRankHeaderHandlerNoOpWithoutRecordedRanks(t *testing.T) {
-	headers := runDPRankHandler(map[string]string{}, nil, dpResultForFirstEndpoint())
+	headers := runDPRankHandler(t, map[string]string{}, nil, dpResultForFirstEndpoint())
 	assert.Empty(t, headers)
 }
 
 // TestDPRankHeaderHandlerSelectedEndpointHasNoRank covers a pod that was scored
 // but held no data-parallel entries, so there is no rank to pin.
 func TestDPRankHeaderHandlerSelectedEndpointHasNoRank(t *testing.T) {
-	headers := runDPRankHandler(map[string]string{}, map[string]int{
+	headers := runDPRankHandler(t, map[string]string{}, map[string]int{
 		"10.0.0.9:8000": 5,
 	}, dpResultForFirstEndpoint())
 
@@ -119,8 +122,9 @@ func TestDPRankHeaderHandlerSelectedEndpointHasNoRank(t *testing.T) {
 
 func TestDPRankHeaderHandlerToleratesNilRequest(t *testing.T) {
 	assert.NotPanics(t, func() {
-		NewDPRankHeaderHandler().PreRequest(context.Background(), nil, dpResultForFirstEndpoint())
-		NewDPRankHeaderHandler().PreRequest(context.Background(),
-			&scheduling.InferenceRequest{}, dpResultForFirstEndpoint())
+		assert.NoError(t,
+			NewDPRankHeaderHandler().PreRequest(context.Background(), nil, dpResultForFirstEndpoint()))
+		assert.NoError(t, NewDPRankHeaderHandler().PreRequest(context.Background(),
+			&scheduling.InferenceRequest{}, dpResultForFirstEndpoint()))
 	})
 }
