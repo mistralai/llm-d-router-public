@@ -1,4 +1,6 @@
-# DataParallel Profile Handler
+# Data Parallel Handlers
+
+## Data Parallel Profile Handler
 
 **Type:** `data-parallel-profile-handler`
 
@@ -35,6 +37,31 @@ plugins:
 ```yaml
 plugins:
   - type: single-profile-handler
+```
+
+## DP Rank Header Handler
+
+**Type:** `dp-rank-header-handler`
+
+Pins a request to the precise-cache producer's winning rank by setting
+`x-data-parallel-rank` after endpoint selection. This is for vLLM Internal and
+Hybrid LB deployments where multiple local ranks share one serving endpoint.
+
+Configure the precise prefix cache producer with
+`kvEventsConfig.podDiscoveryConfig.dataParallelSize` greater than `1`. Do not
+use this handler with External LB; each rank is already a separate serving
+endpoint there.
+
+```yaml
+plugins:
+  - type: precise-prefix-cache-producer
+    parameters:
+      kvEventsConfig:
+        discoverPods: true
+        podDiscoveryConfig:
+          socketPort: 5557
+          dataParallelSize: 8
+  - type: dp-rank-header-handler
 ```
 
 ---

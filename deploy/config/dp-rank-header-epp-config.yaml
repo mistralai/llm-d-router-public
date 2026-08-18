@@ -8,8 +8,8 @@
 # bypassing vLLM's internal queue-based balancing.
 #
 # For External LB, where each rank is its own endpoint on its own port, use
-# dp-epp-config.yaml instead. Leaving dp-rank-header-handler in is harmless
-# there: no rank is recorded during scoring, so no header is emitted.
+# dp-epp-config.yaml instead. Do not configure dp-rank-header-handler there;
+# External LB routes to the rank-specific endpoint directly.
 #
 # Ranks are learned from KV events, so this requires the precise producer --
 # the approximate prefix cache does not track which rank cached a block. Note
