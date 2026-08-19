@@ -20,6 +20,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
@@ -128,4 +129,24 @@ func TestDPRankHeaderHandlerToleratesNilRequest(t *testing.T) {
 		NewDPRankHeaderHandler().PreRequest(context.Background(),
 			&scheduling.InferenceRequest{}, dpResultForFirstEndpoint())
 	})
+}
+
+func TestDPRankHeaderHandlerRecordsRoutingDecision(t *testing.T) {
+	dpRankRoutingTotal.Reset()
+	t.Cleanup(dpRankRoutingTotal.Reset)
+
+	handler := NewDPRankHeaderHandler().WithName("test-handler")
+	pinned := &scheduling.InferenceRequest{Headers: map[string]string{}}
+	pinned.PutAttribute(routing.DataParallelWinningRanksAttribute, map[string]int{
+		"10.0.0.1:8000": 2,
+	})
+	handler.PreRequest(context.Background(), pinned, dpResultForFirstEndpoint())
+
+	internal := &scheduling.InferenceRequest{Headers: map[string]string{}}
+	handler.PreRequest(context.Background(), internal, dpResultForFirstEndpoint())
+
+	assert.Equal(t, float64(1), testutil.ToFloat64(dpRankRoutingTotal.WithLabelValues(
+		DPRankHeaderHandlerType, "test-handler", routingDecisionPreciseKV, "2")))
+	assert.Equal(t, float64(1), testutil.ToFloat64(dpRankRoutingTotal.WithLabelValues(
+		DPRankHeaderHandlerType, "test-handler", routingDecisionVLLMInternal, noDataParallelRankLabel)))
 }
