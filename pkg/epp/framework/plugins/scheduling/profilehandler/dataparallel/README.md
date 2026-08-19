@@ -43,16 +43,29 @@ plugins:
 
 **Type:** `dp-rank-header-handler`
 
-Pins a request to the precise-cache producer's winning rank by setting
+Pins a request to the selected logical endpoint's rank by setting
 `x-data-parallel-rank` after endpoint selection. This is for vLLM Internal and
 Hybrid LB deployments where multiple local ranks share one serving endpoint.
 
-Configure the precise prefix cache producer with
-`kvEventsConfig.podDiscoveryConfig.dataParallelSize` greater than `1`. Do not
-use this handler with External LB; each rank is already a separate serving
-endpoint there.
+Configure EPP with `--endpoint-data-parallel-size` greater than `1`, or set the
+equivalent Helm value `router.modelServers.dataParallelSize`. This makes each
+`(pod, rank)` independently schedulable while retaining the pod's shared
+serving address. The handler pins every request to the rank selected by the
+normal scheduling pipeline.
+
+When precise prefix cache routing is enabled, logical endpoint metadata also
+selects each rank's KV-event socket. The producer's
+`kvEventsConfig.podDiscoveryConfig.dataParallelSize` setting is only required
+by the legacy one-endpoint-per-pod mode. Do not use this handler with External
+LB; each rank is already a separate network endpoint there.
 
 ```yaml
+# Helm values
+router:
+  modelServers:
+    dataParallelSize: 8
+
+# EndpointPickerConfig
 plugins:
   - type: precise-prefix-cache-producer
     parameters:
@@ -60,19 +73,17 @@ plugins:
         discoverPods: true
         podDiscoveryConfig:
           socketPort: 5557
-          dataParallelSize: 8
   - type: dp-rank-header-handler
 ```
 
 The handler exports `llm_d_epp_dp_rank_routing_total`. The `decision` label is
-`precise_kv` when EPP pins the request to the rank with the longest cached
-prefix and `vllm_internal` when no cached rank is available and vLLM selects a
-rank internally. The `rank` label contains the pinned rank or `none`.
+`endpoint` when EPP pins the selected logical endpoint's rank. `precise_kv` and
+`vllm_internal` describe the legacy one-endpoint-per-pod fallback, depending on
+whether precise cache state selected a rank. The `rank` label contains the
+pinned rank or `none`.
 
 ```promql
-sum(rate(llm_d_epp_dp_rank_routing_total{decision="precise_kv"}[5m]))
-/
-sum(rate(llm_d_epp_dp_rank_routing_total{decision=~"precise_kv|vllm_internal"}[5m]))
+sum(rate(llm_d_epp_dp_rank_routing_total{decision="endpoint"}[5m]))
 ```
 
 ---

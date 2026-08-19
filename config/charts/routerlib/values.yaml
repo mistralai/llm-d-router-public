@@ -161,6 +161,7 @@ inferenceObjectives: []
 modelServers:
   type: vllm # vllm, sglang, triton-tensorrt-llm, trtllm-serve, triton
   protocol: http # http, grpc
+  dataParallelSize: 1 # Set above 1 when ranks share one serving port.
   targetPorts:
     - number: 8000
   # matchLabels: # REQUIRED in parent charts if creating inference pool
@@ -255,4 +256,3 @@ latencyPredictor:
     LATENCY_MAX_SAMPLE_SIZE: "10000"
     LATENCY_MAX_CONCURRENT_DISPATCHES: "36"
     LATENCY_COALESCE_WINDOW_MS: "1"
-
