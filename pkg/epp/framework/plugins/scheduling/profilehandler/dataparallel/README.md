@@ -64,6 +64,17 @@ plugins:
   - type: dp-rank-header-handler
 ```
 
+The handler exports `llm_d_epp_dp_rank_routing_total`. The `decision` label is
+`precise_kv` when EPP pins the request to the rank with the longest cached
+prefix and `vllm_internal` when no cached rank is available and vLLM selects a
+rank internally. The `rank` label contains the pinned rank or `none`.
+
+```promql
+sum(rate(llm_d_epp_dp_rank_routing_total{decision="precise_kv"}[5m]))
+/
+sum(rate(llm_d_epp_dp_rank_routing_total{decision=~"precise_kv|vllm_internal"}[5m]))
+```
+
 ---
 
 ## Related Documentation
