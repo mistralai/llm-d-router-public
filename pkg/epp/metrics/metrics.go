@@ -368,7 +368,13 @@ var (
 		prometheus.GaugeOpts{
 			Subsystem: inferenceExtension,
 			Name:      "flow_control_pool_saturation",
-			Help:      metricsutil.HelpMsgWithStability("[Deprecated: Use llm_d_epp_flow_control_pool_saturation] Current saturation level of the inference pool (0.0 = empty, 1.0 = fully saturated).", compbasemetrics.ALPHA),
+			Help: metricsutil.HelpMsgWithStability(
+				"[Deprecated: Use llm_d_epp_flow_control_pool_saturation] Pool saturation signal gating Flow Control "+
+					"dispatch. 1.0 is the gating set point; values above 1.0 indicate the magnitude of oversubscription "+
+					"past it. An empty pool reads as 1.0. With the default utilization detector, endpoints with missing "+
+					"or stale metrics score as fully saturated (fail-closed; see "+
+					"llm_d_epp_flow_control_stale_endpoints).",
+				compbasemetrics.ALPHA),
 		},
 		[]string{"inference_pool"},
 	)
@@ -443,10 +449,13 @@ func Register(customCollectors ...prometheus.Collector) {
 		metrics.Registry.MustRegister(llmdInterTokenLatency)
 		metrics.Registry.MustRegister(inferencePoolAvgKVCache)
 		metrics.Registry.MustRegister(llmdInferencePoolAvgKVCache)
+		metrics.Registry.MustRegister(llmdInferencePoolStdDevKVCache)
 		metrics.Registry.MustRegister(inferencePoolAvgQueueSize)
 		metrics.Registry.MustRegister(llmdInferencePoolAvgQueueSize)
+		metrics.Registry.MustRegister(llmdInferencePoolStdDevQueueSize)
 		metrics.Registry.MustRegister(inferencePoolAvgRunningRequests)
 		metrics.Registry.MustRegister(llmdInferencePoolAvgRunningRequests)
+		metrics.Registry.MustRegister(llmdInferencePoolStdDevRunningRequests)
 		metrics.Registry.MustRegister(inferencePoolReadyPods)
 		metrics.Registry.MustRegister(llmdInferencePoolReadyEndpoints)
 		metrics.Registry.MustRegister(schedulerE2ELatency)
@@ -455,6 +464,9 @@ func Register(customCollectors ...prometheus.Collector) {
 		metrics.Registry.MustRegister(llmdSchedulerAttemptsTotal)
 		metrics.Registry.MustRegister(pluginProcessingLatencies)
 		metrics.Registry.MustRegister(llmdPluginProcessingLatencies)
+		metrics.Registry.MustRegister(llmdPluginDataScopeViolations)
+		metrics.Registry.MustRegister(llmdRequestProcessingLatency)
+		metrics.Registry.MustRegister(llmdResponseProcessingLatency)
 		metrics.Registry.MustRegister(inferenceExtensionInfo)
 		metrics.Registry.MustRegister(llmdInferenceExtensionInfo)
 		metrics.Registry.MustRegister(flowControlRequestQueueDuration)
@@ -467,8 +479,17 @@ func Register(customCollectors ...prometheus.Collector) {
 		metrics.Registry.MustRegister(llmdFlowControlQueueBytes)
 		metrics.Registry.MustRegister(flowControlPoolSaturation)
 		metrics.Registry.MustRegister(llmdFlowControlPoolSaturation)
+		// No deprecated inference_extension twin: new flow control metrics are emitted under the
+		// llm_d_epp prefix only.
+		metrics.Registry.MustRegister(llmdFlowControlStaleEndpoints)
 		metrics.Registry.MustRegister(flowControlRequestEnqueueDuration)
 		metrics.Registry.MustRegister(llmdFlowControlRequestEnqueueDuration)
+		metrics.Registry.MustRegister(llmdFlowControlRequestsTotal)
+		metrics.Registry.MustRegister(llmdFlowControlRevocationsIssuedTotal)
+		metrics.Registry.MustRegister(llmdFlowControlRevocationsTotal)
+		metrics.Registry.MustRegister(llmdFlowControlReclaimTarget)
+		metrics.Registry.MustRegister(llmdFlowControlPendingReclaim)
+		metrics.Registry.MustRegister(llmdFlowControlRevocationConfirmationDuration)
 		metrics.Registry.MustRegister(inferenceModelRewriteDecisionsTotal)
 		metrics.Registry.MustRegister(llmdInferenceModelRewriteDecisionsTotal)
 		metrics.Registry.MustRegister(DataLayerPollErrorsTotal)
@@ -509,10 +530,13 @@ func Reset() {
 	llmdInterTokenLatency.Reset()
 	inferencePoolAvgKVCache.Reset()
 	llmdInferencePoolAvgKVCache.Reset()
+	llmdInferencePoolStdDevKVCache.Reset()
 	inferencePoolAvgQueueSize.Reset()
 	llmdInferencePoolAvgQueueSize.Reset()
+	llmdInferencePoolStdDevQueueSize.Reset()
 	inferencePoolAvgRunningRequests.Reset()
 	llmdInferencePoolAvgRunningRequests.Reset()
+	llmdInferencePoolStdDevRunningRequests.Reset()
 	inferencePoolReadyPods.Reset()
 	llmdInferencePoolReadyEndpoints.Reset()
 	schedulerE2ELatency.Reset()
@@ -521,6 +545,9 @@ func Reset() {
 	llmdSchedulerAttemptsTotal.Reset()
 	pluginProcessingLatencies.Reset()
 	llmdPluginProcessingLatencies.Reset()
+	llmdPluginDataScopeViolations.Reset()
+	llmdRequestProcessingLatency.Reset()
+	llmdResponseProcessingLatency.Reset()
 	inferenceExtensionInfo.Reset()
 	llmdInferenceExtensionInfo.Reset()
 	flowControlRequestQueueDuration.Reset()
@@ -531,10 +558,17 @@ func Reset() {
 	llmdFlowControlQueueBytes.Reset()
 	flowControlPoolSaturation.Reset()
 	llmdFlowControlPoolSaturation.Reset()
+	llmdFlowControlStaleEndpoints.Reset()
 	flowControlRequestEnqueueDuration.Reset()
 	llmdFlowControlRequestEnqueueDuration.Reset()
 	flowControlDispatchCycleDuration.Reset()
 	llmdFlowControlDispatchCycleDuration.Reset()
+	llmdFlowControlRequestsTotal.Reset()
+	llmdFlowControlRevocationsIssuedTotal.Reset()
+	llmdFlowControlRevocationsTotal.Reset()
+	llmdFlowControlReclaimTarget.Reset()
+	llmdFlowControlPendingReclaim.Reset()
+	llmdFlowControlRevocationConfirmationDuration.Reset()
 	inferenceModelRewriteDecisionsTotal.Reset()
 	llmdInferenceModelRewriteDecisionsTotal.Reset()
 	DataLayerPollErrorsTotal.Reset()
@@ -545,6 +579,8 @@ func Reset() {
 
 // RecordRequestCounter records the number of requests.
 func RecordRequestCounter(modelName, targetModelName, fairnessID string, priority int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	prioStr := strconv.Itoa(priority)
 	requestCounter.WithLabelValues(modelName, targetModelName, prioStr).Inc()
 	llmdRequestCounter.WithLabelValues(modelName, targetModelName, fairnessID, prioStr).Inc()
@@ -552,6 +588,8 @@ func RecordRequestCounter(modelName, targetModelName, fairnessID string, priorit
 
 // RecordRequestErrCounter records the number of error requests.
 func RecordRequestErrCounter(modelName, targetModelName, fairnessID, priority string, code string) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if code != "" {
 		requestErrCounter.WithLabelValues(modelName, targetModelName, code).Inc()
 		llmdRequestErrCounter.WithLabelValues(modelName, targetModelName, fairnessID, priority, code).Inc()
@@ -560,12 +598,16 @@ func RecordRequestErrCounter(modelName, targetModelName, fairnessID, priority st
 
 // RecordRequestSizes records the request sizes.
 func RecordRequestSizes(modelName, targetModelName, fairnessID, priority string, reqSize int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	requestSizes.WithLabelValues(modelName, targetModelName).Observe(float64(reqSize))
 	llmdRequestSizes.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(float64(reqSize))
 }
 
 // RecordRequestLatencies records duration of request.
 func RecordRequestLatencies(ctx context.Context, modelName, targetModelName, fairnessID, priority string, received time.Time, complete time.Time) bool {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if !complete.After(received) {
 		log.FromContext(ctx).V(logutil.DEFAULT).Error(nil, "Request latency values are invalid",
 			"modelName", modelName, "targetModelName", targetModelName, "completeTime", complete, "receivedTime", received)
@@ -579,12 +621,16 @@ func RecordRequestLatencies(ctx context.Context, modelName, targetModelName, fai
 
 // RecordResponseSizes records the response sizes.
 func RecordResponseSizes(modelName, targetModelName, fairnessID, priority string, size int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	responseSizes.WithLabelValues(modelName, targetModelName).Observe(float64(size))
 	llmdResponseSizes.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(float64(size))
 }
 
 // RecordInputTokens records input tokens count.
 func RecordInputTokens(modelName, targetModelName, fairnessID, priority string, size int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if size > 0 {
 		inputTokens.WithLabelValues(modelName, targetModelName).Observe(float64(size))
 		llmdInputTokens.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(float64(size))
@@ -593,6 +639,8 @@ func RecordInputTokens(modelName, targetModelName, fairnessID, priority string, 
 
 // RecordOutputTokens records output tokens count.
 func RecordOutputTokens(modelName, targetModelName, fairnessID, priority string, size int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if size > 0 {
 		outputTokens.WithLabelValues(modelName, targetModelName).Observe(float64(size))
 		llmdOutputTokens.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(float64(size))
@@ -601,12 +649,16 @@ func RecordOutputTokens(modelName, targetModelName, fairnessID, priority string,
 
 // RecordPromptCachedTokens records prompt cached tokens count.
 func RecordPromptCachedTokens(modelName, targetModelName, fairnessID, priority string, size int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	promptCachedTokens.WithLabelValues(modelName, targetModelName).Observe(float64(size))
 	llmdPromptCachedTokens.WithLabelValues(modelName, targetModelName, fairnessID, priority).Observe(float64(size))
 }
 
 // RecordNormalizedTimePerOutputToken (NTPOT) records the normalized time per output token.
 func RecordNormalizedTimePerOutputToken(ctx context.Context, modelName, targetModelName, fairnessID, priority string, received time.Time, complete time.Time, outputTokenCount int) bool {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if outputTokenCount <= 0 {
 		return false
 	}
@@ -627,6 +679,8 @@ func RecordNormalizedTimePerOutputToken(ctx context.Context, modelName, targetMo
 
 // RecordRequestTTFT records the time to first token.
 func RecordRequestTTFT(ctx context.Context, modelName, targetModelName, fairnessID, priority string, streaming bool, received time.Time, firstToken time.Time) bool {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if firstToken.IsZero() {
 		return false
 	}
@@ -645,8 +699,18 @@ func RecordRequestTTFT(ctx context.Context, modelName, targetModelName, fairness
 	return true
 }
 
-// RecordRequestTPOT records the average time per output token.
-func RecordRequestTPOT(ctx context.Context, modelName, targetModelName, fairnessID, priority string, received time.Time, firstToken time.Time, complete time.Time, outputTokenCount int) bool {
+// RecordRequestTPOT records the average time per output token. TPOT is only
+// derivable for streaming responses: a non-streaming response arrives as a
+// single body chunk, so the first-token and completion timestamps coincide and
+// no inter-token timing exists. Such requests are skipped silently instead of
+// being logged as invalid (they would otherwise emit an error-level line per
+// request on non-streaming workloads).
+func RecordRequestTPOT(ctx context.Context, modelName, targetModelName, fairnessID, priority string, streaming bool, received time.Time, firstToken time.Time, complete time.Time, outputTokenCount int) bool {
+	if !streaming {
+		return false
+	}
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if firstToken.IsZero() || outputTokenCount <= 1 {
 		return false
 	}
@@ -666,6 +730,8 @@ func RecordRequestTPOT(ctx context.Context, modelName, targetModelName, fairness
 
 // RecordInterTokenLatency records the time between consecutive response body chunks for streaming requests.
 func RecordInterTokenLatency(ctx context.Context, modelName, targetModelName, fairnessID, priority string, itlSeconds float64) bool {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if itlSeconds < 0 {
 		log.FromContext(ctx).Error(nil, "Inter-token latency value must be non-negative",
 			"modelName", modelName, "targetModelName", targetModelName, "itlSeconds", itlSeconds)
@@ -677,6 +743,8 @@ func RecordInterTokenLatency(ctx context.Context, modelName, targetModelName, fa
 
 // IncRunningRequests increases the current running requests.
 func IncRunningRequests(modelName, targetModelName, fairnessID, priority string) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if modelName != "" {
 		runningRequests.WithLabelValues(modelName).Inc()
 		llmdRunningRequests.WithLabelValues(modelName, targetModelName, fairnessID, priority).Inc()
@@ -685,6 +753,8 @@ func IncRunningRequests(modelName, targetModelName, fairnessID, priority string)
 
 // DecRunningRequests decreases the current running requests.
 func DecRunningRequests(modelName, targetModelName, fairnessID, priority string) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	if modelName != "" {
 		runningRequests.WithLabelValues(modelName).Dec()
 		llmdRunningRequests.WithLabelValues(modelName, targetModelName, fairnessID, priority).Dec()
@@ -706,6 +776,18 @@ func RecordInferencePoolAvgRunningRequests(name string, runningRequests float64)
 	llmdInferencePoolAvgRunningRequests.WithLabelValues(name).Set(runningRequests)
 }
 
+func RecordInferencePoolStdDevKVCache(name string, utilization float64) {
+	llmdInferencePoolStdDevKVCache.WithLabelValues(name).Set(utilization)
+}
+
+func RecordInferencePoolStdDevQueueSize(name string, queueSize float64) {
+	llmdInferencePoolStdDevQueueSize.WithLabelValues(name).Set(queueSize)
+}
+
+func RecordInferencePoolStdDevRunningRequests(name string, runningRequests float64) {
+	llmdInferencePoolStdDevRunningRequests.WithLabelValues(name).Set(runningRequests)
+}
+
 func RecordInferencePoolReadyPods(name string, runningPods float64) {
 	inferencePoolReadyPods.WithLabelValues(name).Set(runningPods)
 	llmdInferencePoolReadyEndpoints.WithLabelValues(name).Set(runningPods)
@@ -715,6 +797,18 @@ func RecordInferencePoolReadyPods(name string, runningPods float64) {
 func RecordSchedulerE2ELatency(duration time.Duration) {
 	schedulerE2ELatency.WithLabelValues().Observe(duration.Seconds())
 	llmdSchedulerE2ELatency.WithLabelValues().Observe(duration.Seconds())
+}
+
+// RecordRequestProcessingLatency records the EPP request processing latency,
+// measured from request receipt until the request body has been handled.
+func RecordRequestProcessingLatency(duration time.Duration) {
+	llmdRequestProcessingLatency.WithLabelValues().Observe(duration.Seconds())
+}
+
+// RecordResponseProcessingLatency records the EPP response processing latency
+// for a single request.
+func RecordResponseProcessingLatency(duration time.Duration) {
+	llmdResponseProcessingLatency.WithLabelValues().Observe(duration.Seconds())
 }
 
 // RecordSchedulerAttempt records a scheduling attempt with status and endpoint information.
@@ -733,8 +827,8 @@ func RecordSchedulerAttempt(err error, targetModelName string, result *fwksched.
 			if len(primaryResults.TargetEndpoints) > 0 {
 				metadata := primaryResults.TargetEndpoints[0].GetMetadata()
 				if metadata != nil {
-					schedulerAttemptsTotal.WithLabelValues(SchedulerStatusSuccess, targetModelName, metadata.PodName, metadata.NamespacedName.Namespace, metadata.Port).Inc()
-					llmdSchedulerAttemptsTotal.WithLabelValues(SchedulerStatusSuccess, targetModelName, metadata.PodName, metadata.NamespacedName.Namespace, metadata.Port).Inc()
+					schedulerAttemptsTotal.WithLabelValues(SchedulerStatusSuccess, targetModelName, metadata.Name, metadata.ID.Namespace, metadata.Port).Inc()
+					llmdSchedulerAttemptsTotal.WithLabelValues(SchedulerStatusSuccess, targetModelName, metadata.Name, metadata.ID.Namespace, metadata.Port).Inc()
 					return
 				}
 			}
@@ -756,6 +850,18 @@ func RecordPluginProcessingLatency(extensionPoint, pluginType, pluginName string
 	llmdPluginProcessingLatencies.WithLabelValues(extensionPoint, pluginType, pluginName).Observe(duration.Seconds())
 }
 
+// Access kinds for RecordPluginDataScopeViolation.
+const (
+	DataScopeAccessRead  = "read"
+	DataScopeAccessWrite = "write"
+)
+
+// RecordPluginDataScopeViolation records an endpoint attribute access rejected
+// because the plugin did not declare the DataKey.
+func RecordPluginDataScopeViolation(extensionPoint, pluginType, pluginName, access string) {
+	llmdPluginDataScopeViolations.WithLabelValues(extensionPoint, pluginType, pluginName, access).Inc()
+}
+
 func RecordInferenceExtensionInfo(commitSha, buildRef string) {
 	inferenceExtensionInfo.WithLabelValues(commitSha, buildRef).Set(1)
 	llmdInferenceExtensionInfo.WithLabelValues(commitSha, buildRef).Set(1)
@@ -768,6 +874,8 @@ func RecordFlowControlRequestQueueDuration(
 	modelName, targetModelName string,
 	duration time.Duration,
 ) {
+	fairnessID = boundFairnessID(fairnessID)
+	modelName, targetModelName = boundModels(modelName, targetModelName)
 	flowControlRequestQueueDuration.WithLabelValues(
 		fairnessID, priority, outcome,
 		inferencePool,
@@ -792,6 +900,7 @@ func RecordFlowControlRequestEnqueueDuration(
 	fairnessID string, priority string, outcome string,
 	duration time.Duration,
 ) {
+	fairnessID = boundFairnessID(fairnessID)
 	flowControlRequestEnqueueDuration.WithLabelValues(
 		fairnessID, priority, outcome,
 	).Observe(duration.Seconds())
@@ -803,24 +912,32 @@ func RecordFlowControlRequestEnqueueDuration(
 
 // IncFlowControlQueueSize increments the Flow Control queue size gauge.
 func IncFlowControlQueueSize(fairnessID, priority, inferencePool, modelName, targetModelName string) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	flowControlQueueSize.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Inc()
 	llmdFlowControlQueueSize.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Inc()
 }
 
 // DecFlowControlQueueSize decrements the Flow Control queue size gauge.
 func DecFlowControlQueueSize(fairnessID, priority, inferencePool, modelName, targetModelName string) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	flowControlQueueSize.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Dec()
 	llmdFlowControlQueueSize.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Dec()
 }
 
 // AddFlowControlQueueBytes increments the Flow Control queue bytes gauge.
 func AddFlowControlQueueBytes(fairnessID, priority, inferencePool, modelName, targetModelName string, bytes uint64) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	flowControlQueueBytes.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Add(float64(bytes))
 	llmdFlowControlQueueBytes.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Add(float64(bytes))
 }
 
 // SubFlowControlQueueBytes decrements the Flow Control queue bytes gauge.
 func SubFlowControlQueueBytes(fairnessID, priority, inferencePool, modelName, targetModelName string, bytes uint64) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
 	flowControlQueueBytes.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Sub(float64(bytes))
 	llmdFlowControlQueueBytes.WithLabelValues(fairnessID, priority, inferencePool, modelName, targetModelName).Sub(float64(bytes))
 }
@@ -831,8 +948,81 @@ func RecordFlowControlPoolSaturation(inferencePool string, saturation float64) {
 	llmdFlowControlPoolSaturation.WithLabelValues(inferencePool).Set(saturation)
 }
 
+// RecordFlowControlStaleEndpoints records how many candidate endpoints the given saturation
+// detector scored as fully saturated because their metrics were missing or stale.
+func RecordFlowControlStaleEndpoints(detector string, count int) {
+	llmdFlowControlStaleEndpoints.WithLabelValues(detector).Set(float64(count))
+}
+
+// IncFlowControlRequestsTotal increments the total request counter for a given outcome.
+func IncFlowControlRequestsTotal(outcome, priority, inferencePool string) {
+	llmdFlowControlRequestsTotal.WithLabelValues(outcome, priority, inferencePool).Inc()
+}
+
+// Terminal revocation outcomes for the flow control revocations counter. Every issued revocation
+// eventually increments exactly one outcome.
+const (
+	RevocationOutcomeConfirmed = "confirmed"
+	RevocationOutcomeTimedOut  = "timed_out"
+)
+
+// RecordFlowControlRevocationsIssued counts revocations at issue time, labeled by the demand
+// band's priority.
+func RecordFlowControlRevocationsIssued(inferencePool, priority string, n int) {
+	llmdFlowControlRevocationsIssuedTotal.WithLabelValues(priority, inferencePool).Add(float64(n))
+}
+
+// RecordFlowControlRevocations increments the revocation counter for a terminal outcome.
+func RecordFlowControlRevocations(inferencePool, outcome string, n int) {
+	llmdFlowControlRevocationsTotal.WithLabelValues(outcome, inferencePool).Add(float64(n))
+}
+
+// RecordFlowControlReclaimTarget records the last computed reclamation deficit.
+func RecordFlowControlReclaimTarget(inferencePool string, target float64) {
+	llmdFlowControlReclaimTarget.WithLabelValues(inferencePool).Set(target)
+}
+
+// RecordFlowControlPendingReclaim records the capacity debited for unconfirmed revocations.
+func RecordFlowControlPendingReclaim(inferencePool string, pending float64) {
+	llmdFlowControlPendingReclaim.WithLabelValues(inferencePool).Set(pending)
+}
+
+// RecordFlowControlRevocationConfirmationDuration records issue-to-confirmation latency.
+func RecordFlowControlRevocationConfirmationDuration(inferencePool string, duration time.Duration) {
+	llmdFlowControlRevocationConfirmationDuration.WithLabelValues(inferencePool).Observe(duration.Seconds())
+}
+
+// DeleteFlowControlFlowSeries removes every flow-control series labeled with the given fairness ID
+// and priority, across both the deprecated and the llm_d_epp metric families. The fairness ID is
+// derived from client input, so its cardinality is unbounded; the flow registry calls this when it
+// garbage-collects an idle flow so that the metric vectors track live flows instead of growing
+// monotonically with every fairness ID ever observed.
+//
+// Pruning is not synchronized with recording: a request reviving the flow concurrently with GC can
+// have a queue gauge increment deleted here while its paired decrement lands afterwards, leaving
+// the queue size/bytes gauges negative until the flow's next collection deletes the series again.
+func DeleteFlowControlFlowSeries(fairnessID, priority string) {
+	// The overflow value aggregates every capped-out fairness ID, so a flow whose client-chosen ID
+	// equals it must not delete the shared series.
+	if fairnessID == overflowValue {
+		return
+	}
+	labels := prometheus.Labels{"fairness_id": fairnessID, "priority": priority}
+	flowControlRequestQueueDuration.DeletePartialMatch(labels)
+	flowControlRequestEnqueueDuration.DeletePartialMatch(labels)
+	flowControlQueueSize.DeletePartialMatch(labels)
+	flowControlQueueBytes.DeletePartialMatch(labels)
+	llmdFlowControlRequestQueueDuration.DeletePartialMatch(labels)
+	llmdFlowControlRequestEnqueueDuration.DeletePartialMatch(labels)
+	llmdFlowControlQueueSize.DeletePartialMatch(labels)
+	llmdFlowControlQueueBytes.DeletePartialMatch(labels)
+}
+
 // RecordInferenceModelRewriteDecision records the routing decision for InferenceModelRewrite.
+// The rewrite name and target come from configuration; only the source model name is
+// request-derived and needs bounding (a generic rule matches arbitrary model names).
 func RecordInferenceModelRewriteDecision(modelRewriteName, modelName, targetModel string) {
+	modelName = boundModel(modelName)
 	inferenceModelRewriteDecisionsTotal.WithLabelValues(modelRewriteName, modelName, targetModel).Inc()
 	llmdInferenceModelRewriteDecisionsTotal.WithLabelValues(modelRewriteName, modelName, targetModel).Inc()
 }

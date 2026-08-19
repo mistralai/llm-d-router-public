@@ -22,6 +22,7 @@ package slodeadline
 
 import (
 	"encoding/json"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -69,11 +70,6 @@ func (p *sloDeadlinePolicy) Name() string {
 	return p.name
 }
 
-// RequiredQueueCapabilities returns the queue capabilities required by this policy.
-func (p *sloDeadlinePolicy) RequiredQueueCapabilities() []flowcontrol.QueueCapability {
-	return []flowcontrol.QueueCapability{flowcontrol.CapabilityPriorityConfigurable}
-}
-
 func (p *sloDeadlinePolicy) TypedName() plugin.TypedName {
 	return plugin.TypedName{
 		Type: SLODeadlineOrderingPolicyType,
@@ -100,7 +96,12 @@ func calculateSLODeadline(item flowcontrol.QueueItemAccessor) time.Time {
 		return sloMaxDeadlineTime
 	}
 	ms, err := strconv.ParseInt(strings.TrimSpace(sloTtft), 10, 64)
-	if err != nil || ms < 0 {
+	// The bound on ms must be applied before scaling to a time.Duration: once
+	// time.Duration(ms)*time.Millisecond overflows int64 it wraps to an arbitrary
+	// value, so the overflow cannot be detected afterwards. A negative,
+	// unparsable, or out-of-range value is treated as invalid and assigned the
+	// far-future deadline.
+	if err != nil || ms < 0 || ms > math.MaxInt64/int64(time.Millisecond) {
 		return sloMaxDeadlineTime
 	}
 	return req.ReceivedTimestamp().Add(time.Duration(ms) * time.Millisecond)

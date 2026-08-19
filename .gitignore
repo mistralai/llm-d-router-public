@@ -19,6 +19,9 @@ bin/
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
+# Security scan report written by `make lint-security`
+gosec.sarif
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
@@ -53,3 +56,7 @@ vendor
 # Helm dependency artifacts
 config/charts/*/charts/
 config/charts/*/Chart.lock
+
+# Performance benchmark local results directory
+test/perf/__pycache__/
+test/perf/results/

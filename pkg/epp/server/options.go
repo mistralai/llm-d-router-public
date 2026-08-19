@@ -17,9 +17,13 @@ limitations under the License.
 package server
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,15 +31,18 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
+	ctrl "sigs.k8s.io/controller-runtime"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 )
 
 const (
-	DefaultGrpcPort      = 9002
-	DefaultPoolNamespace = "default"        // default when pool namespace is empty (CLI flag default is empty)
-	DefaultDrainTimeout  = 30 * time.Second // graceful shutdown drain window
+	DefaultGrpcPort           = 9002
+	DefaultPoolNamespace      = "default"        // default when pool namespace is empty (CLI flag default is empty)
+	DefaultDrainTimeout       = 30 * time.Second // graceful shutdown drain window
+	MinRefreshMetricsInterval = 50 * time.Millisecond
 )
 
 // deprecatedMetricFlags lists metric flags that are superseded by engineConfigs
@@ -78,13 +85,10 @@ type Options struct {
 	EndpointSelector            labels.Selector // Parsed selector to filter model server pods on. Set via --endpoint-selector flag and parsed in Complete().
 	EndpointTargetPorts         []int           // Target ports of model server pods.
 	DisableEndpointSubsetFilter bool            // Disables respecting destination endpoint subset metadata in EPP.
+	EmitEndpointScores          bool            // Enables emitting per-endpoint scheduler scores in the request-path dynamic metadata.
 	//
 	// MSP metrics scraping.
 	//
-	ModelServerMetricsScheme         string        // Protocol scheme used in scraping metrics from endpoints.
-	ModelServerMetricsPath           string        // URL path used in scraping metrics from endpoints.
-	ModelServerMetricsPort           int           // Port to scrape metrics from endpoints. (TODO: Deprecated, uint16)
-	ModelServerMetricsHTTPSInsecure  bool          // Disable certificate verification when using 'https' scheme for 'model-server-metrics-scheme'.
 	RefreshMetricsInterval           time.Duration // Interval to refresh metrics.
 	RefreshPrometheusMetricsInterval time.Duration // Interval to flush Prometheus metrics.
 	MetricsStalenessThreshold        time.Duration // Duration after which metrics are considered stale.
@@ -96,22 +100,30 @@ type Options struct {
 	//
 	// Diagnostics.
 	//
-	logging.LoggingOptions         // Logging configuration.
-	Tracing                 bool   // Enables emitting traces.
-	HealthChecking          bool   // Enables health checking.
-	MetricsPort             int    // The metrics port exposed by EPP. (TODO: uint16)
-	GRPCHealthPort          int    // The port used for gRPC liveness and readiness probes. (TODO: uint16)
-	EnablePprof             bool   // Enables pprof handlers.
-	CertPath                string // The path to the certificate for secure serving.
-	EnableCertReload        bool   // Enables certificate reloading of the certificates specified in --cert-path.
-	SecureServing           bool   // Enables secure serving.
-	MetricsEndpointAuth     bool   // Enables authentication and authorization of the metrics endpoint.
-	EnableGRPCStreamMetrics bool   // Enables ext_proc gRPC stream metrics (in-flight gauge, hold duration, completions counter by code).
+	logging.LoggingOptions           // Logging configuration.
+	Tracing                 bool     // Enables emitting traces.
+	HealthChecking          bool     // Enables health checking.
+	MetricsPort             int      // The metrics port exposed by EPP. (TODO: uint16)
+	GRPCHealthPort          int      // The port used for gRPC liveness and readiness probes. (TODO: uint16)
+	EnablePprof             bool     // Enables pprof handlers.
+	CertPath                string   // The path to the certificate for secure serving.
+	EnableCertReload        bool     // Enables certificate reloading of the certificates specified in --cert-path.
+	SecureServing           bool     // Enables secure serving.
+	TLSMinVersion           string   // Minimum TLS version for secure serving (e.g., VersionTLS12, VersionTLS13).
+	TLSCipherSuites         []string // TLS cipher suites (Go crypto/tls names). Only effective for TLS 1.2 and below.
+	tlsMinVersionValue      uint16   // Parsed TLS min version value.
+	tlsCipherSuiteValues    []uint16 // Parsed TLS cipher suite values.
+	MetricsEndpointAuth     bool     // Enables authentication and authorization of the metrics endpoint.
+	MetricsClientCAFile     string   // PEM CA that requires a verified client cert on the metrics endpoint.
+	MetricsCertDir          string   // Directory with the metrics server certificates that enables metrics TLS.
+	EnableGRPCStreamMetrics bool     // Enables ext_proc gRPC stream metrics (in-flight gauge, hold duration, completions counter by code).
 	//
 	// Configuration.
 	//
 	ConfigFile string // The path to the configuration file.
 	ConfigText string // The configuration specified as text, in lieu of a file.
+
+	AllowExperimentalPlugins bool // Allows loading of experimental Alpha plugins.
 
 	// internal
 	fs                  *pflag.FlagSet // FlagSet used in AddFlags() and consulted in Validate()
@@ -126,10 +138,8 @@ func NewOptions() *Options {
 		PoolGroup:                        routing.InferencePoolAPIGroup,
 		EndpointTargetPorts:              []int{},
 		DisableEndpointSubsetFilter:      false,
-		ModelServerMetricsScheme:         "http",
-		ModelServerMetricsPath:           "/metrics",
-		ModelServerMetricsHTTPSInsecure:  true,
-		RefreshMetricsInterval:           50 * time.Millisecond,
+		EmitEndpointScores:               false,
+		RefreshMetricsInterval:           MinRefreshMetricsInterval,
 		RefreshPrometheusMetricsInterval: 5 * time.Second,
 		MetricsStalenessThreshold:        2 * time.Second,
 		TotalQueuedRequestsMetric:        "vllm:num_requests_waiting",
@@ -175,18 +185,9 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 		"Format: a comma-separated list of numbers without whitespace (e.g., '3000,3001,3002').")
 	fs.BoolVar(&opts.DisableEndpointSubsetFilter, "disable-endpoint-subset-filter", opts.DisableEndpointSubsetFilter,
 		"Disables respecting the destination endpoint subset metadata for dispatching requests in EPP.")
-	fs.StringVar(&opts.ModelServerMetricsScheme, "model-server-metrics-scheme", opts.ModelServerMetricsScheme,
-		"Protocol scheme used in scraping metrics from endpoints.")
-	_ = fs.MarkDeprecated("model-server-metrics-scheme", "This flag is deprecated. Configure via EndpointPickerConfig data layer plugin parameters instead.")
-	fs.StringVar(&opts.ModelServerMetricsPath, "model-server-metrics-path", opts.ModelServerMetricsPath,
-		"URL path used in scraping metrics from endpoints.")
-	_ = fs.MarkDeprecated("model-server-metrics-path", "This flag is deprecated. Configure via EndpointPickerConfig data layer plugin parameters instead.")
-	fs.IntVar(&opts.ModelServerMetricsPort, "model-server-metrics-port", opts.ModelServerMetricsPort,
-		"Port to scrape metrics from endpoints. Set to the InferencePool.Spec.TargetPorts[0].Number if not defined.")
-	_ = fs.MarkDeprecated("model-server-metrics-port", "This flag is deprecated and will be removed in a future release.")
-	fs.BoolVar(&opts.ModelServerMetricsHTTPSInsecure, "model-server-metrics-https-insecure-skip-verify", opts.ModelServerMetricsHTTPSInsecure,
-		"Disable certificate verification when using 'https' scheme for 'model-server-metrics-scheme'.")
-	_ = fs.MarkDeprecated("model-server-metrics-https-insecure-skip-verify", "This flag is deprecated. Configure via EndpointPickerConfig data layer plugin parameters instead.")
+	fs.BoolVar(&opts.EmitEndpointScores, "emit-endpoint-scores", opts.EmitEndpointScores,
+		"Enables emitting the scheduler's per-endpoint scores in the request-path dynamic metadata under the "+
+			"'x-gateway-destination-endpoint-scores' key of the 'envoy.lb' namespace.")
 	fs.DurationVar(&opts.RefreshMetricsInterval, "refresh-metrics-interval", opts.RefreshMetricsInterval, "Interval to refresh metrics.")
 	fs.DurationVar(&opts.RefreshPrometheusMetricsInterval, "refresh-prometheus-metrics-interval", opts.RefreshPrometheusMetricsInterval,
 		"Interval to flush Prometheus metrics.")
@@ -225,10 +226,20 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&opts.EnableGRPCStreamMetrics, "enable-grpc-stream-metrics", opts.EnableGRPCStreamMetrics,
 		"Enables ext_proc gRPC stream metrics (in-flight gauge, hold-duration histogram, completions counter by code).")
 	fs.BoolVar(&opts.SecureServing, "secure-serving", opts.SecureServing, "Enables secure serving.")
+	fs.StringVar(&opts.TLSMinVersion, "tls-min-version", opts.TLSMinVersion,
+		"Minimum TLS version for secure serving (e.g., VersionTLS12, VersionTLS13).")
+	fs.StringSliceVar(&opts.TLSCipherSuites, "tls-cipher-suites", opts.TLSCipherSuites,
+		"Comma-separated list of TLS cipher suites for secure serving (Go crypto/tls names, e.g., TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256). Only effective for TLS 1.2 and below; TLS 1.3 cipher suites are not configurable.")
 	fs.BoolVar(&opts.MetricsEndpointAuth, "metrics-endpoint-auth", opts.MetricsEndpointAuth,
 		"Enables authentication and authorization of the metrics endpoint.")
+	fs.StringVar(&opts.MetricsClientCAFile, "metrics-client-ca-file", opts.MetricsClientCAFile,
+		"PEM CA for metrics mTLS: require verified client certs.")
+	fs.StringVar(&opts.MetricsCertDir, "metrics-cert-dir", opts.MetricsCertDir,
+		"Directory with the metrics server certificates. Enables TLS on the metrics endpoint.")
 	fs.StringVar(&opts.ConfigFile, "config-file", opts.ConfigFile, "The path to the configuration file.")
 	fs.StringVar(&opts.ConfigText, "config-text", opts.ConfigText, "The configuration specified as text, in lieu of a file.")
+	fs.BoolVar(&opts.AllowExperimentalPlugins, "allow-experimental-plugins", opts.AllowExperimentalPlugins,
+		"Allows loading of experimental Alpha plugins.")
 }
 
 func (opts *Options) Complete() error {
@@ -279,8 +290,75 @@ func (opts *Options) Complete() error {
 		opts.GRPCMaxSendMsgSize = int(val)
 	}
 
+	if opts.MetricsClientCAFile != "" {
+		if _, err := os.Stat(opts.MetricsClientCAFile); err != nil {
+			return fmt.Errorf("%w: %s: %v", errMetricsCertUnreadable, opts.MetricsClientCAFile, err)
+		}
+	}
+	if opts.MetricsCertDir != "" {
+		for _, name := range []string{"tls.crt", "tls.key"} {
+			p := filepath.Join(opts.MetricsCertDir, name)
+			if _, err := os.Stat(p); err != nil {
+				return fmt.Errorf("%w: %s: %v", errMetricsCertUnreadable, p, err)
+			}
+		}
+	}
+
+	if opts.TLSMinVersion != "" {
+		v, err := parseTLSVersion(opts.TLSMinVersion)
+		if err != nil {
+			return fmt.Errorf("invalid tls-min-version %q: %w", opts.TLSMinVersion, err)
+		}
+		opts.tlsMinVersionValue = v
+	}
+	if len(opts.TLSCipherSuites) > 0 {
+		suites, err := parseCipherSuites(opts.TLSCipherSuites)
+		if err != nil {
+			return fmt.Errorf("invalid tls-cipher-suites: %w", err)
+		}
+		opts.tlsCipherSuiteValues = suites
+	}
+
 	// Complete logging options.
 	return opts.LoggingOptions.Complete()
+}
+
+var (
+	errMetricsClientCARequiresCertDir = errors.New(`"metrics-client-ca-file" requires "metrics-cert-dir"`)
+	errMetricsTLSWithoutAuth          = errors.New(`"metrics-cert-dir" enables metrics TLS without authentication; set "metrics-client-ca-file" or "metrics-endpoint-auth"`)
+	errMetricsCertUnreadable          = errors.New("metrics TLS cert file unreadable")
+	errReadMetricsClientCA            = errors.New("reading metrics client CA")
+	errNoValidMetricsCA               = errors.New("no valid CA certs in metrics client CA file")
+)
+
+// ConfigureMetricsTLS enables TLS, and optional client mTLS, on the metrics server.
+func ConfigureMetricsTLS(opts *Options, mo *metricsserver.Options) error {
+	if opts.MetricsCertDir == "" && opts.MetricsClientCAFile == "" {
+		return nil
+	}
+	mo.SecureServing = true
+	if opts.MetricsCertDir != "" {
+		mo.CertDir = opts.MetricsCertDir
+	}
+	var clientCAs *x509.CertPool
+	if opts.MetricsClientCAFile != "" {
+		caPEM, err := os.ReadFile(opts.MetricsClientCAFile)
+		if err != nil {
+			return fmt.Errorf("%w %s: %v", errReadMetricsClientCA, opts.MetricsClientCAFile, err)
+		}
+		clientCAs = x509.NewCertPool()
+		if !clientCAs.AppendCertsFromPEM(caPEM) {
+			return fmt.Errorf("%w: %s", errNoValidMetricsCA, opts.MetricsClientCAFile)
+		}
+	}
+	mo.TLSOpts = append(mo.TLSOpts, func(c *tls.Config) {
+		c.MinVersion = tls.VersionTLS12
+		if clientCAs != nil {
+			c.ClientCAs = clientCAs
+			c.ClientAuth = tls.RequireAndVerifyClientCert
+		}
+	})
+	return nil
 }
 
 func (opts *Options) Validate() error {
@@ -299,13 +377,21 @@ func (opts *Options) Validate() error {
 	}
 
 	if opts.ConfigText != "" && opts.ConfigFile != "" {
-		return fmt.Errorf("both the %q and %q flags can not be set at the same time", "configText", "configFile")
-	}
-	if opts.ModelServerMetricsScheme != "http" && opts.ModelServerMetricsScheme != "https" {
-		return fmt.Errorf("unexpected %q value for %q flag, it can only be set to 'http' or 'https'",
-			opts.ModelServerMetricsScheme, "model-server-metrics-scheme")
+		return fmt.Errorf("both the %q and %q flags cannot be set at the same time", "config-file", "config-text")
 	}
 
+	if opts.MetricsClientCAFile != "" && opts.MetricsCertDir == "" {
+		return errMetricsClientCARequiresCertDir
+	}
+	if opts.MetricsCertDir != "" && opts.MetricsClientCAFile == "" && !opts.MetricsEndpointAuth {
+		return errMetricsTLSWithoutAuth
+	}
+
+	if opts.RefreshMetricsInterval < MinRefreshMetricsInterval {
+		ctrl.Log.WithName("options").Info("Warning: refresh-metrics-interval below minimum, clamped",
+			"requested", opts.RefreshMetricsInterval, "effective", MinRefreshMetricsInterval)
+		opts.RefreshMetricsInterval = MinRefreshMetricsInterval
+	}
 	if opts.GRPCMaxRecvMsgSize < 0 {
 		return fmt.Errorf("grpc-max-recv-msg-size must be non-negative, got %d", opts.GRPCMaxRecvMsgSize)
 	}
@@ -343,4 +429,51 @@ func removeDuplicatePorts(ports []int) []int {
 		}
 	}
 	return unique
+}
+
+// TLSMinVersionValue returns the parsed uint16 TLS min version.
+func (opts *Options) TLSMinVersionValue() uint16 {
+	return opts.tlsMinVersionValue
+}
+
+// TLSCipherSuiteValues returns the parsed uint16 TLS cipher suite IDs.
+func (opts *Options) TLSCipherSuiteValues() []uint16 {
+	return opts.tlsCipherSuiteValues
+}
+
+var tlsVersions = map[string]uint16{
+	"VersionTLS10": tls.VersionTLS10,
+	"VersionTLS11": tls.VersionTLS11,
+	"VersionTLS12": tls.VersionTLS12,
+	"VersionTLS13": tls.VersionTLS13,
+}
+
+func parseTLSVersion(s string) (uint16, error) {
+	if v, ok := tlsVersions[s]; ok {
+		return v, nil
+	}
+	return 0, fmt.Errorf("unknown TLS version %q; supported values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13", s)
+}
+
+func parseCipherSuites(names []string) ([]uint16, error) {
+	byName := make(map[string]uint16)
+	for _, cs := range tls.CipherSuites() {
+		byName[cs.Name] = cs.ID
+	}
+	for _, cs := range tls.InsecureCipherSuites() {
+		byName[cs.Name] = cs.ID
+	}
+	ids := make([]uint16, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		id, ok := byName[name]
+		if !ok {
+			return nil, fmt.Errorf("unknown cipher suite %q", name)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }

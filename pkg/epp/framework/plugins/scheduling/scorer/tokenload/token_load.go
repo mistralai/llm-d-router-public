@@ -23,6 +23,7 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
@@ -94,18 +95,18 @@ func (s *TokenLoadScorer) Score(ctx context.Context, _ *fwksched.InferenceReques
 	logger := log.FromContext(ctx)
 
 	for _, endpoint := range endpoints {
-		endpointID := endpoint.GetMetadata().NamespacedName.String()
+		endpointID := endpoint.GetMetadata().ID.String()
 		tokenLoad := 0.0
 
 		// Read both accumulated in-flight load and the projected impact of the
 		// request being scored, which are now carried on separate attributes.
 		var tokens int64
-		if val, ok := endpoint.Get(s.inFlightLoadDataKey.String()); ok {
+		if val, ok := endpoint.Get(s.inFlightLoadDataKey); ok {
 			if load, ok := val.(*attrconcurrency.InFlightLoad); ok && load != nil {
 				tokens += load.Tokens
 			}
 		}
-		if val, ok := endpoint.Get(s.uncachedRequestTokensDataKey.String()); ok {
+		if val, ok := endpoint.Get(s.uncachedRequestTokensDataKey); ok {
 			if uncached, ok := val.(*attrconcurrency.UncachedRequestTokens); ok && uncached != nil {
 				tokens += uncached.Tokens
 			}
@@ -122,7 +123,7 @@ func (s *TokenLoadScorer) Score(ctx context.Context, _ *fwksched.InferenceReques
 			score = 1.0 - (tokenLoad / s.queueThresholdTokens)
 		}
 		scores[endpoint] = score
-		logger.V(1).Info("TokenLoadScorer scoring", "endpoint", endpointID, "tokenLoad", tokenLoad, "score", score)
+		logger.V(logutil.DEBUG).Info("TokenLoadScorer scoring", "endpoint", endpointID, "tokenLoad", tokenLoad, "score", score)
 	}
 
 	return scores

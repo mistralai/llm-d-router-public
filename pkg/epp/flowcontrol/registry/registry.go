@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,16 +30,17 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts"
-	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/framework/plugins/queue"
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/queue"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
 )
 
 // propagateStatsDeltaFunc defines the callback function used to propagate statistics changes (deltas) up the hierarchy
-// (Queue -> Shard -> Registry).
+// (Queue -> Registry).
 // Implementations MUST be non-blocking (relying on atomics).
 type propagateStatsDeltaFunc func(priority int, lenDelta, byteSizeDelta int64)
 
-// bandStats holds the aggregated atomic statistics for a single priority band across all shards.
+// bandStats holds the aggregated atomic statistics for a single priority band.
 type bandStats struct {
 	byteSize atomic.Int64
 	len      atomic.Int64
@@ -49,7 +51,7 @@ type flowState struct {
 	leasedState
 	key flowcontrol.FlowKey
 
-	// initialized ensures that the heavy-weight infrastructure provisioning (creating queues on shards) happens exactly
+	// initialized ensures that the heavy-weight infrastructure provisioning (creating queues) happens exactly
 	// once per flowState instance.
 	// This prevents race conditions where multiple concurrent requests might attempt to provision the same flow
 	// simultaneously.
@@ -67,8 +69,8 @@ type priorityBandState struct {
 
 // FlowRegistry is the concrete implementation of the contracts.FlowRegistry interface.
 //
-// The FlowRegistry manages the mapping between abstract FlowKeys and the concrete managed queues distributed across
-// internal shards. It serves as the single source of truth for flow control configuration and lifecycle management.
+// The FlowRegistry manages the mapping between abstract FlowKeys and their concrete managed queues. It serves as the
+// single source of truth for flow control configuration and lifecycle management.
 //
 // # Concurrency Model
 //
@@ -109,13 +111,15 @@ type FlowRegistry struct {
 	// Key: int (priority), Value: *priorityBand
 	priorityBands sync.Map
 
+	// orderedPriorityLevels is a sorted list of active priority levels, published copy-on-write.
+	// Writers (band provisioning and removal, serialized by fr.mu) build a fresh slice and swap the
+	// pointer; a published slice is never mutated. Readers load the pointer and iterate the shared
+	// slice directly, with no lock and no per-call copy on the dispatch hot path.
+	orderedPriorityLevels atomic.Pointer[[]int]
+
 	// --- Administrative state (protected by `mu`) ---
 
 	mu sync.RWMutex
-
-	// orderedPriorityLevels is a sorted list of active priority levels.
-	// It is updated dynamically when new bands are provisioned.
-	orderedPriorityLevels []int
 
 	// initialPriorities tracks priority bands provisioned at startup.
 	// These are never removed by control-plane sync or garbage collection.
@@ -159,6 +163,7 @@ func NewFlowRegistry(config *Config, logger logr.Logger, opts ...RegistryOption)
 		desiredPriorities:    make(map[int]struct{}),
 		priorityBandUpdateCh: make(chan map[int]struct{}, 1),
 	}
+	fr.orderedPriorityLevels.Store(&[]int{})
 
 	for _, opt := range opts {
 		opt(fr)
@@ -174,7 +179,7 @@ func NewFlowRegistry(config *Config, logger logr.Logger, opts ...RegistryOption)
 	}
 
 	fr.logger.V(logging.DEFAULT).Info("FlowRegistry initialized successfully",
-		"orderedPriorities", fr.orderedPriorityLevels)
+		"orderedPriorities", fr.AllOrderedPriorityLevels())
 	return fr
 }
 
@@ -339,22 +344,21 @@ func (fr *FlowRegistry) WithConnection(key flowcontrol.FlowKey, fn func(conn con
 	return fn(&connection{registry: fr, key: key})
 }
 
-// ensureFlowInfrastructure guarantees that the Priority Band exists and that the flow's queues are synchronized across
-// all active shards.
+// ensureFlowInfrastructure guarantees that the Priority Band exists and that the flow's queue is synchronized.
 //
 // NOTE: The caller (WithConnection) must already hold a lease on the priority band to prevent GC during this operation.
 func (fr *FlowRegistry) ensureFlowInfrastructure(key flowcontrol.FlowKey) error {
 	// buildFlowComponents validates that the priority band exists (returning ErrPriorityBandNotFound if not)
 	// under the same read lock it uses to read the topology, so a single acquisition covers both.
 	fr.mu.RLock()
-	components, err := fr.buildFlowComponents(key)
+	policy, q, err := fr.buildFlowComponents(key)
 	fr.mu.RUnlock()
 
 	if err != nil {
 		return err
 	}
 
-	fr.synchronizeFlow(key, components.policy, components.queue)
+	fr.synchronizeFlow(key, policy, q)
 
 	fr.logger.V(logging.DEBUG).Info("Provisioned flow infrastructure", "flowKey", key)
 	return nil
@@ -424,8 +428,8 @@ func (fr *FlowRegistry) Stats() contracts.AggregateStats {
 	fr.mu.RLock()
 	defer fr.mu.RUnlock()
 
-	// Casts from `int64` to `uint64` are safe because the non-negativity invariant is strictly enforced at the
-	// `managedQueue` level.
+	// Casts from `int64` to `uint64` are safe: aggregates are sums of deltas measured from
+	// queue-reported stats (see managedQueue), and per-queue stats are non-negative by construction.
 	stats := contracts.AggregateStats{
 		TotalCapacityBytes:    fr.config.MaxBytes,
 		TotalCapacityRequests: fr.config.MaxRequests,
@@ -473,10 +477,18 @@ func (fr *FlowRegistry) gcFlows() {
 		}
 
 		fr.cleanupFlowResources(keysToClean)
+
+		// Prune the flows' metric series. Fairness IDs come from client input, so without pruning the
+		// per-flow metric vectors grow monotonically with every fairness ID ever observed. Done after
+		// cleanupFlowResources and outside fr.mu: DeletePartialMatch scans whole metric vectors, which
+		// must not run under the registry write lock.
+		for _, key := range keysToClean {
+			metrics.DeleteFlowControlFlowSeries(key.ID, strconv.Itoa(key.Priority))
+		}
 	}
 }
 
-// cleanupFlowResources removes queue resources from the shards for the specified flows.
+// cleanupFlowResources removes queue resources for the specified flows.
 func (fr *FlowRegistry) cleanupFlowResources(keys []flowcontrol.FlowKey) {
 	fr.mu.Lock() // Exclusive lock to prevent race with ensureFlowInfrastructure.
 	defer fr.mu.Unlock()
@@ -508,7 +520,7 @@ func (fr *FlowRegistry) gcPriorityBands() {
 	}
 }
 
-// cleanupPriorityBandResources removes priority band configuration and resources from the registry and all shards.
+// cleanupPriorityBandResources removes priority band configuration and resources from the registry.
 func (fr *FlowRegistry) cleanupPriorityBandResources(priorities []int) {
 	fr.mu.Lock()
 	defer fr.mu.Unlock()
@@ -536,35 +548,25 @@ func (fr *FlowRegistry) cleanupPriorityBandResourcesLocked(priority int) {
 	fr.perPriorityBandStats.Delete(priority)
 	fr.priorityBands.Delete(priority)
 
-	fr.orderedPriorityLevels = slices.DeleteFunc(fr.orderedPriorityLevels, func(p int) bool { return p == priority })
+	// Copy-on-write: the published slice is shared with lock-free readers and must not be mutated.
+	updated := slices.DeleteFunc(slices.Clone(*fr.orderedPriorityLevels.Load()), func(p int) bool { return p == priority })
+	fr.orderedPriorityLevels.Store(&updated)
 
 	fr.logger.V(logging.DEFAULT).Info("Successfully deleted priority band", "priority", priority)
 }
 
 // --- Internal Helpers ---
 
-// flowComponents holds the plugin instances created for a single flow on a single shard.
-type flowComponents struct {
-	policy flowcontrol.OrderingPolicy
-	queue  contracts.SafeQueue
-}
-
-// buildFlowComponents instantiates the necessary plugin components for a new flow instance.
-// It creates a distinct instance of each component to ensure state isolation.
-func (fr *FlowRegistry) buildFlowComponents(key flowcontrol.FlowKey) (*flowComponents, error) {
+// buildFlowComponents instantiates the plugin components (ordering policy and queue) for a new flow instance.
+// It creates a distinct queue instance to ensure state isolation.
+func (fr *FlowRegistry) buildFlowComponents(
+	key flowcontrol.FlowKey,
+) (flowcontrol.OrderingPolicy, contracts.SafeQueue, error) {
 	bandConfig, ok := fr.config.PriorityBands[key.Priority]
 	if !ok {
-		return nil, fmt.Errorf("priority band %d not found: %w", key.Priority, contracts.ErrPriorityBandNotFound)
+		return nil, nil, fmt.Errorf("priority band %d not found: %w", key.Priority, contracts.ErrPriorityBandNotFound)
 	}
-
-	q, err := queue.NewQueueFromName(bandConfig.Queue, bandConfig.OrderingPolicy)
-	if err != nil {
-		return nil, fmt.Errorf("failed to instantiate queue %q for flow %s: %w",
-			bandConfig.Queue, key, err)
-	}
-	components := &flowComponents{policy: bandConfig.OrderingPolicy, queue: q}
-
-	return components, nil
+	return bandConfig.OrderingPolicy, queue.New(bandConfig.OrderingPolicy), nil
 }
 
 // propagateStatsDelta is the top-level, lock-free aggregator for all statistics.

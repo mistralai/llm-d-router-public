@@ -53,12 +53,15 @@ func (pl *PredictedLatency) generatePredictions(ctx context.Context, predictedLa
 	generatedTokenCounts := make([]int, len(candidateEndpoints))
 	prefixCacheScores := make([]float64, len(candidateEndpoints))
 	prefillTokensInFlights := make([]int64, len(candidateEndpoints))
+	numRequestRunnings := make([]int, len(candidateEndpoints))
+	encoderInputSizes := make([]int, len(candidateEndpoints))
+	encoderMatchedSizes := make([]int, len(candidateEndpoints))
 
 	for i, endpoint := range candidateEndpoints {
 		logger.V(logutil.TRACE).Info("Candidate pod for scheduling", "endpoint", endpoint.GetMetadata().String(), "metrics", endpoint.GetMetrics().String())
 
 		// Get prefix cache score for the pod
-		prefixCacheScore := predictedLatencyCtx.prefixCacheScoresForEndpoints[endpoint.GetMetadata().NamespacedName.Name]
+		prefixCacheScore := predictedLatencyCtx.prefixCacheScoresForEndpoints[endpoint.GetMetadata().ID.Name]
 
 		logger.V(logutil.DEBUG).Info("Prefix cache score for pod", "pod", endpoint.GetMetadata().String(), "prefixCacheScore", prefixCacheScore)
 
@@ -67,13 +70,22 @@ func (pl *PredictedLatency) generatePredictions(ctx context.Context, predictedLa
 		inputTokenLengths[i] = predictedLatencyCtx.inputTokenCount
 		generatedTokenCounts[i] = 1
 		prefixCacheScores[i] = prefixCacheScore
+		encoderInputSizes[i] = predictedLatencyCtx.encoderInputSize
+		encoderMatchedSizes[i] = predictedLatencyCtx.encoderMatchedSizeForEndpoints[endpoint.GetMetadata().ID.Name]
 
-		podKey := endpoint.GetMetadata().NamespacedName.String()
-		prefillTokensInFlights[i] = pl.endpointCounter(&pl.prefillTokensInFlight, podKey).Load()
+		// Reuse the in-flight load captured for this endpoint earlier in Produce,
+		// so the prediction features are identical to the dispatch-time training
+		// features and neither depends on PreRequest hook ordering.
+		snapshot, ok := predictedLatencyCtx.inFlightLoadForEndpoints[endpoint.GetMetadata().ID.String()]
+		if !ok {
+			snapshot = pl.readInFlightLoad(endpoint)
+		}
+		prefillTokensInFlights[i] = snapshot.tokens
+		numRequestRunnings[i] = snapshot.requests
 	}
 
 	// Bulk predict
-	bulkPredictions, err := bulkPredictWithMetrics(ctx, pl.typedName.Name, pl.typedName.Type, predictedLatencyCtx, pl.latencypredictor, metricsStates, pl.config.EndpointRoleLabel, targetEndpointsMetadatas, inputTokenLengths, generatedTokenCounts, prefixCacheScores, prefillTokensInFlights)
+	bulkPredictions, err := bulkPredictWithMetrics(ctx, pl.typedName.Name, pl.typedName.Type, predictedLatencyCtx, pl.latencypredictor, metricsStates, pl.config.EndpointRoleLabel, targetEndpointsMetadatas, inputTokenLengths, generatedTokenCounts, prefixCacheScores, prefillTokensInFlights, numRequestRunnings, encoderInputSizes, encoderMatchedSizes)
 	if err != nil {
 		logger.V(logutil.DEBUG).Error(err, "Bulk prediction failed")
 		return nil, err
@@ -128,7 +140,7 @@ func (pl *PredictedLatency) updateRequestContextWithPredictions(predictedLatency
 	predMap := make(map[string]endpointPredictionResult, len(predictions))
 	for _, pred := range predictions {
 		if pred.Endpoint != nil && pred.Endpoint.GetMetadata() != nil {
-			predMap[pred.Endpoint.GetMetadata().NamespacedName.Name] = pred
+			predMap[pred.Endpoint.GetMetadata().ID.Name] = pred
 		}
 	}
 	predictedLatencyCtx.predictionsForScheduling = predMap

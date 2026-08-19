@@ -17,6 +17,7 @@ limitations under the License.
 package openai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -39,6 +40,8 @@ const (
 	chatCompletionsAPI = "chat/completions"
 	completionsAPI     = "completions"
 	embeddingsAPI      = "embeddings"
+	// imagesGenerationsAPI is the OpenAI-compatible image generation endpoint/
+	imagesGenerationsAPI = "images/generations"
 
 	streamingRespPrefix = "data: "
 	streamingEndMsg     = "data: [DONE]"
@@ -59,7 +62,10 @@ const (
 )
 
 // compile-time type validation
-var _ fwkrh.Parser = &OpenAIParser{}
+var (
+	_ fwkrh.Parser            = &OpenAIParser{}
+	_ fwkrh.ModelNameRewriter = &OpenAIParser{}
+)
 
 // OpenAIParser implements the fwkrh.Parser interface for OpenAI API
 // https://developers.openai.com/api/reference/overview
@@ -92,6 +98,7 @@ func (p *OpenAIParser) Claims() fwkrh.Claims {
 			conversationsAPI,
 			chatCompletionsAPI + "/render",
 			completionsAPI + "/render",
+			imagesGenerationsAPI,
 		},
 		Protocols: []v1.AppProtocol{v1.AppProtocolH2C, v1.AppProtocolHTTP},
 	}
@@ -118,11 +125,24 @@ func (p *OpenAIParser) ParseRequest(ctx context.Context, body []byte, headers ma
 		return nil, err
 	}
 	extractedBody.Payload = fwkrh.PayloadMap(bodyMap)
+	if model, ok := bodyMap["model"].(string); ok {
+		extractedBody.Model = model
+	}
 	extractedBody.MaxOutputTokens = maxOutputTokensForAPI(apiType, bodyMap)
 	if stream, ok := bodyMap["stream"].(bool); ok && stream {
 		extractedBody.Stream = true
 	}
 	return &fwkrh.ParseResult{Body: extractedBody, SkipResponseProcessing: false}, nil
+}
+
+// RewriteModelName writes the resolved model into the request payload map.
+func (p *OpenAIParser) RewriteModelName(payload fwkrh.MarshalablePayload, model string) (fwkrh.MarshalablePayload, error) {
+	m, ok := payload.(fwkrh.PayloadMap)
+	if !ok {
+		return payload, nil
+	}
+	m["model"] = model
+	return m, nil
 }
 
 // maxOutputTokensForAPI normalizes the per-API output-token cap field into a
@@ -169,7 +189,7 @@ func (p *OpenAIParser) ParseResponse(ctx context.Context, body []byte, headers m
 }
 
 func (p *OpenAIParser) parseStreamResponse(chunk []byte) (*fwkrh.ParsedResponse, error) {
-	usage := extractUsageStreaming(string(chunk))
+	usage := extractUsageStreaming(chunk)
 	return &fwkrh.ParsedResponse{
 		Usage: usage,
 	}, nil
@@ -196,6 +216,9 @@ func determineAPITypeFromPath(path string) string {
 	}
 	if request.MatchPathSuffix(path, "/embeddings") {
 		return embeddingsAPI
+	}
+	if request.MatchPathSuffix(path, "/images/generations") {
+		return imagesGenerationsAPI
 	}
 
 	// Default to completions API for backward compatibility with existing clients and integration tests
@@ -242,6 +265,13 @@ func extractRequestBody(apiType string, rawBody []byte) (*fwkrh.InferenceRequest
 			return &fwkrh.InferenceRequestBody{Embeddings: &embeddings}, nil
 		}
 		return nil, errors.New("invalid embeddings request: must have input field")
+
+	case imagesGenerationsAPI:
+		var images fwkrh.ImagesGenerationsRequest
+		if err := json.Unmarshal(rawBody, &images); err == nil && images.Prompt != "" {
+			return &fwkrh.InferenceRequestBody{Images: &images}, nil
+		}
+		return nil, errors.New("invalid images generations request: must have prompt field")
 	default:
 		return nil, errors.New("unsupported API endpoint")
 	}
@@ -340,8 +370,7 @@ func extractUsage(responseBytes []byte) (*fwkrh.Usage, error) {
 //	data: {"response":{"usage":{"input_tokens":31,..},...},"type":"response.completed"}
 //
 // It extracts usage from events with type="response.completed".
-func extractUsageStreaming(responseText string) *fwkrh.Usage {
-
+func extractUsageStreaming(responseBytes []byte) *fwkrh.Usage {
 	var streamResponse struct {
 		Usage    *fwkrh.Usage `json:"usage"`
 		Response struct {
@@ -350,18 +379,17 @@ func extractUsageStreaming(responseText string) *fwkrh.Usage {
 		Type string `json:"type"`
 	}
 
-	lines := strings.SplitSeq(responseText, "\n")
+	lines := bytes.SplitSeq(responseBytes, []byte("\n"))
 	for line := range lines {
-		content, ok := strings.CutPrefix(line, streamingRespPrefix)
+		content, ok := bytes.CutPrefix(line, []byte(streamingRespPrefix))
 		if !ok {
 			continue
 		}
 		// When the stream is terminated with [DONE] or there's not any usage data, skip the line
-		if content == "[DONE]" || !strings.Contains(content, "usage") {
+		if bytes.Equal(content, []byte("[DONE]")) || !bytes.Contains(content, []byte("usage")) {
 			continue
 		}
-		byteSlice := []byte(content)
-		if err := json.Unmarshal(byteSlice, &streamResponse); err != nil {
+		if err := json.Unmarshal(content, &streamResponse); err != nil {
 			continue
 		}
 		// Standard ChatCompletion / vLLM usage format

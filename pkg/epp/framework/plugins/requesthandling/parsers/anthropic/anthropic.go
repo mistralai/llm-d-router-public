@@ -17,6 +17,7 @@ limitations under the License.
 package anthropic
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -43,7 +44,10 @@ const (
 )
 
 // compile-time type validation
-var _ fwkrh.Parser = &AnthropicParser{}
+var (
+	_ fwkrh.Parser            = &AnthropicParser{}
+	_ fwkrh.ModelNameRewriter = &AnthropicParser{}
+)
 
 type AnthropicParser struct {
 	typedName fwkplugin.TypedName
@@ -112,11 +116,24 @@ func (p *AnthropicParser) ParseRequest(_ context.Context, body []byte, headers m
 		Payload:         fwkrh.PayloadMap(bodyMap),
 		MaxOutputTokens: fwkrh.MaxOutputTokensFromPayload(bodyMap, "max_tokens"),
 	}
+	if model, ok := bodyMap["model"].(string); ok {
+		result.Model = model
+	}
 	if stream, ok := bodyMap["stream"].(bool); ok && stream {
 		result.Stream = true
 	}
 
 	return &fwkrh.ParseResult{Body: result, SkipResponseProcessing: false}, nil
+}
+
+// RewriteModelName writes the resolved model into the request payload map.
+func (p *AnthropicParser) RewriteModelName(payload fwkrh.MarshalablePayload, model string) (fwkrh.MarshalablePayload, error) {
+	m, ok := payload.(fwkrh.PayloadMap)
+	if !ok {
+		return payload, nil
+	}
+	m["model"] = model
+	return m, nil
 }
 
 func (p *AnthropicParser) ParseResponse(_ context.Context, body []byte, headers map[string]string, _ bool) (*fwkrh.ParsedResponse, error) {
@@ -182,19 +199,20 @@ func extractUsage(responseBytes []byte) (*fwkrh.Usage, error) {
 //	event: message_stop
 //	data: {"type":"message_stop"}
 func (p *AnthropicParser) parseStreamResponse(chunk []byte) (*fwkrh.ParsedResponse, error) {
-	usage := extractUsageStreaming(string(chunk))
+	usage := extractUsageStreaming(chunk)
 	return &fwkrh.ParsedResponse{Usage: usage}, nil
 }
 
-func extractUsageStreaming(responseText string) *fwkrh.Usage {
+func extractUsageStreaming(responseBytes []byte) *fwkrh.Usage {
 	var result *fwkrh.Usage
 
-	lines := strings.Split(responseText, "\n")
-	for _, line := range lines {
-		if !strings.HasPrefix(line, streamingRespPrefix) {
+	lines := bytes.SplitSeq(responseBytes, []byte("\n"))
+	for line := range lines {
+		content, ok := bytes.CutPrefix(line, []byte(streamingRespPrefix))
+		// Safe because only message_start/message_delta carry usage, both with a literal "usage" key.
+		if !ok || !bytes.Contains(content, []byte("usage")) {
 			continue
 		}
-		content := strings.TrimPrefix(line, streamingRespPrefix)
 
 		var event struct {
 			Type    string `json:"type"`
@@ -203,7 +221,7 @@ func extractUsageStreaming(responseText string) *fwkrh.Usage {
 			} `json:"message"`
 			Usage map[string]any `json:"usage"`
 		}
-		if err := json.Unmarshal([]byte(content), &event); err != nil {
+		if err := json.Unmarshal(content, &event); err != nil {
 			continue
 		}
 

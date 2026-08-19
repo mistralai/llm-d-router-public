@@ -17,11 +17,21 @@ limitations under the License.
 package server
 
 import (
+	"crypto/tls"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/pflag"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	testPoolName   = "test-pool"
+	testConfigFile = "fake-config.yaml"
 )
 
 // TestEndpointTargetPorts
@@ -89,7 +99,7 @@ func TestEndpointTargetPorts(t *testing.T) {
 			opts.AddFlags(tt.fs)
 
 			argv := make([]string, 0, 4+len(tt.args))
-			argv = append(argv, "--endpoint-selector", "app=vllm", "--config-file", "fake-config.yaml") // avoid an options validation error
+			argv = append(argv, "--endpoint-selector", "app=vllm", "--config-file", testConfigFile) // avoid an options validation error
 			argv = append(argv, tt.args...)
 
 			if err := tt.fs.Parse(argv); err != nil {
@@ -200,7 +210,7 @@ func TestGRPCFlags(t *testing.T) {
 			opts.AddFlags(fs)
 
 			argv := make([]string, 0, 4+len(tt.args))
-			argv = append(argv, "--pool-name", "test-pool", "--config-file", "fake-config.yaml")
+			argv = append(argv, "--pool-name", testPoolName, "--config-file", testConfigFile)
 			argv = append(argv, tt.args...)
 
 			if err := fs.Parse(argv); err != nil {
@@ -234,17 +244,39 @@ func TestGRPCFlags(t *testing.T) {
 
 func TestValidateDirectValues(t *testing.T) {
 	opts := NewOptions()
-	opts.PoolName = "test-pool" // bypass other validations
+	opts.PoolName = testPoolName // bypass other validations
 	opts.GRPCMaxRecvMsgSize = -5
 	if err := opts.Validate(); err == nil {
 		t.Errorf("Expected Validate() to fail for negative GRPCMaxRecvMsgSize, but it succeeded")
 	}
 
 	opts = NewOptions()
-	opts.PoolName = "test-pool"
+	opts.PoolName = testPoolName
 	opts.GRPCMaxSendMsgSize = -5
 	if err := opts.Validate(); err == nil {
 		t.Errorf("Expected Validate() to fail for negative GRPCMaxSendMsgSize, but it succeeded")
+	}
+}
+
+func TestValidateRefreshMetricsIntervalFloor(t *testing.T) {
+	opts := NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.RefreshMetricsInterval = 10 * time.Millisecond
+	if err := opts.Validate(); err != nil {
+		t.Fatalf("Expected Validate() to clamp, not fail: %v", err)
+	}
+	if opts.RefreshMetricsInterval != MinRefreshMetricsInterval {
+		t.Errorf("Expected RefreshMetricsInterval to be clamped to %s, got %s",
+			MinRefreshMetricsInterval, opts.RefreshMetricsInterval)
+	}
+
+	opts = NewOptions()
+	opts.AddFlags(pflag.NewFlagSet("test", pflag.ContinueOnError))
+	opts.PoolName = testPoolName
+	opts.RefreshMetricsInterval = 50 * time.Millisecond
+	if err := opts.Validate(); err != nil {
+		t.Errorf("Expected Validate() to pass for RefreshMetricsInterval of 50ms, got %v", err)
 	}
 }
 
@@ -266,4 +298,218 @@ func TestDrainTimeoutFlag(t *testing.T) {
 	if opts.DrainTimeout != 30*time.Second {
 		t.Errorf("DrainTimeout = %v, want 30s", opts.DrainTimeout)
 	}
+}
+
+func TestValidateConfigFlagsMutuallyExclusive(t *testing.T) {
+	opts := NewOptions()
+	opts.PoolName = "config-flags-pool" // bypass the pool/selector validation
+	opts.ConfigFile = testConfigFile
+	opts.ConfigText = "fake: config"
+
+	err := opts.Validate()
+	if err == nil {
+		t.Fatalf("Expected Validate() to fail when both config flags are set, but it succeeded")
+	}
+	for _, want := range []string{"config-file", "config-text"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Validate() error must reference the %q flag, got: %v", want, err)
+		}
+	}
+}
+
+func TestMetricsMTLSFlags(t *testing.T) {
+	fs := pflag.NewFlagSet("metrics-mtls", pflag.ContinueOnError)
+	opts := NewOptions()
+	opts.AddFlags(fs)
+	require.NoError(t, fs.Parse([]string{
+		"--pool-name", testPoolName, "--config-file", testConfigFile,
+		"--metrics-cert-dir", "/etc/epp-tls",
+		"--metrics-client-ca-file", "/etc/epp-ca/ca.crt",
+	}))
+	require.Equal(t, "/etc/epp-tls", opts.MetricsCertDir)
+	require.Equal(t, "/etc/epp-ca/ca.crt", opts.MetricsClientCAFile)
+}
+
+func TestValidateMetricsMTLS(t *testing.T) {
+	tests := []struct {
+		name         string
+		clientCA     string
+		certDir      string
+		endpointAuth bool
+		wantErr      error
+	}{
+		{name: "neither set"},
+		{name: "endpoint auth only", endpointAuth: true},
+		{name: "mTLS (cert dir + client CA)", clientCA: "ca.crt", certDir: "tls"},
+		{name: "cert dir + endpoint auth", certDir: "tls", endpointAuth: true},
+		{name: "cert dir + client CA + auth", clientCA: "ca.crt", certDir: "tls", endpointAuth: true},
+		{name: "cert dir only, no auth (fail-open)", certDir: "tls", wantErr: errMetricsTLSWithoutAuth},
+		{name: "client CA without cert dir", clientCA: "ca.crt", wantErr: errMetricsClientCARequiresCertDir},
+		{name: "client CA without cert dir, auth on", clientCA: "ca.crt", endpointAuth: true, wantErr: errMetricsClientCARequiresCertDir},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := NewOptions()
+			opts.AddFlags(pflag.NewFlagSet(tc.name, pflag.ContinueOnError))
+			opts.PoolName = testPoolName
+			opts.MetricsClientCAFile = tc.clientCA
+			opts.MetricsCertDir = tc.certDir
+			opts.MetricsEndpointAuth = tc.endpointAuth
+			err := opts.Validate()
+			if tc.wantErr == nil {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestCompleteMetricsCertFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	missing := NewOptions()
+	missing.AddFlags(pflag.NewFlagSet("missing", pflag.ContinueOnError))
+	missing.MetricsCertDir = dir
+	require.ErrorIs(t, missing.Complete(), errMetricsCertUnreadable)
+
+	// tls.crt present but tls.key still missing: partial cert must fail.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "tls.crt"), []byte("x"), 0o600))
+	partial := NewOptions()
+	partial.AddFlags(pflag.NewFlagSet("partial", pflag.ContinueOnError))
+	partial.MetricsCertDir = dir
+	require.ErrorIs(t, partial.Complete(), errMetricsCertUnreadable)
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "tls.key"), []byte("x"), 0o600))
+
+	present := NewOptions()
+	present.AddFlags(pflag.NewFlagSet("present", pflag.ContinueOnError))
+	present.MetricsCertDir = dir
+	require.NoError(t, present.Complete())
+}
+
+func TestTLSMinVersionFlag(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantVersion uint16
+		wantErr     bool
+	}{
+		{
+			name:        "VersionTLS12",
+			args:        []string{"--tls-min-version", "VersionTLS12"},
+			wantVersion: tls.VersionTLS12,
+		},
+		{
+			name:        "VersionTLS13",
+			args:        []string{"--tls-min-version", "VersionTLS13"},
+			wantVersion: tls.VersionTLS13,
+		},
+		{
+			name:        "not set",
+			args:        []string{},
+			wantVersion: 0,
+		},
+		{
+			name:    "invalid version",
+			args:    []string{"--tls-min-version", "TLS1.2"},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := pflag.NewFlagSet(tt.name, pflag.ContinueOnError)
+			opts := NewOptions()
+			opts.AddFlags(fs)
+
+			argv := append([]string{"--pool-name", testPoolName, "--config-file", testConfigFile}, tt.args...)
+			require.NoError(t, fs.Parse(argv))
+
+			err := opts.Complete()
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantVersion, opts.TLSMinVersionValue())
+		})
+	}
+}
+
+func TestTLSCipherSuitesFlag(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantSuites []uint16
+		wantErr    bool
+	}{
+		{
+			name: "single cipher",
+			args: []string{"--tls-cipher-suites", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"},
+			wantSuites: []uint16{
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			},
+		},
+		{
+			name: "multiple ciphers",
+			args: []string{"--tls-cipher-suites", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"},
+			wantSuites: []uint16{
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			},
+		},
+		{
+			name:       "not set",
+			args:       []string{},
+			wantSuites: nil,
+		},
+		{
+			name:    "unknown cipher",
+			args:    []string{"--tls-cipher-suites", "FAKE_CIPHER_SUITE"},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := pflag.NewFlagSet(tt.name, pflag.ContinueOnError)
+			opts := NewOptions()
+			opts.AddFlags(fs)
+
+			argv := append([]string{"--pool-name", testPoolName, "--config-file", testConfigFile}, tt.args...)
+			require.NoError(t, fs.Parse(argv))
+
+			err := opts.Complete()
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantSuites, opts.TLSCipherSuiteValues())
+		})
+	}
+}
+
+func TestParseTLSVersion(t *testing.T) {
+	for name, want := range tlsVersions {
+		got, err := parseTLSVersion(name)
+		require.NoError(t, err, name)
+		require.Equal(t, want, got, name)
+	}
+	_, err := parseTLSVersion("invalid")
+	require.Error(t, err)
+}
+
+func TestParseCipherSuites(t *testing.T) {
+	ids, err := parseCipherSuites([]string{
+		"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint16{
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	}, ids)
+
+	_, err = parseCipherSuites([]string{"BOGUS"})
+	require.Error(t, err)
 }

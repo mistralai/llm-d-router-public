@@ -50,7 +50,7 @@ func PrepareForTestStreamingServer(t *testing.T, objectives []*v1alpha2.Inferenc
 	ctx, cancel := context.WithCancel(context.Background())
 
 	epf := datalayer.NewTestRuntime(t, time.Second)
-	ds := datastore.NewDatastore(ctx, epf, 0)
+	ds := datastore.NewDatastore(ctx, epf)
 
 	initObjs := make([]client.Object, 0, len(objectives)+len(pods))
 	for _, objective := range objectives {
@@ -59,7 +59,9 @@ func PrepareForTestStreamingServer(t *testing.T, objectives []*v1alpha2.Inferenc
 	}
 	for _, pod := range pods {
 		initObjs = append(initObjs, pod)
-		ds.PodUpdateOrAddIfNotExist(ctx, pod)
+		if err := ds.PodUpdateOrAddIfNotExist(ctx, pod); err != nil {
+			t.Fatalf("failed to add pod %s to datastore: %v", pod.Name, err)
+		}
 	}
 
 	scheme := runtime.NewScheme()

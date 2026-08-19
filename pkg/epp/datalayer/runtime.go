@@ -35,6 +35,7 @@ import (
 var (
 	ErrSourceTypeCollision    = errors.New("source type registered across variants")
 	ErrDuplicateExtractorType = errors.New("duplicate extractor type configured for the same source")
+	ErrNoDefaultProducer      = errors.New("no default producer found for missing data key")
 )
 
 type sourceVariant string
@@ -47,12 +48,16 @@ const (
 
 // Runtime manages data sources, extractors, their mapping, and endpoint lifecycle.
 type Runtime struct {
-	pollingInterval time.Duration // used for polling sources
+	pollingInterval time.Duration
 
 	dispatchers  *pollingDispatchers
 	notification *notificationManager
 	endpoint     *endpointManager
 	extractors   *extractorMap
+	syncer       fwkdl.CrossReplicaSyncer
+	syncInterval time.Duration
+
+	crossReplicaPub *crossReplicaPublisher
 
 	pendingMu            sync.Mutex
 	pendingRegistrations []fwkdl.PendingRegistration // code-registered (source-type, extractor) pairs, resolved by Configure()
@@ -66,10 +71,10 @@ const (
 )
 
 // NewRuntime creates a new Runtime with the given polling interval.
-// If duration is <= 0, uses the defaultRefreshInterval.
+// If duration is <= defaultRefreshInterval, uses defaultRefreshInterval.
 func NewRuntime(pollingInterval time.Duration) *Runtime {
 	interval := defaultRefreshInterval
-	if pollingInterval > 0 {
+	if pollingInterval > defaultRefreshInterval {
 		interval = pollingInterval
 	}
 	return &Runtime{
@@ -95,8 +100,25 @@ func (r *Runtime) Configure(cfg *Config, logger logr.Logger) error {
 	numSources := 0
 	if cfg != nil {
 		numSources = len(cfg.Sources)
+		r.syncer = cfg.Syncer
+		r.syncInterval = cfg.SyncInterval
 	}
 	logger.Info("Configuring datalayer runtime", "numSources", numSources)
+
+	// Lower the base tick to the smallest source interval so that no
+	// source is forced to run slower than its configured cadence.
+	if cfg != nil {
+		for _, srcCfg := range cfg.Sources {
+			if disp, ok := srcCfg.Plugin.(fwkdl.PollingDispatcher); ok {
+				if iv := disp.Interval(); iv > 0 && iv < r.pollingInterval {
+					r.pollingInterval = iv
+				}
+			}
+		}
+		if r.pollingInterval < defaultRefreshInterval {
+			r.pollingInterval = defaultRefreshInterval
+		}
+	}
 
 	// boundTypes tracks (srcName, extractor type) pairs that already have a bound
 	// extractor. Pending registrations consult this so code-registered defaults
@@ -118,6 +140,21 @@ func (r *Runtime) Configure(cfg *Config, logger logr.Logger) error {
 			logger.V(logging.DEFAULT).Info("Processing source", "source", srcName, "numExtractors", len(srcCfg.Extractors))
 			if err := r.validateSourceExtractors(src, srcCfg.Extractors); err != nil {
 				return err
+			}
+
+			if disp, ok := src.(fwkdl.PollingDispatcher); ok {
+				period, err := periodTicks(disp.Interval(), r.pollingInterval)
+				if err != nil {
+					return fmt.Errorf("source %s: %w", srcName, err)
+				}
+				if requested := disp.Interval(); requested > 0 {
+					effective := time.Duration(period) * r.pollingInterval
+					if effective != requested {
+						logger.Info("source interval rounded to nearest base-tick multiple",
+							"source", srcName, "requested", requested, "effective", effective)
+					}
+				}
+				src = newIntervalDispatcher(disp, period)
 			}
 
 			if err := r.registerSource(src, gvk); err != nil {
@@ -203,6 +240,13 @@ func (r *Runtime) Configure(cfg *Config, logger logr.Logger) error {
 		markBound(srcName, extType)
 	}
 
+	// Build the cross-replica publisher but do NOT register it as a polling
+	// dispatcher. The publisher runs on its own ticker per endpoint (started
+	// in NewEndpoint) so its cadence is independent of the datalayer base
+	// tick. This avoids the sync interval being silently clamped to the
+	// (much slower) metric-scrape interval.
+	r.crossReplicaPub = newCrossReplicaPublisher(r.syncer, r.extractors, r.syncInterval)
+
 	logger.Info("Datalayer runtime configured",
 		"pollers", r.dispatchers.Count(),
 		"notifiers", r.notification.Count(),
@@ -225,7 +269,6 @@ func (r *Runtime) Register(reg fwkdl.PendingRegistration) error {
 // registerSource dispatches src to the matching variant manager. g enforces
 // per-Configure-call GVK uniqueness for NotificationSources. src may be a
 // PollingDispatcher (not a DataSource), so the parameter is plugin.Plugin.
-//
 // A source that implements more than one variant interface is rejected: type-
 // switch order would otherwise silently bind it to the first match, hiding the
 // ambiguity until a notification or endpoint event mismatched its handler.
@@ -369,12 +412,15 @@ func (r *Runtime) Start(ctx context.Context, mgr ctrl.Manager) error {
 // NewEndpoint sets up data polling on the provided endpoint.
 func (r *Runtime) NewEndpoint(ctx context.Context, endpointMetadata *fwkdl.EndpointMetadata) fwkdl.Endpoint {
 	logger, _ := logr.FromContext(ctx)
-	logger = logger.WithValues("endpoint", endpointMetadata.GetNamespacedName())
+	logger = logger.WithValues("endpoint", endpointMetadata.GetID())
 
 	endpoint := fwkdl.NewEndpoint(endpointMetadata, nil)
 
 	dispatchers := make([]fwkdl.PollingDispatcher, 0, r.dispatchers.Count())
 	for _, d := range r.dispatchers.Dispatchers() {
+		if id, ok := d.(*intervalDispatcher); ok {
+			d = newIntervalDispatcher(id.PollingDispatcher, id.period)
+		}
 		dispatchers = append(dispatchers, d)
 	}
 	if len(dispatchers) == 0 {
@@ -385,7 +431,7 @@ func (r *Runtime) NewEndpoint(ctx context.Context, endpointMetadata *fwkdl.Endpo
 
 	collector := NewCollector()
 
-	key := endpointMetadata.GetNamespacedName()
+	key := endpointMetadata.GetID()
 	if !r.collectors.Register(key, collector) {
 		logger.V(logging.DEFAULT).Info("collector already running for endpoint", "endpoint", key)
 		return nil
@@ -399,14 +445,37 @@ func (r *Runtime) NewEndpoint(ctx context.Context, endpointMetadata *fwkdl.Endpo
 	}
 
 	r.dispatchEndpointEvent(ctx, logger, fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: endpoint})
+
+	// Start an independent ticker for cross-replica sync, decoupled from the
+	// collector's base tick so the configured sync interval is honoured even
+	// when the metric-scrape interval is much longer.
+	if r.crossReplicaPub != nil {
+		go r.runCrossReplicaSync(ctx, endpoint)
+	}
+
 	return endpoint
+}
+
+// runCrossReplicaSync publishes local per-endpoint state to the syncer on
+// its own ticker. Runs for the lifetime of the endpoint (cancelled via ctx).
+func (r *Runtime) runCrossReplicaSync(ctx context.Context, ep fwkdl.Endpoint) {
+	ticker := time.NewTicker(r.crossReplicaPub.Interval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = r.crossReplicaPub.Dispatch(ctx, ep)
+		}
+	}
 }
 
 // ReleaseEndpoint terminates polling for data on the given endpoint.
 func (r *Runtime) ReleaseEndpoint(ep fwkdl.Endpoint) {
 	r.dispatchEndpointEvent(context.Background(), r.logger, fwkdl.EndpointEvent{Type: fwkdl.EventDelete, Endpoint: ep})
 
-	key := ep.GetMetadata().GetNamespacedName()
+	key := ep.GetMetadata().GetID()
 	if collector, ok := r.collectors.Remove(key); ok {
 		collector.Stop()
 	}
@@ -415,7 +484,7 @@ func (r *Runtime) ReleaseEndpoint(ep fwkdl.Endpoint) {
 // UpdateEndpoint dispatches an add/update lifecycle event for an existing endpoint.
 func (r *Runtime) UpdateEndpoint(ctx context.Context, ep fwkdl.Endpoint) {
 	logger, _ := logr.FromContext(ctx)
-	logger = logger.WithValues("endpoint", ep.GetMetadata().GetNamespacedName())
+	logger = logger.WithValues("endpoint", ep.GetMetadata().GetID())
 	r.dispatchEndpointEvent(ctx, logger, fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: ep})
 }
 
@@ -443,6 +512,30 @@ func (r *Runtime) dispatchEndpointEvent(ctx context.Context, logger logr.Logger,
 			if epExt, ok := ext.(fwkdl.EndpointExtractor); ok {
 				if err := epExt.Extract(ctx, *processed); err != nil {
 					logger.Error(err, "endpoint extractor failed", "extractor", ext.TypedName())
+				}
+				if contributor, ok := ext.(fwkdl.CrossReplicaContributor); ok && r.syncer != nil {
+					spec := contributor.CrossReplicaState()
+					endpointID := processed.Endpoint.GetMetadata().GetNamespacedName().String()
+					if spec.SyncDisabled {
+						continue
+					}
+					switch processed.Type {
+					case fwkdl.EventAddOrUpdate:
+						processed.Endpoint.GetAttributes().Put(spec.AttributeKey, &fwkdl.DynamicAttribute{
+							Get: func() fwkdl.Cloneable {
+								if val, ok, _ := r.syncer.Get(ctx, spec.StateKey, endpointID, spec.Aggregate); ok {
+									if c, ok := val.(fwkdl.Cloneable); ok {
+										return c
+									}
+								}
+								return nil
+							},
+						})
+					case fwkdl.EventDelete:
+						if err := r.syncer.Delete(ctx, spec.StateKey, endpointID); err != nil {
+							logger.Error(err, "failed to delete shared state", "extractor", ext.TypedName(), "key", spec.StateKey)
+						}
+					}
 				}
 			}
 		}

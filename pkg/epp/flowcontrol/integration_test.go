@@ -72,6 +72,10 @@ func TestConcurrentSaturationReads(t *testing.T) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 
+	// Track PreRequest errors via atomic counter — require/assert must not be
+	// called from non-test goroutines.
+	var preRequestErrs atomic.Int32
+
 	// Writer: track and release 200 requests rapidly.
 	wg.Add(1)
 	go func() {
@@ -90,7 +94,9 @@ func TestConcurrentSaturationReads(t *testing.T) {
 					"decode": {TargetEndpoints: []fwksched.Endpoint{schedEp}},
 				},
 			}
-			pd.producer.PreRequest(ctx, req, result)
+			if err := pd.producer.PreRequest(ctx, req, result); err != nil {
+				preRequestErrs.Add(1)
+			}
 			req.SchedulingResult = result
 			pd.producer.ResponseBody(ctx, req,
 				&requestcontrol.Response{EndOfStream: true}, pd.epMeta)
@@ -116,6 +122,8 @@ func TestConcurrentSaturationReads(t *testing.T) {
 	close(start)
 	wg.Wait()
 
+	require.Equal(t, int32(0), preRequestErrs.Load(),
+		"PreRequest returned errors during concurrent tracking")
 	require.Equal(t, int32(0), saturationViolations.Load(),
 		"saturation was outside [0.0, 1.0] during concurrent reads")
 	require.InDelta(t, 0.0, pd.detector.Saturation(ctx, endpoints), 1e-9,
@@ -163,7 +171,7 @@ func TestSaturationFullLoop(t *testing.T) {
 				"decode": {TargetEndpoints: []fwksched.Endpoint{schedEp}},
 			},
 		}
-		pd.producer.PreRequest(h.ctx, req, result)
+		require.NoError(t, pd.producer.PreRequest(h.ctx, req, result))
 	}
 
 	// Verify the detector sees saturation via the real Locate->Saturation path.
@@ -452,7 +460,7 @@ func TestUsageLimitThresholdGatesDispatch(t *testing.T) {
 				"decode": {TargetEndpoints: []fwksched.Endpoint{schedEp}},
 			},
 		}
-		pd.producer.PreRequest(h.ctx, req, result)
+		require.NoError(t, pd.producer.PreRequest(h.ctx, req, result))
 	}
 
 	// saturation=0.5, threshold=0.5: 0.5 >= 0.5 -> HoL blocking should trigger.
@@ -497,37 +505,28 @@ func TestGlobalAndBandCapacityInteraction(t *testing.T) {
 
 	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
 
-	results := make(chan dispatchResult, 5)
-	for i := 0; i < 5; i++ {
-		id := fmt.Sprintf("req-%d", i)
-		go func() {
-			reqCtx, reqCancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
-			defer reqCancel()
-			req := &testRequest{id: id, key: key, byteSize: 100, ttl: 500 * time.Millisecond}
-			outcome, err := h.fc.EnqueueAndWait(reqCtx, req)
-			results <- dispatchResult{id: id, outcome: outcome, err: err}
-		}()
-		time.Sleep(5 * time.Millisecond)
+	const count = 3
+	release := h.fillQueue(t, key, count, 100, func() bool {
+		return h.reg.Stats().TotalLen == count
+	})
+
+	// The global limit (3) is exhausted while the band limit (10) still has room, so a further
+	// request must be rejected for capacity.
+	overflow := make(chan dispatchResult, 1)
+	go func() {
+		req := &testRequest{id: "overflow-req", key: key, byteSize: 100, ttl: 5 * time.Minute}
+		outcome, err := h.fc.EnqueueAndWait(h.ctx, req)
+		overflow <- dispatchResult{id: "overflow-req", outcome: outcome, err: err}
+	}()
+	select {
+	case r := <-overflow:
+		require.Equal(t, fcTypes.QueueOutcomeRejectedCapacity, r.outcome,
+			"global MaxRequests=3 should reject the overflow even though the band allows 10")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for overflow rejection")
 	}
 
-	var admitted, rejected int
-	for i := 0; i < 5; i++ {
-		select {
-		case r := <-results:
-			if r.outcome == fcTypes.QueueOutcomeRejectedCapacity {
-				rejected++
-			} else {
-				admitted++
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for result %d", i)
-		}
-	}
-
-	require.LessOrEqual(t, admitted, 3,
-		"global MaxRequests=3 should cap admissions even though band allows 10")
-	require.GreaterOrEqual(t, rejected, 2,
-		"at least 2 requests should be rejected by global limit")
+	release()
 }
 
 // TestByteCapacityEnforcement verifies that the per-band byte capacity limit
@@ -545,34 +544,27 @@ func TestByteCapacityEnforcement(t *testing.T) {
 
 	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
 
-	const numRequests = 4
-	results := make(chan dispatchResult, numRequests)
-	for i := 0; i < numRequests; i++ {
-		id := fmt.Sprintf("byte-req-%d", i)
-		go func() {
-			reqCtx, reqCancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
-			defer reqCancel()
-			req := &testRequest{id: id, key: key, byteSize: 300, ttl: 500 * time.Millisecond}
-			outcome, err := h.fc.EnqueueAndWait(reqCtx, req)
-			results <- dispatchResult{id: id, outcome: outcome, err: err}
-		}()
-		time.Sleep(5 * time.Millisecond)
+	// 3 requests of 300 bytes each (900 total) fit within the 1000-byte budget.
+	release := h.fillQueue(t, key, 3, 300, func() bool {
+		return h.reg.Stats().TotalByteSize == 900
+	})
+
+	// A 4th 300-byte request would bring the band to 1200 bytes, so it must be rejected.
+	overflow := make(chan dispatchResult, 1)
+	go func() {
+		req := &testRequest{id: "byte-req-overflow", key: key, byteSize: 300, ttl: 5 * time.Minute}
+		outcome, err := h.fc.EnqueueAndWait(h.ctx, req)
+		overflow <- dispatchResult{id: "byte-req-overflow", outcome: outcome, err: err}
+	}()
+	select {
+	case r := <-overflow:
+		require.Equal(t, fcTypes.QueueOutcomeRejectedCapacity, r.outcome,
+			"request exceeding the band byte budget should be rejected")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for byte-capacity rejection")
 	}
 
-	var rejected int
-	for i := 0; i < numRequests; i++ {
-		select {
-		case r := <-results:
-			if r.outcome == fcTypes.QueueOutcomeRejectedCapacity {
-				rejected++
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for result %d", i)
-		}
-	}
-
-	require.GreaterOrEqual(t, rejected, 1,
-		"at least 1 request should be rejected when 4x300 bytes exceeds band budget of 1000")
+	release()
 }
 
 // TestEmptyPoolRejectsAsNoEndpoints verifies the scale-from-zero path: when the candidate pool has no
@@ -591,41 +583,30 @@ func TestEmptyPoolRejectsAsNoEndpoints(t *testing.T) {
 
 	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
 
-	const numRequests = 4
-	results := make(chan dispatchResult, numRequests)
-	for i := 0; i < numRequests; i++ {
-		id := fmt.Sprintf("noep-req-%d", i)
-		go func() {
-			reqCtx, reqCancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
-			defer reqCancel()
-			req := &testRequest{id: id, key: key, byteSize: 300, ttl: 500 * time.Millisecond}
-			outcome, err := h.fc.EnqueueAndWait(reqCtx, req)
-			results <- dispatchResult{id: id, outcome: outcome, err: err}
-		}()
-		time.Sleep(5 * time.Millisecond)
+	// 3 requests of 300 bytes each (900 total) fit within the 1000-byte budget.
+	release := h.fillQueue(t, key, 3, 300, func() bool {
+		return h.reg.Stats().TotalByteSize == 900
+	})
+
+	// The 4th request exceeds the byte budget, but because the pool is empty the rejection must
+	// surface as RejectedNoEndpoints (503), not RejectedCapacity (429).
+	overflow := make(chan dispatchResult, 1)
+	go func() {
+		req := &testRequest{id: "noep-req-overflow", key: key, byteSize: 300, ttl: 5 * time.Minute}
+		outcome, err := h.fc.EnqueueAndWait(h.ctx, req)
+		overflow <- dispatchResult{id: "noep-req-overflow", outcome: outcome, err: err}
+	}()
+	select {
+	case r := <-overflow:
+		require.Equal(t, fcTypes.QueueOutcomeRejectedNoEndpoints, r.outcome,
+			"with an empty pool, a full-queue rejection should be RejectedNoEndpoints")
+		require.ErrorIs(t, r.err, fcTypes.ErrNoEndpoints,
+			"no-endpoints rejection should wrap ErrNoEndpoints")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for no-endpoints rejection")
 	}
 
-	var noEndpoints, capacity int
-	for i := 0; i < numRequests; i++ {
-		select {
-		case r := <-results:
-			switch r.outcome {
-			case fcTypes.QueueOutcomeRejectedNoEndpoints:
-				noEndpoints++
-				require.ErrorIs(t, r.err, fcTypes.ErrNoEndpoints,
-					"no-endpoints rejection should wrap ErrNoEndpoints")
-			case fcTypes.QueueOutcomeRejectedCapacity:
-				capacity++
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for result %d", i)
-		}
-	}
-
-	require.GreaterOrEqual(t, noEndpoints, 1,
-		"with an empty pool, a full-queue rejection should be RejectedNoEndpoints")
-	require.Zero(t, capacity,
-		"with an empty pool, no rejection should be classified as RejectedCapacity")
+	release()
 }
 
 // ============================================================================
@@ -653,9 +634,9 @@ func TestEvictionPipeline(t *testing.T) {
 	)
 
 	epMeta := &datalayer.EndpointMetadata{
-		NamespacedName: types.NamespacedName{Name: "pod-1", Namespace: "default"},
-		Address:        "10.0.0.1",
-		Port:           "8000",
+		ID:      types.NamespacedName{Name: "pod-1", Namespace: "default"},
+		Address: "10.0.0.1",
+		Port:    "8000",
 	}
 	schedEndpoint := fwksched.NewEndpoint(epMeta, datalayer.NewMetrics(), nil)
 	makeResult := func() *fwksched.SchedulingResult {
@@ -683,8 +664,8 @@ func TestEvictionPipeline(t *testing.T) {
 	reqCtx, reqCancel := context.WithCancel(ctx)
 	defer reqCancel()
 
-	requestEvictor.PreRequest(reqCtx, sheddableReq, makeResult())
-	requestEvictor.PreRequest(reqCtx, protectedReq, makeResult())
+	require.NoError(t, requestEvictor.PreRequest(reqCtx, sheddableReq, makeResult()))
+	require.NoError(t, requestEvictor.PreRequest(reqCtx, protectedReq, makeResult()))
 
 	inFlight, evictable := requestEvictor.Stats()
 	require.Equal(t, 2, inFlight, "both requests should be tracked in-flight")
@@ -695,7 +676,7 @@ func TestEvictionPipeline(t *testing.T) {
 	sheddableCh := reg.Get("shed-1")
 	require.NotNil(t, sheddableCh, "sheddable request should have an eviction channel")
 
-	evictedIDs, err := requestEvictor.EvictN(ctx, 1)
+	evictedIDs, err := requestEvictor.EvictN(ctx, 1, 0)
 	require.NoError(t, err)
 	require.Equal(t, []string{"shed-1"}, evictedIDs)
 
@@ -735,7 +716,9 @@ func TestTTLExpiryEvictsQueuedRequest(t *testing.T) {
 	t.Parallel()
 
 	detector := newBlockedDetector()
-	h := newHarness(t, harnessOpts{detector: detector})
+	// The pool must be non-empty for this to be the saturation regime: with no endpoints the request would be waiting
+	// for one to appear, which is the no-endpoint budget's case, not this one.
+	h := newHarness(t, harnessOpts{detector: detector, endpointCandidates: nonEmptyCandidates()})
 
 	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
 
@@ -809,6 +792,11 @@ func TestConcurrentEnqueueDuringShutdown(t *testing.T) {
 
 	h := newHarness(t, harnessOpts{
 		detector: detector,
+		controllerCfg: &controller.Config{
+			DefaultRequestTTL:        0,
+			ExpiryCleanupInterval:    10 * time.Millisecond,
+			EnqueueChannelBufferSize: 100,
+		},
 	})
 
 	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
@@ -818,8 +806,8 @@ func TestConcurrentEnqueueDuringShutdown(t *testing.T) {
 	for i := 0; i < numRequests; i++ {
 		id := fmt.Sprintf("req-%d", i)
 		go func() {
-			req := &testRequest{id: id, key: key, byteSize: 100, ttl: 5 * time.Minute}
-			outcome, err := h.fc.EnqueueAndWait(h.ctx, req)
+			req := &testRequest{id: id, key: key, byteSize: 100}
+			outcome, err := h.fc.EnqueueAndWait(context.Background(), req)
 			results <- dispatchResult{id: id, outcome: outcome, err: err}
 		}()
 	}
@@ -836,6 +824,8 @@ func TestConcurrentEnqueueDuringShutdown(t *testing.T) {
 				"no request should dispatch (detector is blocked and controller is shutting down)")
 			require.Error(t, r.err,
 				"every request should receive an error during shutdown")
+			require.ErrorIs(t, r.err, fcTypes.ErrFlowControllerNotRunning,
+				"every request should report the shutdown cause")
 		case <-time.After(5 * time.Second):
 			t.Fatalf("request %d hung during concurrent shutdown", i)
 		}
@@ -900,10 +890,9 @@ func TestGracefulShutdownDrainsQueuedRequests(t *testing.T) {
 // Production Edge Cases
 // ============================================================================
 
-// TestZombieCapacityStarvation verifies that TTL-expired items still in the
-// queue (zombies) consume capacity until the cleanup sweep runs. If the sweep
-// interval is long, new requests are falsely rejected because capacity is held
-// by dead items.
+// TestZombieCapacityStarvation verifies that finalized items still in the queue (zombies) consume capacity until the
+// cleanup sweep runs. If the sweep interval is long, new requests are falsely rejected because capacity is held by dead
+// items.
 func TestZombieCapacityStarvation(t *testing.T) {
 	t.Parallel()
 
@@ -914,7 +903,11 @@ func TestZombieCapacityStarvation(t *testing.T) {
 		bandMaxRequests:    3,
 		endpointCandidates: nonEmptyCandidates(),
 		controllerCfg: &controller.Config{
-			DefaultRequestTTL:        50 * time.Millisecond,
+			// The sweep finalizes and removes an expired item in the same pass, so queue-wait expiry cannot strand a
+			// zombie. A caller deadline can: it finalizes the item where it sits and leaves the sweep to reclaim it.
+			// The budgets therefore sit beyond the test's horizon and the callers give up instead.
+			DefaultRequestTTL:        1 * time.Minute,
+			NoEndpointRequestTTL:     1 * time.Minute,
 			ExpiryCleanupInterval:    10 * time.Second,
 			EnqueueChannelBufferSize: 100,
 		},
@@ -922,25 +915,29 @@ func TestZombieCapacityStarvation(t *testing.T) {
 
 	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
 
-	// Fill capacity with 3 requests that will expire via TTL.
+	// Fill capacity with 3 requests whose callers give up while they are queued.
 	expired := make(chan dispatchResult, 3)
 	for i := 0; i < 3; i++ {
 		id := fmt.Sprintf("zombie-%d", i)
 		go func() {
-			req := &testRequest{id: id, key: key, byteSize: 100, ttl: 50 * time.Millisecond}
-			outcome, err := h.fc.EnqueueAndWait(h.ctx, req)
+			reqCtx, reqCancel := context.WithTimeout(h.ctx, 50*time.Millisecond)
+			defer reqCancel()
+			req := &testRequest{id: id, key: key, byteSize: 100}
+			outcome, err := h.fc.EnqueueAndWait(reqCtx, req)
 			expired <- dispatchResult{id: id, outcome: outcome, err: err}
 		}()
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Wait for all to expire.
+	// Wait for all to be finalized. Each must be evicted rather than rejected: only an item that reached a queue holds
+	// the capacity this test goes on to observe.
 	for i := 0; i < 3; i++ {
 		select {
 		case r := <-expired:
+			require.ErrorIs(t, r.err, fcTypes.ErrEvicted, "zombie must have been queued before it was finalized")
 			require.ErrorIs(t, r.err, fcTypes.ErrTTLExpired)
 		case <-time.After(5 * time.Second):
-			t.Fatalf("zombie %d did not expire", i)
+			t.Fatalf("zombie %d was not finalized", i)
 		}
 	}
 
@@ -993,7 +990,7 @@ func TestEndpointReregistrationSaturationAccuracy(t *testing.T) {
 	detector := detectorPlugin.(flowcontrol.SaturationDetector)
 
 	epMeta := &datalayer.EndpointMetadata{
-		NamespacedName: types.NamespacedName{Name: "pod-1", Namespace: "default"},
+		ID: types.NamespacedName{Name: "pod-1", Namespace: "default"},
 	}
 	ep := datalayer.NewEndpoint(epMeta, datalayer.NewMetrics())
 	require.NoError(t, producer.Extract(ctx, datalayer.EndpointEvent{
@@ -1013,7 +1010,7 @@ func TestEndpointReregistrationSaturationAccuracy(t *testing.T) {
 			"decode": {TargetEndpoints: []fwksched.Endpoint{schedEp}},
 		},
 	}
-	producer.PreRequest(ctx, oldReq, oldResult)
+	require.NoError(t, producer.PreRequest(ctx, oldReq, oldResult))
 
 	sat := detector.Saturation(ctx, []datalayer.Endpoint{ep})
 	require.Greater(t, sat, 0.0, "saturation should be nonzero with in-flight request")
@@ -1048,7 +1045,7 @@ func TestEndpointReregistrationSaturationAccuracy(t *testing.T) {
 		"old request completion should not affect re-registered endpoint's tracker")
 
 	// Verify the deleted endpoint's tracker is clean.
-	eid := epMeta.NamespacedName.String()
+	eid := epMeta.ID.String()
 	require.Equal(t, int64(0), producer.GetRequests(eid),
 		"deleted endpoint tracker should report 0 requests")
 
@@ -1069,7 +1066,7 @@ func TestEndpointReregistrationSaturationAccuracy(t *testing.T) {
 			"decode": {TargetEndpoints: []fwksched.Endpoint{newSchedEp}},
 		},
 	}
-	producer.PreRequest(ctx, newReq, newResult)
+	require.NoError(t, producer.PreRequest(ctx, newReq, newResult))
 	require.Equal(t, int64(1), producer.GetRequests(eid),
 		"new request on re-registered endpoint should be tracked")
 
@@ -1105,7 +1102,7 @@ func TestEndpointIdentityCollisionDuringPodReplacement(t *testing.T) {
 	detector := detectorPlugin.(flowcontrol.SaturationDetector)
 
 	epMeta := &datalayer.EndpointMetadata{
-		NamespacedName: types.NamespacedName{Name: "pod-1", Namespace: "default"},
+		ID: types.NamespacedName{Name: "pod-1", Namespace: "default"},
 	}
 
 	oldEp := datalayer.NewEndpoint(epMeta, datalayer.NewMetrics())
@@ -1130,7 +1127,7 @@ func TestEndpointIdentityCollisionDuringPodReplacement(t *testing.T) {
 			"decode": {TargetEndpoints: []fwksched.Endpoint{schedEp}},
 		},
 	}
-	producer.PreRequest(ctx, req, result)
+	require.NoError(t, producer.PreRequest(ctx, req, result))
 
 	require.Greater(t, detector.Saturation(ctx, []datalayer.Endpoint{newEp}), 0.0,
 		"new endpoint should show in-flight load before stale delete")
@@ -1149,12 +1146,37 @@ func TestEndpointIdentityCollisionDuringPodReplacement(t *testing.T) {
 // Metrics Emission Tests
 // ============================================================================
 
-// TestFlowControlMetricsEmitted verifies that EnqueueAndWait emits queue_size
-// metrics. A blocked request holds the gauge > 0 while queued; after TTL
-// expiry the gauge returns to 0.
-func TestFlowControlMetricsEmitted(t *testing.T) {
-	t.Parallel()
+// queueSizeGaugeSum returns the sum of the llm_d_epp_flow_control_queue_size gauge across the
+// series labeled with the given fairness ID, or 0 if no such series exists yet.
+func queueSizeGaugeSum(t *testing.T, fairnessID string) float64 {
+	t.Helper()
+	families, err := ctrlmetrics.Registry.Gather()
+	require.NoError(t, err)
+	var sum float64
+	for _, f := range families {
+		if f.GetName() != "llm_d_epp_flow_control_queue_size" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "fairness_id" && lp.GetValue() == fairnessID {
+					sum += m.GetGauge().GetValue()
+				}
+			}
+		}
+	}
+	return sum
+}
 
+// TestFlowControlMetricsEmitted verifies that EnqueueAndWait maintains the queue_size gauge: a
+// blocked request holds the gauge > 0 while queued, and the gauge returns to 0 once the request
+// finalizes.
+//
+// This test intentionally does NOT run in parallel: running in the sequential phase guarantees
+// its fairness ID is admitted under the fairness-ID cardinality cap (the parallel stress tests
+// burn enough distinct flow IDs to exhaust it), which keeps the label-filtered gauge reads
+// deterministic.
+func TestFlowControlMetricsEmitted(t *testing.T) {
 	eppmetrics.Register()
 
 	detector := newBlockedDetector()
@@ -1164,37 +1186,38 @@ func TestFlowControlMetricsEmitted(t *testing.T) {
 
 	results := make(chan dispatchResult, 1)
 	go func() {
-		req := &testRequest{id: "metrics-req", key: key, byteSize: 512, ttl: 200 * time.Millisecond}
+		req := &testRequest{id: "metrics-req", key: key, byteSize: 512, ttl: 5 * time.Minute}
 		outcome, err := h.fc.EnqueueAndWait(h.ctx, req)
 		results <- dispatchResult{outcome: outcome, err: err}
 	}()
 
-	// While the request is queued (blocked detector), the gauge should be > 0.
-	time.Sleep(50 * time.Millisecond)
+	// Wait for queue admission rather than polling the gauge: the gauge increments before the
+	// item is committed to a queue, and unblocking the gated detector on that earlier signal
+	// would let an empty dispatch cycle consume its single slot (Saturation() charges inFlight
+	// even when nothing dispatches), leaving the request queued forever.
+	require.Eventually(t, func() bool {
+		return h.reg.Stats().TotalLen == 1
+	}, time.Second, time.Millisecond, "request should be queued before the gauge is read")
 
-	families, gatherErr := ctrlmetrics.Registry.Gather()
-	require.NoError(t, gatherErr)
-
-	var queueSizeWhileQueued float64
-	var foundQueueSize bool
-	for _, f := range families {
-		if f.GetName() == "llm_d_epp_flow_control_queue_size" {
-			foundQueueSize = true
-			for _, m := range f.GetMetric() {
-				queueSizeWhileQueued += m.GetGauge().GetValue()
-			}
-		}
-	}
-	require.True(t, foundQueueSize,
-		"llm_d_epp_flow_control_queue_size metric should exist")
-	require.Greater(t, queueSizeWhileQueued, 0.0,
+	// The increment happens before queue admission, so the gauge is already > 0 here.
+	require.Greater(t, queueSizeGaugeSum(t, key.ID), 0.0,
 		"queue_size should be > 0 while a request is actively queued")
 
+	// Unblock the detector so the request finalizes deterministically via dispatch.
+	detector.Unblock(1)
+
 	select {
-	case <-results:
+	case r := <-results:
+		require.NoError(t, r.err)
+		require.Equal(t, fcTypes.QueueOutcomeDispatched, r.outcome)
 	case <-time.After(5 * time.Second):
-		t.Fatal("request did not expire")
+		t.Fatal("request did not dispatch after detector was unblocked")
 	}
+
+	// The gauge decrement runs before EnqueueAndWait returns, so once the result is observed the
+	// gauge is already back at 0 -- no polling needed.
+	require.Zero(t, queueSizeGaugeSum(t, key.ID),
+		"queue_size should return to 0 after the request finalizes")
 }
 
 // ============================================================================
@@ -1387,5 +1410,158 @@ func TestEndpointChurnUnderLoad(t *testing.T) {
 			"request should dispatch after endpoints are restored")
 	case <-time.After(3 * time.Second):
 		t.Fatal("request did not dispatch after endpoint restoration")
+	}
+}
+
+// TestNoEndpointBudgetShedsAsUnavailability verifies that a request that exhausts its queue-wait budget against an
+// empty pool is shed as genuine unavailability (EvictedNoEndpoints, mapped to 503) rather than as backpressure,
+// independent of the saturation budget.
+func TestNoEndpointBudgetShedsAsUnavailability(t *testing.T) {
+	t.Parallel()
+
+	// Pool intentionally empty (no endpointCandidates set): the queue is a scale-from-zero waiting room.
+	detector := newBlockedDetector()
+	h := newHarness(t, harnessOpts{
+		detector: detector,
+		controllerCfg: &controller.Config{
+			// The saturation budget is long enough that only the no-endpoint budget can shed this request.
+			DefaultRequestTTL:        5 * time.Minute,
+			NoEndpointRequestTTL:     100 * time.Millisecond,
+			ExpiryCleanupInterval:    10 * time.Millisecond,
+			EnqueueChannelBufferSize: 100,
+		},
+	})
+
+	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
+
+	results := make(chan dispatchResult, 1)
+	go func() {
+		req := &testRequest{id: "noep-budget-req", key: key, byteSize: 100, ttl: 5 * time.Minute}
+		outcome, err := h.fc.EnqueueAndWait(h.ctx, req)
+		results <- dispatchResult{id: "noep-budget-req", outcome: outcome, err: err}
+	}()
+
+	select {
+	case r := <-results:
+		require.Equal(t, fcTypes.QueueOutcomeEvictedNoEndpoints, r.outcome,
+			"an expiry against an empty pool should be attributed to unavailability")
+		require.ErrorIs(t, r.err, fcTypes.ErrEvicted, "the request was queued, so it is evicted rather than rejected")
+		require.ErrorIs(t, r.err, fcTypes.ErrNoEndpoints, "the error should wrap ErrNoEndpoints")
+		require.ErrorIs(t, r.err, fcTypes.ErrTTLExpired, "the error should wrap ErrTTLExpired")
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not return after the no-endpoint budget expired")
+	}
+}
+
+// TestNoEndpointBudgetOutlastingSaturationShedsAsUnavailability covers the configuration this feature targets, where
+// the cold-start budget is the longer of the two. Only the sweep observes the regime, so only the sweep can attribute
+// an empty-pool expiry to unavailability; nothing keyed to the request alone may pre-empt that decision and shed the
+// request as backpressure instead.
+func TestNoEndpointBudgetOutlastingSaturationShedsAsUnavailability(t *testing.T) {
+	t.Parallel()
+
+	const saturationTTL = 100 * time.Millisecond
+
+	// Pool intentionally empty (no endpointCandidates set): the queue is a scale-from-zero waiting room.
+	detector := newBlockedDetector()
+	h := newHarness(t, harnessOpts{
+		detector: detector,
+		controllerCfg: &controller.Config{
+			DefaultRequestTTL:    saturationTTL,
+			NoEndpointRequestTTL: 6 * saturationTTL,
+			// The sweep must win the attribution race against the request context's backstop, which sits one sweep
+			// interval beyond the first tick that can observe the expiry. The interval is therefore the tolerance this
+			// test has for scheduling lateness, not just its resolution.
+			ExpiryCleanupInterval:    50 * time.Millisecond,
+			EnqueueChannelBufferSize: 100,
+		},
+	})
+
+	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
+
+	results := make(chan dispatchResult, 1)
+	go func() {
+		// ttl 0 defers to the controller's saturation budget.
+		req := &testRequest{id: "cold-start-budget-req", key: key, byteSize: 100}
+		outcome, err := h.fc.EnqueueAndWait(h.ctx, req)
+		results <- dispatchResult{id: "cold-start-budget-req", outcome: outcome, err: err}
+	}()
+
+	// The saturation budget does not govern an empty pool, so the request holds well past it.
+	select {
+	case r := <-results:
+		t.Fatalf("request was shed on the saturation budget against an empty pool: outcome=%v err=%v", r.outcome, r.err)
+	case <-time.After(3 * saturationTTL):
+	}
+
+	select {
+	case r := <-results:
+		require.Equal(t, fcTypes.QueueOutcomeEvictedNoEndpoints, r.outcome,
+			"an expiry against an empty pool should be attributed to unavailability, not to backpressure")
+		require.ErrorIs(t, r.err, fcTypes.ErrEvicted, "the request was queued, so it is evicted rather than rejected")
+		require.ErrorIs(t, r.err, fcTypes.ErrNoEndpoints, "the error should wrap ErrNoEndpoints")
+		require.ErrorIs(t, r.err, fcTypes.ErrTTLExpired, "the error should wrap ErrTTLExpired")
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not return after the no-endpoint budget expired")
+	}
+}
+
+// TestScaleFromZeroOutlivesSaturationBudget verifies the regime is not fixed at admission: a request queued against an
+// empty pool holds past the saturation budget, and once the pool scales up it dispatches on a fresh saturation budget
+// rather than being shed the instant it becomes servable.
+func TestScaleFromZeroOutlivesSaturationBudget(t *testing.T) {
+	t.Parallel()
+
+	const saturationTTL = 150 * time.Millisecond
+
+	// The pool starts empty and scales up mid-flight; the dispatch cycle reads it via Locate().
+	var endpoints atomic.Value
+	endpoints.Store([]datalayer.Endpoint(nil))
+	endpointCandidates := &contractmocks.MockEndpointCandidates{
+		LocateFunc: func(_ context.Context, _ map[string]any) []datalayer.Endpoint {
+			return endpoints.Load().([]datalayer.Endpoint)
+		},
+	}
+
+	detector := newBlockedDetector()
+	h := newHarness(t, harnessOpts{
+		detector:           detector,
+		endpointCandidates: endpointCandidates,
+		controllerCfg: &controller.Config{
+			DefaultRequestTTL:        saturationTTL,
+			NoEndpointRequestTTL:     5 * time.Second,
+			ExpiryCleanupInterval:    10 * time.Millisecond,
+			EnqueueChannelBufferSize: 100,
+		},
+	})
+
+	key := flowcontrol.FlowKey{ID: "flow-a", Priority: 0}
+
+	results := make(chan dispatchResult, 1)
+	go func() {
+		// ttl 0 defers to the controller's saturation budget.
+		req := &testRequest{id: "cold-start-req", key: key, byteSize: 100}
+		outcome, err := h.fc.EnqueueAndWait(h.ctx, req)
+		results <- dispatchResult{id: "cold-start-req", outcome: outcome, err: err}
+	}()
+
+	// Wait well past the saturation budget while the pool is still empty.
+	select {
+	case r := <-results:
+		t.Fatalf("request was shed while waiting for the pool to scale up: outcome=%v err=%v", r.outcome, r.err)
+	case <-time.After(4 * saturationTTL):
+	}
+
+	// Scale from zero. The request only now becomes dispatchable, on a budget that has nominally elapsed.
+	endpoints.Store([]datalayer.Endpoint{datalayer.NewEndpoint(nil, nil)})
+	detector.Unblock(1)
+
+	select {
+	case r := <-results:
+		require.NoError(t, r.err, "a request that becomes dispatchable should not carry an error")
+		require.Equal(t, fcTypes.QueueOutcomeDispatched, r.outcome,
+			"the request should dispatch once the pool scales up, not be shed against a spent budget")
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not dispatch after the pool scaled up")
 	}
 }

@@ -21,7 +21,7 @@ const ProgramAwarePluginType = "program-aware-fairness"
 
 // enqueueTimeAttributeKey is the per-request attribute under which Pick
 // stashes the flow-control enqueue timestamp for PreRequest to read back.
-const enqueueTimeAttributeKey = "program-aware/enqueue-time"
+var enqueueTimeAttributeKey = plugin.NewDataKey("enqueue-time", ProgramAwarePluginType)
 
 type Config struct {
 	Strategy             string  `json:"strategy,omitempty"`
@@ -30,7 +30,6 @@ type Config struct {
 
 	LASWeightService   float64 `json:"lasWeightService,omitempty"`
 	LASWeightHeadWait  float64 `json:"lasWeightHeadWait,omitempty"`
-	LASDecayFactor     float64 `json:"lasDecayFactor,omitempty"`
 	LASHalfLifeSeconds float64 `json:"lasHalfLifeSeconds,omitempty"`
 }
 
@@ -41,8 +40,7 @@ func DefaultConfig() Config {
 		EvictionSweepSeconds: 300,
 		LASWeightService:     0.8,
 		LASWeightHeadWait:    0.2,
-		LASDecayFactor:       0.99997,
-		LASHalfLifeSeconds:   0,
+		LASHalfLifeSeconds:   60,
 	}
 }
 
@@ -59,9 +57,6 @@ func (c Config) validate() error {
 	if c.LASWeightHeadWait < 0 {
 		return fmt.Errorf("lasWeightHeadWait must be >= 0, got %v", c.LASWeightHeadWait)
 	}
-	if c.LASDecayFactor <= 0 || c.LASDecayFactor > 1 {
-		return fmt.Errorf("lasDecayFactor must be in (0, 1], got %v", c.LASDecayFactor)
-	}
 	if c.LASHalfLifeSeconds < 0 {
 		return fmt.Errorf("lasHalfLifeSeconds must be >= 0, got %v", c.LASHalfLifeSeconds)
 	}
@@ -72,6 +67,7 @@ var (
 	_ flowcontrol.FairnessPolicy  = &ProgramAwarePlugin{}
 	_ fwkrc.PreRequest            = &ProgramAwarePlugin{}
 	_ fwkrc.ResponseBodyProcessor = &ProgramAwarePlugin{}
+	_ plugin.StateDumper          = &ProgramAwarePlugin{}
 )
 
 //nolint:revive // factory name matches sibling fairness plugins.
@@ -120,6 +116,45 @@ func (p *ProgramAwarePlugin) TypedName() plugin.TypedName {
 	return plugin.TypedName{Type: ProgramAwarePluginType, Name: p.name}
 }
 
+// fairnessDumpState is the sanitized snapshot returned by DumpState. Program IDs
+// come from a user-controlled request header, so they are omitted; only these
+// bounded aggregates are reported.
+type fairnessDumpState struct {
+	TotalPrograms int     `json:"totalPrograms"`
+	TotalInFlight int64   `json:"totalInFlight"`
+	FairnessIndex float64 `json:"fairnessIndex"`
+}
+
+// DumpState reports aggregate fairness health: how many programs are tracked,
+// the total in-flight requests across them, and Jain's fairness index. Per-program
+// IDs are deliberately excluded because they are user-controlled and high-cardinality.
+// All three values come from a single pass over the program map.
+func (p *ProgramAwarePlugin) DumpState() (json.RawMessage, error) {
+	var totalPrograms int
+	var totalInFlight int64
+	var sum, sumSq, n float64
+	p.programMetrics.Range(func(_, value any) bool {
+		totalPrograms++
+		m, ok := value.(*ProgramMetrics)
+		if !ok {
+			return true
+		}
+		totalInFlight += m.InFlight()
+		if m.WaitCount() > 0 {
+			x := m.AverageWaitTime()
+			sum += x
+			sumSq += x * x
+			n++
+		}
+		return true
+	})
+	return json.Marshal(fairnessDumpState{
+		TotalPrograms: totalPrograms,
+		TotalInFlight: totalInFlight,
+		FairnessIndex: jainFairnessIndex(sum, sumSq, n),
+	})
+}
+
 // getStrategy falls back to a default LAS strategy for zero-value plugin
 // instances constructed in tests.
 func (p *ProgramAwarePlugin) getStrategy() Strategy {
@@ -161,6 +196,9 @@ func (p *ProgramAwarePlugin) Pick(_ context.Context, band flowcontrol.PriorityBa
 		return nil, nil //nolint:nilnil
 	}
 
+	// IterateQueues visits only active (non-empty) queues. That is sufficient: attained-service
+	// decay is time-anchored inside the strategy, so an idle program's service ages out without its
+	// queue being visited.
 	infos := make(map[string]QueueInfo)
 	band.IterateQueues(func(queue flowcontrol.FlowQueueAccessor) bool {
 		if queue == nil {
@@ -192,9 +230,9 @@ func (p *ProgramAwarePlugin) Pick(_ context.Context, band flowcontrol.PriorityBa
 	return best, nil
 }
 
-func (p *ProgramAwarePlugin) PreRequest(_ context.Context, request *fwksched.InferenceRequest, _ *fwksched.SchedulingResult) {
+func (p *ProgramAwarePlugin) PreRequest(_ context.Context, request *fwksched.InferenceRequest, _ *fwksched.SchedulingResult) error {
 	if request == nil {
-		return
+		return nil
 	}
 	id := programIDFor(request)
 	metrics := p.getOrCreateMetrics(id)
@@ -204,6 +242,7 @@ func (p *ProgramAwarePlugin) PreRequest(_ context.Context, request *fwksched.Inf
 	avgWaitTimeMs.WithLabelValues(id).Set(metrics.AverageWaitTime())
 
 	p.getStrategy().OnPreRequest(metrics, request)
+	return nil
 }
 
 // ResponseBody acts on the final stream chunk only; intermediate chunks are
@@ -261,6 +300,16 @@ func (p *ProgramAwarePlugin) evictKey(key any) {
 	}
 }
 
+// jainFairnessIndex returns Jain's fairness index for the given sum, sum of
+// squares, and count of per-program wait observations. It is 1.0 (perfectly
+// fair) when fewer than two programs have observations.
+func jainFairnessIndex(sum, sumSq, n float64) float64 {
+	if n <= 1 || sumSq == 0 {
+		return 1.0
+	}
+	return (sum * sum) / (n * sumSq)
+}
+
 // computeFairnessIndex returns Jain's Fairness Index over the average wait
 // time per program. Programs with no wait observations are skipped.
 func (p *ProgramAwarePlugin) computeFairnessIndex() float64 {
@@ -279,8 +328,5 @@ func (p *ProgramAwarePlugin) computeFairnessIndex() float64 {
 		n++
 		return true
 	})
-	if n <= 1 || sumSq == 0 {
-		return 1.0
-	}
-	return (sum * sum) / (n * sumSq)
+	return jainFairnessIndex(sum, sumSq, n)
 }

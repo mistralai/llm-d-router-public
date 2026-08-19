@@ -20,16 +20,19 @@ limitations under the License.
 package tokenizer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
-	"github.com/llm-d/llm-d-kv-cache/pkg/tokenization"
-	tokenizerTypes "github.com/llm-d/llm-d-kv-cache/pkg/tokenization/types"
+	kvctok "github.com/llm-d/llm-d-kv-cache/pkg/tokenization"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/tokenization"
+	tokenizerTypes "github.com/llm-d/llm-d-router/pkg/kvcache/tokenization/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
@@ -54,6 +57,25 @@ const (
 	LegacyPluginType = "tokenizer"
 
 	tokenizedPromptKeyID = "TokenizedPrompt"
+
+	// anthropicBillingHeaderPrefix marks Claude Code system text that carries a
+	// per-request hash; vLLM strips it server-side, so the tokenizer must too.
+	anthropicBillingHeaderPrefix = "x-anthropic-billing-header"
+
+	// defaultImageMediaType fills in Anthropic base64 image sources with no
+	// media_type, matching vLLM's conversion.
+	defaultImageMediaType = "image/jpeg"
+)
+
+// Content-block types the Anthropic Messages conversion reads and emits.
+const (
+	blockTypeText             = "text"
+	blockTypeImage            = "image"
+	blockTypeImageURL         = "image_url"
+	blockTypeThinking         = "thinking"
+	blockTypeRedactedThinking = "redacted_thinking"
+	blockTypeToolUse          = "tool_use"
+	blockTypeToolResult       = "tool_result"
 )
 
 var TokenizedPromptDataKey = plugin.NewDataKey(tokenizedPromptKeyID, PluginType)
@@ -69,7 +91,7 @@ type tokenizerPluginConfig struct {
 	//
 	// Deprecated: the UDS tokenizer backend is deprecated and will be removed
 	// in a future release. Migrate to the `vllm` HTTP /render backend.
-	TokenizerConfig tokenization.UdsTokenizerConfig `json:"udsTokenizerConfig,omitempty"`
+	TokenizerConfig kvctok.UdsTokenizerConfig `json:"udsTokenizerConfig,omitempty"`
 	// VLLM configures the vLLM /render backend.
 	VLLM *vllmConfig `json:"vllm,omitempty"`
 	// Estimate selects the tokenizer-free byte-packing backend; mutually
@@ -79,11 +101,13 @@ type tokenizerPluginConfig struct {
 	ModelName string `json:"modelName"`
 }
 
-// estimateConfig configures the estimation backend. Multimodal image estimation
-// is the only tunable; an empty config uses built-in defaults.
+// estimateConfig configures the estimation backend. Multimodal image and video
+// estimation are the only tunables; an empty config uses built-in defaults.
 type estimateConfig struct {
 	// Image tunes multimodal image placeholder-token estimation.
 	Image *imageEstimateConfig `json:"image,omitempty"`
+	// Video tunes multimodal video placeholder-token estimation.
+	Video *videoEstimateConfig `json:"video,omitempty"`
 }
 
 // imageEstimateConfig tunes how an image's placeholder-token count is estimated.
@@ -112,10 +136,87 @@ type dynamicImageConfig struct {
 	Factor int `json:"factor,omitempty"`
 }
 
-// resolution is an image width/height in pixels.
+// resolution is an image or video-frame width/height in pixels.
 type resolution struct {
 	Width  int `json:"width"`
 	Height int `json:"height"`
+}
+
+// videoEstimateConfig tunes how a video's placeholder-token count is estimated:
+// min(frames * tokensPerFrame, maxVideoTokens). Empty fields fall back to
+// built-in defaults. qwen3 is dynamic tokens-per-frame + sampled frames; gemma4
+// is static tokens-per-frame + strided frames. Duration and resolution are not
+// decoded from the video; they come from these fields.
+type videoEstimateConfig struct {
+	// DefaultResolution is the per-frame resolution used for dynamic
+	// tokens-per-frame.
+	DefaultResolution *resolution `json:"defaultResolution,omitempty"`
+	// DefaultDuration is the video length in seconds used for frame counting.
+	DefaultDuration float64 `json:"defaultDuration,omitempty"`
+	// TokensPerFrame configures the per-frame placeholder count.
+	TokensPerFrame *tokensPerFrameConfig `json:"tokensPerFrame,omitempty"`
+	// Frames configures how many frames are sampled from the video.
+	Frames *framesConfig `json:"frames,omitempty"`
+	// MaxVideoTokens caps the total placeholder count. Zero means uncapped.
+	MaxVideoTokens int `json:"maxVideoTokens,omitempty"`
+}
+
+// tokensPerFrameConfig configures the per-frame placeholder count.
+type tokensPerFrameConfig struct {
+	// Mode selects "dynamic" (width*height/factor) or "static" (a constant count).
+	Mode string `json:"mode,omitempty"`
+	// Static configures the static (constant per-frame) mode.
+	Static *tokensPerFrameStaticMode `json:"static,omitempty"`
+	// Dynamic configures the dynamic (pixels/factor) mode.
+	Dynamic *tokensPerFrameDynamicMode `json:"dynamic,omitempty"`
+}
+
+// tokensPerFrameStaticMode is the static-mode parameter.
+type tokensPerFrameStaticMode struct {
+	// NumTokensPerFrame is the per-frame placeholder count.
+	NumTokensPerFrame int `json:"numTokensPerFrame,omitempty"`
+}
+
+// tokensPerFrameDynamicMode is the dynamic-mode parameter.
+type tokensPerFrameDynamicMode struct {
+	// Factor maps a frame's pixels to placeholder tokens (width*height/factor).
+	Factor int `json:"factor,omitempty"`
+}
+
+// framesConfig configures how many frames are counted from a video. MinFrames
+// and MaxFrames clamp the count in both modes; the mode sub-structs hold the
+// mode-specific knobs.
+type framesConfig struct {
+	// Mode selects "sampled" (duration*sampleFPS) or "strided"
+	// (duration*sourceFPS/frameStride).
+	Mode string `json:"mode,omitempty"`
+	// MinFrames floors the frame count. Zero means no floor.
+	MinFrames int `json:"minFrames,omitempty"`
+	// MaxFrames caps the frame count. Zero means uncapped.
+	MaxFrames int `json:"maxFrames,omitempty"`
+	// Sampled configures the sampled (duration*sampleFPS) mode.
+	Sampled *framesSampledMode `json:"sampled,omitempty"`
+	// Strided configures the strided (duration*sourceFPS/frameStride) mode.
+	Strided *framesStridedMode `json:"strided,omitempty"`
+}
+
+// framesSampledMode configures the sampled frame-count mode.
+type framesSampledMode struct {
+	// SampleFPS is the sampling rate.
+	SampleFPS float64 `json:"sampleFPS,omitempty"`
+	// TemporalPatchSize merges every N sampled frames into one token group,
+	// modeling temporal patch merging (e.g. qwen3-vl uses 2). Values < 2 apply
+	// no merging.
+	TemporalPatchSize int `json:"temporalPatchSize,omitempty"`
+}
+
+// framesStridedMode configures the strided frame-count mode.
+type framesStridedMode struct {
+	// DefaultSourceFPS is the fallback source frame rate, used when the
+	// x-llm-d-video-fps header is absent.
+	DefaultSourceFPS float64 `json:"defaultSourceFPS,omitempty"`
+	// FrameStride keeps every Nth source frame.
+	FrameStride int `json:"frameStride,omitempty"`
 }
 
 // PluginFactory is the factory function for the tokenizer plugin.
@@ -142,6 +243,19 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 	if config.Estimate != nil && config.Estimate.Image != nil {
 		if m := config.Estimate.Image.Mode; m != "" && m != imageModeDynamic && m != imageModeStatic {
 			return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.image.mode must be %q or %q", PluginType, imageModeDynamic, imageModeStatic)
+		}
+	}
+	if config.Estimate != nil && config.Estimate.Video != nil {
+		vid := config.Estimate.Video
+		if vid.TokensPerFrame != nil {
+			if m := vid.TokensPerFrame.Mode; m != "" && m != videoTPFModeDynamic && m != videoTPFModeStatic {
+				return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.video.tokensPerFrame.mode must be %q or %q", PluginType, videoTPFModeDynamic, videoTPFModeStatic)
+			}
+		}
+		if vid.Frames != nil {
+			if m := vid.Frames.Mode; m != "" && m != videoFramesModeSampled && m != videoFramesModeStrided {
+				return nil, fmt.Errorf("invalid configuration for '%s' plugin: estimate.video.frames.mode must be %q or %q", PluginType, videoFramesModeSampled, videoFramesModeStrided)
+			}
 		}
 	}
 
@@ -193,7 +307,7 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 		}
 		backend = renderBackend{tk: renderer}
 	default:
-		backend = estimateBackend{img: newImageEstimator(config.Estimate)}
+		backend = estimateBackend{img: newImageEstimator(config.Estimate), vid: newVideoEstimator(config.Estimate)}
 	}
 
 	p := &Plugin{
@@ -257,6 +371,7 @@ func (p *Plugin) Produce(ctx context.Context, request *scheduling.InferenceReque
 		return nil
 	}
 
+	ctx = withMMMetadata(ctx, parseMMMetadataHeaders(request.Headers))
 	tp, err := p.backend.produce(ctx, request.Body)
 	if err != nil {
 		return err
@@ -276,7 +391,7 @@ func ChatCompletionsToRenderChatRequest(chat *fwkrh.ChatCompletionsRequest) *tok
 	for _, msg := range chat.Messages {
 		conv := tokenizerTypes.Conversation{
 			Role:      msg.Role,
-			Content:   tokenizerTypes.Content{Raw: msg.Content.Raw},
+			Content:   &tokenizerTypes.Content{Raw: msg.Content.Raw},
 			ToolCalls: msg.ToolCalls,
 		}
 		for _, block := range msg.Content.Structured {
@@ -299,6 +414,251 @@ func ChatCompletionsToRenderChatRequest(chat *fwkrh.ChatCompletionsRequest) *tok
 		AddGenerationPrompt:       chat.AddGenerationPrompt,
 		ChatTemplateKWArgs:        chat.ChatTemplateKWArgs,
 	}
+}
+
+// MessagesToRenderChatRequest converts an Anthropic MessagesRequest into the
+// OpenAI chat shape vLLM builds when serving /v1/messages, so the render
+// backend and the server apply the identical chat-template pipeline to the
+// same request and prefix-cache blocks line up.
+func MessagesToRenderChatRequest(msg *fwkrh.MessagesRequest) *tokenizerTypes.RenderChatRequest {
+	conversation := make([]tokenizerTypes.Conversation, 0, 1+len(msg.Messages))
+
+	if sys := anthropicSystemText(msg.System); sys != "" {
+		conversation = append(conversation, tokenizerTypes.Conversation{
+			Role:    "system",
+			Content: &tokenizerTypes.Content{Raw: sys},
+		})
+	}
+
+	for _, m := range msg.Messages {
+		if m.Role == "system" {
+			// Not valid Anthropic input; tolerated the way vLLM does.
+			if text := anthropicSystemText(m.Content); text != "" {
+				conversation = append(conversation, tokenizerTypes.Conversation{
+					Role:    "system",
+					Content: &tokenizerTypes.Content{Raw: text},
+				})
+			}
+			continue
+		}
+		conversation = appendAnthropicMessage(conversation, m)
+	}
+
+	return &tokenizerTypes.RenderChatRequest{
+		Conversation: conversation,
+		Tools:        convertAnthropicTools(msg.Tools),
+	}
+}
+
+// anthropicSystemText joins the system prompt's text blocks with no
+// separator, dropping Claude Code's per-request billing header so it does not
+// defeat prefix caching (mirrors vLLM).
+func anthropicSystemText(ac fwkrh.AnthropicContent) string {
+	if ac.Raw != "" {
+		return ac.Raw
+	}
+	var sb strings.Builder
+	for _, block := range ac.Structured {
+		if block.Type == blockTypeText && block.Text != "" && !strings.HasPrefix(block.Text, anthropicBillingHeaderPrefix) {
+			sb.WriteString(block.Text)
+		}
+	}
+	return sb.String()
+}
+
+// appendAnthropicMessage appends the conversations for one message. User
+// tool_result blocks append their tool messages immediately, so those precede
+// the user message that carried them - the order vLLM emits.
+func appendAnthropicMessage(conversation []tokenizerTypes.Conversation, m fwkrh.AnthropicMessage) []tokenizerTypes.Conversation {
+	if m.Content.Raw != "" {
+		return append(conversation, tokenizerTypes.Conversation{
+			Role:    m.Role,
+			Content: &tokenizerTypes.Content{Raw: m.Content.Raw},
+		})
+	}
+
+	var contentBlocks []tokenizerTypes.ContentBlock
+	var toolCalls []any
+	var reasoning strings.Builder
+	for _, b := range m.Content.Structured {
+		switch b.Type {
+		case blockTypeText:
+			if b.Text != "" {
+				contentBlocks = append(contentBlocks, tokenizerTypes.ContentBlock{Type: blockTypeText, Text: b.Text})
+			}
+		case blockTypeImage:
+			contentBlocks = appendImageBlock(contentBlocks, b.Source)
+		case blockTypeThinking:
+			reasoning.WriteString(b.Thinking)
+		case blockTypeRedactedThinking:
+			// Opaque safety-filtered reasoning; parses but contributes no tokens.
+		case blockTypeToolUse:
+			toolCalls = append(toolCalls, anthropicToolCall(b))
+		case blockTypeToolResult:
+			if m.Role == "user" {
+				conversation = appendAnthropicToolResult(conversation, b)
+			} else {
+				text, _ := anthropicToolResultContent(b)
+				contentBlocks = append(contentBlocks, tokenizerTypes.ContentBlock{
+					Type: blockTypeText,
+					Text: "Tool result: " + text,
+				})
+			}
+		}
+	}
+
+	conv := tokenizerTypes.Conversation{Role: m.Role}
+	if reasoning.Len() > 0 {
+		conv.Reasoning = reasoning.String()
+	}
+	conv.ToolCalls = toolCalls
+	switch {
+	case len(contentBlocks) == 1 && contentBlocks[0].Type == blockTypeText:
+		conv.Content = &tokenizerTypes.Content{Raw: contentBlocks[0].Text}
+	case len(contentBlocks) > 0:
+		conv.Content = &tokenizerTypes.Content{Structured: contentBlocks}
+	}
+	// A user message reduced to bare tool_results has no content of its own;
+	// its tool messages were already appended above.
+	if m.Role == "user" && conv.Content == nil {
+		return conversation
+	}
+	return append(conversation, conv)
+}
+
+// appendImageBlock maps an Anthropic image source to an OpenAI image_url
+// content block; sources that resolve to no URL are dropped.
+func appendImageBlock(blocks []tokenizerTypes.ContentBlock, src *fwkrh.AnthropicImageSource) []tokenizerTypes.ContentBlock {
+	if url := anthropicImageToURL(src); url != "" {
+		blocks = append(blocks, tokenizerTypes.ContentBlock{
+			Type:     blockTypeImageURL,
+			ImageURL: tokenizerTypes.ImageBlock{URL: url},
+		})
+	}
+	return blocks
+}
+
+// anthropicToolCall converts a tool_use block into an OpenAI function tool
+// call. Arguments are CPython json.dumps formatted (separators, ASCII
+// escaping, wire key order) - the exact string vLLM renders into the prompt.
+func anthropicToolCall(b fwkrh.AnthropicContentBlock) map[string]any {
+	id := b.ID
+	if id == "" {
+		// vLLM falls back to call_<unix-time>; a fixed stand-in only keeps the
+		// rendered length stable (ids are generated in practice).
+		id = "call_0000000000"
+	}
+	return map[string]any{
+		"id":   id,
+		"type": "function",
+		"function": map[string]any{
+			"name":      b.Name,
+			"arguments": pythonArguments(b.Input),
+		},
+	}
+}
+
+// pythonArguments renders tool_use input as json.dumps(input or {}): absent,
+// null, and empty-object inputs all render as "{}".
+func pythonArguments(raw json.RawMessage) string {
+	switch string(bytes.TrimSpace(raw)) {
+	case "", "null", "{}":
+		return "{}"
+	}
+	if out, err := pythonDumps(raw); err == nil {
+		return out
+	}
+	return "{}"
+}
+
+// appendAnthropicToolResult appends a tool-role message for a user
+// tool_result block; images in the result follow as their own user message.
+func appendAnthropicToolResult(conversation []tokenizerTypes.Conversation, b fwkrh.AnthropicContentBlock) []tokenizerTypes.Conversation {
+	text, imageBlocks := anthropicToolResultContent(b)
+	conversation = append(conversation, tokenizerTypes.Conversation{
+		Role:       "tool",
+		ToolCallID: b.ToolUseID,
+		Content:    &tokenizerTypes.Content{Raw: text},
+	})
+	if len(imageBlocks) > 0 {
+		conversation = append(conversation, tokenizerTypes.Conversation{
+			Role:    "user",
+			Content: &tokenizerTypes.Content{Structured: imageBlocks},
+		})
+	}
+	return conversation
+}
+
+// anthropicToolResultContent splits a tool_result's content into its text
+// (block texts joined with newlines) and image blocks.
+func anthropicToolResultContent(b fwkrh.AnthropicContentBlock) (string, []tokenizerTypes.ContentBlock) {
+	if b.Content.Raw != "" {
+		return b.Content.Raw, nil
+	}
+	var parts []string
+	var imageBlocks []tokenizerTypes.ContentBlock
+	for _, item := range b.Content.Structured {
+		switch item.Type {
+		case blockTypeText:
+			parts = append(parts, item.Text)
+		case blockTypeImage:
+			imageBlocks = appendImageBlock(imageBlocks, item.Source)
+		}
+	}
+	return strings.Join(parts, "\n"), imageBlocks
+}
+
+// convertAnthropicTools rewrites Anthropic tool definitions into OpenAI
+// function tools. input_schema passes through as raw JSON so the template's
+// re-serialization keeps the wire key order.
+func convertAnthropicTools(tools []fwkrh.AnthropicTool) []any {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(tools))
+	for _, t := range tools {
+		var schema json.RawMessage = bytes.TrimSpace(t.InputSchema)
+		if len(schema) == 0 || bytes.Equal(schema, []byte("null")) {
+			schema = json.RawMessage(`{"type":"object"}`)
+		}
+		fn := map[string]any{
+			"name":       t.Name,
+			"parameters": schema,
+		}
+		if t.Description != "" {
+			fn["description"] = t.Description
+		}
+		if t.Strict != nil {
+			fn["strict"] = *t.Strict
+		}
+		if t.DeferLoading != nil {
+			fn["defer_loading"] = *t.DeferLoading
+		}
+		out = append(out, map[string]any{"type": "function", "function": fn})
+	}
+	return out
+}
+
+// anthropicImageToURL converts an Anthropic image source to an OpenAI-shaped
+// URL. Sources carrying a URL pass it through (URL sources, and sources
+// missing a type); base64 sources become data URIs, with an image/jpeg media
+// type when absent. Sources with neither a URL nor data yield "" so the
+// caller drops the block.
+func anthropicImageToURL(src *fwkrh.AnthropicImageSource) string {
+	if src == nil {
+		return ""
+	}
+	if src.Type == "url" || src.URL != "" {
+		return src.URL
+	}
+	if src.Data == "" {
+		return ""
+	}
+	mediaType := src.MediaType
+	if mediaType == "" {
+		mediaType = defaultImageMediaType
+	}
+	return "data:" + mediaType + ";base64," + src.Data
 }
 
 // convertMMFeaturesToUpstream flattens the kv-cache map-shaped multimodal

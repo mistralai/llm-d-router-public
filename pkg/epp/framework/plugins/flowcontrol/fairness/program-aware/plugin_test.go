@@ -12,6 +12,7 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkfcmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
@@ -42,8 +43,6 @@ func TestFactory_InvalidConfig(t *testing.T) {
 		"negative ttl":       `{"evictionTtlSeconds":-1}`,
 		"zero sweep":         `{"evictionSweepSeconds":0}`,
 		"negative weight":    `{"lasWeightService":-0.1}`,
-		"decay factor > 1":   `{"lasDecayFactor":1.5}`,
-		"decay factor 0":     `{"lasDecayFactor":0}`,
 		"negative half life": `{"lasHalfLifeSeconds":-1}`,
 	}
 	for name, cfg := range cases {
@@ -52,6 +51,14 @@ func TestFactory_InvalidConfig(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+// TestFactory_RejectsUnknownKeys pins that a config key the plugin does not recognize fails
+// startup. Decay is parameterized by lasHalfLifeSeconds alone, so a config setting lasDecayFactor
+// names a parameter the plugin does not accept, and the operator hears about it.
+func TestFactory_RejectsUnknownKeys(t *testing.T) {
+	_, err := ProgramAwarePluginFactory("test", plugin.StrictDecoder([]byte(`{"lasDecayFactor":0.99997}`)), nil)
+	require.ErrorContains(t, err, "lasDecayFactor")
 }
 
 func TestPick_NilBand(t *testing.T) {
@@ -101,13 +108,61 @@ func TestPick_SingleNonEmptyQueue_StashesEnqueueTime(t *testing.T) {
 	assert.Equal(t, enqueue, stashed)
 }
 
+// TestPick_IdleProgramServiceDecaysWithoutVisits is the end-to-end regression for idle-service
+// freeze under the band accessor's skip-empty iteration: an idle program's queue is never visited,
+// so its decay must not depend on visits. After idling, its decayed service must let it outrank a
+// fresh low-service competitor.
+func TestPick_IdleProgramServiceDecaysWithoutVisits(t *testing.T) {
+	strategy, err := newStrategy(Config{
+		Strategy:           "las",
+		LASWeightService:   1.0,
+		LASWeightHeadWait:  0.0,
+		LASHalfLifeSeconds: 1,
+	})
+	require.NoError(t, err)
+	las, ok := strategy.(*LASStrategy)
+	require.True(t, ok)
+	p := &ProgramAwarePlugin{strategy: strategy}
+	now := time.Now()
+
+	// "heavy" accrued lots of service, then idled 10 half-lives without any Pick visiting it;
+	// "light" completed a small request just now.
+	heavy := las.getOrCreateState("heavy")
+	heavy.attainedService = 1000
+	heavy.decayAnchor = now.Add(-10 * time.Second)
+	light := las.getOrCreateState("light")
+	light.attainedService = 10
+	light.decayAnchor = now
+
+	// Both become active; the band visits only these two non-empty queues.
+	queues := []*fwkfcmocks.MockFlowQueueAccessor{
+		{LenV: 1, FlowKeyV: flowcontrol.FlowKey{ID: "heavy"}, PeekV: &fwkfcmocks.MockQueueItemAccessor{EnqueueTimeV: now}},
+		{LenV: 1, FlowKeyV: flowcontrol.FlowKey{ID: "light"}, PeekV: &fwkfcmocks.MockQueueItemAccessor{EnqueueTimeV: now}},
+	}
+	band := &fwkfcmocks.MockPriorityBandAccessor{
+		IterateQueuesFunc: func(cb func(flowcontrol.FlowQueueAccessor) bool) {
+			for _, q := range queues {
+				if !cb(q) {
+					return
+				}
+			}
+		},
+	}
+
+	got, err := p.Pick(context.Background(), band)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "heavy", got.FlowKey().ID,
+		"heavy's service must have decayed to ~1 while idle, below light's 10")
+}
+
 func TestPreRequest_RecordsDispatchAndWait(t *testing.T) {
 	enqueue := time.Now().Add(-50 * time.Millisecond)
 	req := &fwksched.InferenceRequest{FairnessID: "alpha"}
 	req.PutAttribute(enqueueTimeAttributeKey, enqueue)
 
 	p := &ProgramAwarePlugin{}
-	p.PreRequest(context.Background(), req, nil)
+	_ = p.PreRequest(context.Background(), req, nil)
 
 	m := p.getOrCreateMetrics("alpha")
 	assert.Equal(t, int64(1), m.DispatchedCount())
@@ -119,7 +174,7 @@ func TestPreRequest_RecordsDispatchAndWait(t *testing.T) {
 func TestPreRequest_NoEnqueueAttribute_StillDispatches(t *testing.T) {
 	req := &fwksched.InferenceRequest{FairnessID: "alpha"}
 	p := &ProgramAwarePlugin{}
-	p.PreRequest(context.Background(), req, nil)
+	_ = p.PreRequest(context.Background(), req, nil)
 
 	m := p.getOrCreateMetrics("alpha")
 	assert.Equal(t, int64(1), m.DispatchedCount())
@@ -130,7 +185,7 @@ func TestPreRequest_NoEnqueueAttribute_StillDispatches(t *testing.T) {
 func TestPreRequest_NoFairnessID_FallsBackToDefault(t *testing.T) {
 	req := &fwksched.InferenceRequest{}
 	p := &ProgramAwarePlugin{}
-	p.PreRequest(context.Background(), req, nil)
+	_ = p.PreRequest(context.Background(), req, nil)
 
 	got, ok := p.programMetrics.Load(metadata.DefaultFairnessID)
 	require.True(t, ok, "default fairness ID entry should be created")
@@ -254,4 +309,45 @@ func TestGetOrCreateMetrics_Idempotent(t *testing.T) {
 	a := p.getOrCreateMetrics("alpha")
 	b := p.getOrCreateMetrics("alpha")
 	assert.Same(t, a, b)
+}
+
+func TestDumpState(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	p.getOrCreateMetrics("prog-a").RecordDispatched(time.Now().Add(-10 * time.Millisecond))
+	p.getOrCreateMetrics("prog-b").RecordDispatched(time.Now().Add(-20 * time.Millisecond))
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+
+	var state fairnessDumpState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	assert.Equal(t, 2, state.TotalPrograms)
+	assert.Equal(t, int64(2), state.TotalInFlight)
+	assert.GreaterOrEqual(t, state.FairnessIndex, 0.0)
+	assert.LessOrEqual(t, state.FairnessIndex, 1.0)
+}
+
+func TestDumpStateOmitsProgramIDs(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	// Program IDs come from a user-controlled header and must never be dumped.
+	p.getOrCreateMetrics("secret-tenant-xyz").RecordDispatched(time.Now().Add(-5 * time.Millisecond))
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+	assert.NotContains(t, string(payload), "secret-tenant-xyz")
+}
+
+func TestDumpStateEmpty(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+
+	payload, err := p.DumpState()
+	require.NoError(t, err)
+	assert.True(t, json.Valid(payload))
+
+	var state fairnessDumpState
+	require.NoError(t, json.Unmarshal(payload, &state))
+	assert.Equal(t, 0, state.TotalPrograms)
+	assert.Equal(t, int64(0), state.TotalInFlight)
+	// With no programs the policy is trivially fair.
+	assert.Equal(t, 1.0, state.FairnessIndex)
 }

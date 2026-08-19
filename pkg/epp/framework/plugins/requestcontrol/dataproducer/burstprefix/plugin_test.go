@@ -42,12 +42,12 @@ func tokenizedRequest(tokens []uint32) *fwksched.InferenceRequest {
 func (p *dataProducer) assignedReplica(t *testing.T, endpoints []fwksched.Endpoint) string {
 	t.Helper()
 	for _, ep := range endpoints {
-		v, ok := ep.Get(p.dk.String())
+		v, ok := ep.Get(p.dk)
 		require.True(t, ok, "PrefixCacheMatchInfo must be attached to every endpoint")
 		info, ok := v.(*attrprefix.PrefixCacheMatchInfo)
 		require.True(t, ok)
 		if info.MatchBlocks() > 0 {
-			return ep.GetMetadata().NamespacedName.Name
+			return ep.GetMetadata().ID.Name
 		}
 	}
 	return ""
@@ -62,6 +62,9 @@ func TestNew_RejectsInvalidConfig(t *testing.T) {
 
 	_, err = newDataProducer(context.Background(), "burst", config{WindowDurationMs: 100, MaxPerReplica: -1, BlockSizeTokens: 0})
 	assert.Error(t, err, "blockSizeTokens must be > 0")
+
+	_, err = newDataProducer(context.Background(), "burst", config{WindowDurationMs: 100, MaxPerReplica: -1, BlockSizeTokens: 64, BalanceBy: "bogus"})
+	assert.Error(t, err, "balanceBy must be requests or tokens")
 }
 
 func TestProduce_ColocatesIdenticalPromptBurst(t *testing.T) {
@@ -118,7 +121,7 @@ func TestProduce_CancelledContextBeforeSeal(t *testing.T) {
 	require.Error(t, err, "a context cancelled before seal must return an error")
 
 	for _, ep := range endpoints {
-		v, ok := ep.Get(p.dk.String())
+		v, ok := ep.Get(p.dk)
 		if !ok {
 			continue // no affinity attached is expected when Produce returns early
 		}

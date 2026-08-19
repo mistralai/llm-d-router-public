@@ -31,7 +31,7 @@ import (
 type FlowControlRequest interface {
 	// FlowKey returns the composite key that uniquely identifies the flow instance this request belongs to.
 	// The `controller.FlowController` uses this key as the primary identifier to look up the correct
-	// `contracts.ManagedQueue` and configured OrderingPolicy from a `contracts.RegistryShard`.
+	// `contracts.ManagedQueue` and configured OrderingPolicy from the `contracts.FlowRegistry`.
 	// The returned key is treated as an immutable value.
 	FlowKey() FlowKey
 
@@ -115,9 +115,14 @@ type QueueItemAccessor interface {
 	// landed in a SafeQueue instance.
 	EnqueueTime() time.Time
 
-	// EffectiveTTL is the actual Time-To-Live assigned to this item by the `controller.FlowController`, taking into
-	// account the request's preference (`FlowControlRequest.InitialEffectiveTTL()`) and any `controller.FlowController`
-	// or per-flow defaults/policies.
+	// EffectiveTTL is the Time-To-Live assigned to this item by the `controller.FlowController`, taking into account the
+	// request's preference (`FlowControlRequest.InitialEffectiveTTL()`) and any `controller.FlowController` or per-flow
+	// defaults/policies.
+	//
+	// It is the queue-wait budget for the regime in which the candidate pool has endpoints. While the pool has none, the
+	// wait is bounded by a separate controller-level budget that this value does not describe, so an item may outlive it.
+	// A policy deriving a deadline from it is therefore ordering by the request's own budget, not by when the item will
+	// actually be evicted.
 	EffectiveTTL() time.Duration
 
 	// Handle returns the `QueueItemHandle` associated with this item once it has been successfully added to a

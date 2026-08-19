@@ -1,12 +1,14 @@
 package e2e
 
+import "fmt"
+
 // Simple EPP configuration for running without P/D
 const simpleConfig = `apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:
 - type: approx-prefix-cache-producer
   parameters:
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: decode-filter
@@ -30,7 +32,7 @@ plugins:
 - type: approx-prefix-cache-producer
   parameters:
     blockSizeTokens: 16
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: prefill-filter
@@ -90,7 +92,7 @@ plugins:
 - type: approx-prefix-cache-producer
   parameters:
     blockSizeTokens: 16
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: max-score-picker
@@ -121,14 +123,59 @@ schedulingProfiles:
     weight: 2
 `
 
+// generateEncodeConfig is the encode-only EPP config for /inference/v1/generate.
+// Uses single-profile-handler so the EPP routes directly to encode pods without
+// requiring a decode stage.
+const generateEncodeConfig = `apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: vllmhttp-parser
+- type: encode-filter
+- type: max-score-picker
+- type: single-profile-handler
+requestHandler:
+  parsers:
+   - pluginRef: vllmhttp-parser 
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: encode-filter
+  - pluginRef: max-score-picker
+`
+
+// generatePrefillConfig is the prefill-only EPP config for /inference/v1/generate.
+// Uses single-profile-handler so the EPP routes directly to prefill pods without
+// requiring a decode stage.
+const generatePrefillConfig = `apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: vllmhttp-parser
+- type: prefill-filter
+- type: max-score-picker
+- type: single-profile-handler
+requestHandler:
+  parsers:
+   - pluginRef: vllmhttp-parser 
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: prefill-filter
+  - pluginRef: max-score-picker
+`
+
 // EPP configuration for running with P/D using the unified disagg-profile-handler
+// pdConfig uses vllmhttp-parser as the request handler so the EPP can parse
+// both OpenAI-style and /inference/v1/generate (token-in) traffic. The parser
+// delegates non-generate paths to the embedded OpenAI parser, so existing
+// chat/completions tests are unaffected.
 const pdConfig = `apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:
+- type: vllmhttp-parser
 - type: approx-prefix-cache-producer
   parameters:
     blockSizeTokens: 16
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: prefill-filter
@@ -162,7 +209,7 @@ kind: EndpointPickerConfig
 plugins:
 - type: approx-prefix-cache-producer
   parameters:
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 16384
     lruCapacityPerServer: 256
 - type: prefix-cache-scorer
 - type: encode-filter
@@ -179,26 +226,28 @@ schedulingProfiles:
     weight: 2
 `
 
-// EPP config for running with precise prefix scoring (i.e. KV events).
-const kvConfig = `apiVersion: llm-d.ai/v1alpha1
+// kvConfig returns the EPP config for running with precise prefix scoring (i.e. KV events).
+// The render URL is built from vllmRenderPort so VLLM_RENDER_PORT is respected.
+func kvConfig() string {
+	return fmt.Sprintf(`apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:
 - type: token-producer
   parameters:
     modelName: Qwen/Qwen2.5-1.5B-Instruct
     vllm:
-      url: http://localhost:8000
+      url: http://vllm-render:%s
 - type: precise-prefix-cache-scorer
   parameters:
     tokenProcessorConfig:
-      blockSize: 16
+      blockSizeTokens: 16
       hashSeed: "42"
     kvEventsConfig:
       zmqEndpoint: tcp://0.0.0.0:5557
     indexerConfig:
       kvBlockIndexConfig:
         enableMetrics: false                  # enable kv-block index metrics (prometheus)
-        metricsLoggingInterval: 6000000000    # log kv-block metrics as well (1m in nanoseconds)
+        metricsLoggingInterval: 60000000000   # log kv-block metrics as well (1m in nanoseconds)
 - type: decode-filter
 - type: max-score-picker
 - type: disagg-profile-handler
@@ -209,21 +258,24 @@ schedulingProfiles:
   - pluginRef: max-score-picker
   - pluginRef: precise-prefix-cache-scorer
     weight: 10
-`
+`, vllmRenderPort)
+}
 
-// Alias of kvConfig retained for tests that reference the external-tokenizer name.
-const kvExternalTokenizerConfig = `apiVersion: llm-d.ai/v1alpha1
+// kvExternalTokenizerConfig returns the EPP config for the external-tokenizer DataProducer variant.
+// The render URL is built from vllmRenderPort so VLLM_RENDER_PORT is respected.
+func kvExternalTokenizerConfig() string {
+	return fmt.Sprintf(`apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:
 - type: token-producer
   parameters:
     modelName: Qwen/Qwen2.5-1.5B-Instruct
     vllm:
-      url: http://localhost:8000
+      url: http://vllm-render:%s
 - type: precise-prefix-cache-scorer
   parameters:
     tokenProcessorConfig:
-      blockSize: 16
+      blockSizeTokens: 16
       hashSeed: "42"
     kvEventsConfig:
       zmqEndpoint: tcp://0.0.0.0:5557
@@ -240,7 +292,8 @@ schedulingProfiles:
   - pluginRef: max-score-picker
   - pluginRef: precise-prefix-cache-scorer
     weight: 10
-`
+`, vllmRenderPort)
+}
 
 // EPP configuration for running scale model server test
 const scaleConfig = `apiVersion: llm-d.ai/v1alpha1
