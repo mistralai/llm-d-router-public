@@ -29,6 +29,7 @@ import (
 
 const (
 	routingDecisionPreciseKV    = "precise_kv"
+	routingDecisionEndpoint     = "endpoint"
 	routingDecisionVLLMInternal = "vllm_internal"
 	noDataParallelRankLabel     = "none"
 )
@@ -38,7 +39,7 @@ var dpRankRoutingTotal = prometheus.NewCounterVec(
 		Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
 		Name:      "dp_rank_routing_total",
 		Help: metricsutil.HelpMsgWithStability(
-			"Requests routed to a precise-cache-selected data-parallel rank or delegated to the model server's internal router.",
+			"Requests routed to a logical or precise-cache-selected data-parallel rank, or delegated to the model server's internal router.",
 			compbasemetrics.ALPHA,
 		),
 	},

@@ -56,14 +56,18 @@ var (
 )
 
 func TestEndpointMetadataClone(t *testing.T) {
-	clone := expected.Clone()
-	assert.NotSame(t, expected, clone)
-	if diff := cmp.Diff(expected, clone); diff != "" {
+	rank := 3
+	withRank := expected.Clone()
+	withRank.DataParallelRank = &rank
+	clone := withRank.Clone()
+	assert.NotSame(t, withRank, clone)
+	if diff := cmp.Diff(withRank, clone); diff != "" {
 		t.Errorf("Unexpected output (-want +got): %v", diff)
 	}
+	assert.NotSame(t, withRank.DataParallelRank, clone.DataParallelRank)
 
 	clone.Labels["env"] = "staging"
-	assert.Equal(t, "prod", expected.Labels["env"], "mutating clone should not affect original")
+	assert.Equal(t, "prod", withRank.Labels["env"], "mutating clone should not affect original")
 }
 
 func TestEndpointMetadataEqual(t *testing.T) {
@@ -132,6 +136,13 @@ func TestEndpointMetadataEqual(t *testing.T) {
 			name: "rank index",
 			mutate: func(meta *EndpointMetadata) {
 				meta.RankIndex = 2
+			},
+		},
+		{
+			name: "data parallel rank",
+			mutate: func(meta *EndpointMetadata) {
+				rank := 2
+				meta.DataParallelRank = &rank
 			},
 		},
 	}
