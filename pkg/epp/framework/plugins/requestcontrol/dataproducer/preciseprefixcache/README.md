@@ -40,27 +40,44 @@ Set `kvEventsConfig.engineType` to `sglang` for SGLang KV-events. It defaults
 to `vllm` when omitted.
 
 For vLLM Internal or Hybrid LB, where all local DP ranks share one HTTP
-endpoint, set the local rank count under pod discovery:
+endpoint, expose each rank to the scheduler as a logical endpoint:
+
+```yaml
+# Helm values
+router:
+  modelServers:
+    dataParallelSize: 8
+```
+
+The chart renders `--endpoint-data-parallel-size=8`. When running EPP without
+the chart, pass that flag directly. A shared-port deployment must configure
+exactly one target port. Enable pod discovery for KV events and set the base
+publisher port:
 
 ```yaml
 kvEventsConfig:
   discoverPods: true
   podDiscoveryConfig:
     socketPort: 5557
-    dataParallelSize: 8
 ```
 
-The producer creates subscribers for `socketPort` through
-`socketPort + dataParallelSize - 1`, associates every event stream with the
-shared serving endpoint, and exposes the winning rank to pre-request plugins.
-Also configure `dp-rank-header-handler` so the selected rank is sent to vLLM
-through `x-data-parallel-rank`.
+Endpoint discovery creates one schedulable endpoint per `(pod, rank)`, all
+sharing the pod's serving address. The producer creates one subscriber per
+logical endpoint on `socketPort + rank` and keeps precise-cache scores separate
+by rank. Configure `dp-rank-header-handler` so the rank of the selected logical
+endpoint is sent to vLLM through `x-data-parallel-rank`.
 
-For External LB, leave `dataParallelSize` at its default of `1` and do not
-configure `dp-rank-header-handler`. Every rank is already exposed as a separate
-serving endpoint, so endpoint selection addresses the rank directly. The
-producer does not expose a winning rank for header injection unless
-`dataParallelSize` is greater than `1`.
+The legacy configuration without `--endpoint-data-parallel-size` remains
+supported. Set `kvEventsConfig.podDiscoveryConfig.dataParallelSize` greater
+than `1` to make the producer create all rank subscribers from one endpoint per
+pod. It collapses rank scores to that endpoint and exposes the cache-winning
+rank to the header handler. Requests without a precise-cache winner fall back
+to vLLM's internal balancing.
+
+For External LB, leave `--endpoint-data-parallel-size` and the producer's
+`dataParallelSize` at their defaults of `1`, and do not configure
+`dp-rank-header-handler`. Every rank is already exposed as a separate serving
+endpoint, so endpoint selection addresses the rank directly.
 
 The KV-event `data_parallel_rank` must be the rank accepted by
 `x-data-parallel-rank` on that serving endpoint. A wide-EP deployment where
