@@ -85,6 +85,7 @@ type Options struct {
 	//
 	EndpointSelector            labels.Selector // Parsed selector to filter model server pods on. Set via --endpoint-selector flag and parsed in Complete().
 	EndpointTargetPorts         []int           // Target ports of model server pods.
+	EndpointDataParallelSize    int             // Logical ranks per pod when all ranks share one target port.
 	DisableEndpointSubsetFilter bool            // Disables respecting destination endpoint subset metadata in EPP.
 	EmitEndpointScores          bool            // Enables emitting per-endpoint scheduler scores in the request-path dynamic metadata.
 	//
@@ -143,6 +144,7 @@ func NewOptions() *Options {
 		DrainTimeout:                     DefaultDrainTimeout,
 		PoolGroup:                        routing.InferencePoolAPIGroup,
 		EndpointTargetPorts:              []int{},
+		EndpointDataParallelSize:         1,
 		DisableEndpointSubsetFilter:      false,
 		EmitEndpointScores:               false,
 		RefreshMetricsInterval:           MinRefreshMetricsInterval,
@@ -190,6 +192,8 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 			"set-based (e.g., 'env in (prod,staging),tier!=frontend'), and existence (e.g., 'key,!deprecated').")
 	fs.IntSliceVar(&opts.EndpointTargetPorts, "endpoint-target-ports", opts.EndpointTargetPorts, "Target ports of model server pods. "+
 		"Format: a comma-separated list of numbers without whitespace (e.g., '3000,3001,3002').")
+	fs.IntVar(&opts.EndpointDataParallelSize, "endpoint-data-parallel-size", opts.EndpointDataParallelSize,
+		"Number of logical data-parallel rank endpoints per pod when ranks share one serving port.")
 	fs.BoolVar(&opts.DisableEndpointSubsetFilter, "disable-endpoint-subset-filter", opts.DisableEndpointSubsetFilter,
 		"Disables respecting the destination endpoint subset metadata for dispatching requests in EPP.")
 	fs.BoolVar(&opts.EmitEndpointScores, "emit-endpoint-scores", opts.EmitEndpointScores,
@@ -389,6 +393,12 @@ func (opts *Options) Validate() error {
 				return fmt.Errorf("invalid port number %d in %q", port, "endpoint-target-ports")
 			}
 		}
+	}
+	if opts.EndpointDataParallelSize < 1 {
+		return fmt.Errorf("flag %q must be positive", "endpoint-data-parallel-size")
+	}
+	if opts.EndpointSelector != nil && opts.EndpointDataParallelSize > 1 && len(opts.EndpointTargetPorts) != 1 {
+		return fmt.Errorf("flag %q requires exactly one endpoint target port", "endpoint-data-parallel-size")
 	}
 
 	if opts.ConfigText != "" && opts.ConfigFile != "" {

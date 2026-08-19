@@ -372,7 +372,8 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 	}
 
 	ds, err := setupDatastore(ctx, epf, startCrdReconcilers,
-		gknn.Namespace, gknn.Name, opts.EndpointSelector, opts.EndpointTargetPorts)
+		gknn.Namespace, gknn.Name, opts.EndpointSelector, opts.EndpointTargetPorts,
+		opts.EndpointDataParallelSize)
 	if err != nil {
 		setupLog.Error(err, "Failed to setup datastore")
 		return nil, nil, err
@@ -555,17 +556,19 @@ func NewEndpointPoolFromOptions(
 }
 
 func setupDatastore(ctx context.Context, epFactory datalayer.EndpointFactory,
-	startCrdReconcilers bool, namespace, name string, endpointSelector labels.Selector, endpointTargetPorts []int) (datastore.Datastore, error) {
+	startCrdReconcilers bool, namespace, name string, endpointSelector labels.Selector, endpointTargetPorts []int,
+	dataParallelSize int,
+) (datastore.Datastore, error) {
 
 	if startCrdReconcilers {
-		return datastore.NewDatastore(ctx, epFactory), nil
+		return datastore.NewDatastore(ctx, epFactory, datastore.WithDataParallelSize(dataParallelSize)), nil
 	}
 	endpointPool, err := NewEndpointPoolFromOptions(namespace, name, endpointSelector, endpointTargetPorts)
 	if err != nil {
 		setupLog.Error(err, "Failed to construct endpoint pool from options")
 		return nil, err
 	}
-	return datastore.NewDatastore(ctx, epFactory).WithEndpointPool(endpointPool), nil
+	return datastore.NewDatastore(ctx, epFactory, datastore.WithDataParallelSize(dataParallelSize)).WithEndpointPool(endpointPool), nil
 }
 
 // registerInTreePlugins registers the factory functions of all known plugins
