@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	preciseprefixcacheconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/preciseprefixcache/constants"
@@ -126,6 +127,34 @@ func TestPreRequest_SeedsSpeculativeForWinningRank(t *testing.T) {
 	require.Len(t, cached.Value().podEntries, 1)
 	require.NotNil(t, cached.Value().podEntries[0].DataParallelRank)
 	assert.Equal(t, 2, *cached.Value().podEntries[0].DataParallelRank)
+}
+
+func TestPreRequest_SeedsSpeculativeForLogicalEndpointRank(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+
+	var calls []addCall
+	idx := &fakeKVBlockIndex{
+		addFn: func(_ context.Context, _ []kvblock.BlockHash, keys []kvblock.BlockHash, entries []kvblock.PodEntry) error {
+			calls = append(calls, addCall{keys: keys, entries: entries})
+			return nil
+		},
+	}
+	p := newProducerForPreRequest(ctx, true, idx)
+	rank := 3
+	meta := testEndpoints[0].GetMetadata().Clone()
+	meta.DataParallelRank = &rank
+	endpoint := scheduling.NewEndpoint(meta, fwkdl.NewMetrics(), nil)
+
+	req := &scheduling.InferenceRequest{RequestID: "req-pre-logical-dp"}
+	p.pluginState.Write(req.RequestID, blockKeysStateKey,
+		&blockKeysState{perPromptKeys: [][]kvblock.BlockHash{{0xAA}}})
+
+	require.NoError(t, p.PreRequest(ctx, req, primaryOnly(endpoint)))
+
+	require.Len(t, calls, 1)
+	require.Len(t, calls[0].entries, 1)
+	require.NotNil(t, calls[0].entries[0].DataParallelRank)
+	assert.Equal(t, rank, *calls[0].entries[0].DataParallelRank)
 }
 
 // speculativeEnabled=true with empty blockKeys: PreRequest must not call

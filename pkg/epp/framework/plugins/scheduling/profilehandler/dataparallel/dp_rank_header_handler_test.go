@@ -23,8 +23,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	preciseprefixcacheconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/preciseprefixcache/constants"
 )
@@ -64,6 +66,26 @@ func TestDPRankHeaderHandlerPinsSelectedEndpointRank(t *testing.T) {
 
 	assert.Equal(t, "2", headers[routing.DataParallelRankHeader],
 		"the rank of the selected endpoint must be pinned")
+}
+
+func TestDPRankHeaderHandlerPinsLogicalEndpointRank(t *testing.T) {
+	rank := 4
+	endpoint := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
+		ID:               k8stypes.NamespacedName{Namespace: "default", Name: "pod-1-rank-4"},
+		Address:          "10.0.0.1",
+		Port:             DefaultTestPodPort,
+		DataParallelRank: &rank,
+	}, nil, nil)
+	result := &scheduling.SchedulingResult{
+		PrimaryProfileName: dpTestProfile,
+		ProfileResults: map[string]*scheduling.ProfileRunResult{
+			dpTestProfile: {TargetEndpoints: []scheduling.Endpoint{endpoint}},
+		},
+	}
+
+	headers := runDPRankHandler(t, map[string]string{}, nil, result)
+
+	assert.Equal(t, "4", headers[routing.DataParallelRankHeader])
 }
 
 func TestDPRankHeaderHandlerDoesNotPinWithoutSelectedEndpoint(t *testing.T) {

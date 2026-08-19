@@ -456,6 +456,49 @@ func TestProduce_ExternalLBDoesNotExposeWinningRank(t *testing.T) {
 		"External LB must route by endpoint without an x-data-parallel-rank header")
 }
 
+func TestProduce_SharedPortRankEndpointsKeepIndependentScores(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	rank0, rank1 := 0, 1
+	endpoints := []scheduling.Endpoint{
+		scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
+			ID:               k8stypes.NamespacedName{Name: "pod-a-rank-0"},
+			Address:          "10.0.0.1",
+			Port:             "8080",
+			DataParallelRank: &rank0,
+		}, nil, nil),
+		scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
+			ID:               k8stypes.NamespacedName{Name: "pod-a-rank-1"},
+			Address:          "10.0.0.1",
+			Port:             "8080",
+			DataParallelRank: &rank1,
+		}, nil, nil),
+	}
+	const addr = "10.0.0.1:8080"
+	keys := []kvblock.BlockHash{1, 2}
+
+	idx := &fakeKVCacheIndexer{index: &fakeKVBlockIndex{
+		lookup: func(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
+			return map[kvblock.BlockHash][]kvblock.PodEntry{}, nil
+		},
+	}}
+	scorer := &fakeKVBlockScorer{score: func(_ context.Context, _ []kvblock.BlockHash, _ map[kvblock.BlockHash][]kvblock.PodEntry) (map[string]float64, error) {
+		return map[string]float64{addr + "@dp0": 1, addr + "@dp1": 2}, nil
+	}}
+	p := newProducerWithIndexer(ctx, idx, scorer)
+	req := &scheduling.InferenceRequest{RequestID: "req-logical-ranks", Headers: map[string]string{}}
+
+	require.NoError(t, p.produceFromBlockKeys(ctx, trace.SpanFromContext(ctx), req, endpoints,
+		[][]kvblock.BlockHash{keys}, nil))
+
+	for rank, want := range []int{1, 2} {
+		raw, ok := endpoints[rank].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
+		require.True(t, ok)
+		assert.Equal(t, want, raw.(*attrprefix.PrefixCacheMatchInfo).MatchBlocks())
+	}
+	_, ok := scheduling.ReadRequestAttribute[map[string]int](req, preciseprefixcacheconstants.WinningRanksDataKey)
+	assert.False(t, ok, "rank endpoints carry their rank in endpoint metadata")
+}
+
 func TestProduce_CachedBlocksUseWinningRank(t *testing.T) {
 	ctx := utils.NewTestContext(t)
 	endpoints := freshEndpoints()[:1]
