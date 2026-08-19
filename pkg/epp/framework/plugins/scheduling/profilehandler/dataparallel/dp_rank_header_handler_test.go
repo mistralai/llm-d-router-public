@@ -22,8 +22,10 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 )
 
@@ -61,6 +63,26 @@ func TestDPRankHeaderHandlerPinsSelectedEndpointRank(t *testing.T) {
 		"the rank of the selected endpoint must be pinned")
 	assert.NotContains(t, headers, routing.DataParallelWinningRanksHeader,
 		"the internal winning-ranks header must never reach the model server")
+}
+
+func TestDPRankHeaderHandlerPinsLogicalEndpointRank(t *testing.T) {
+	rank := 4
+	endpoint := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
+		ID:               k8stypes.NamespacedName{Namespace: "default", Name: "pod-1-rank-4"},
+		Address:          "10.0.0.1",
+		Port:             DefaultTestPodPort,
+		DataParallelRank: &rank,
+	}, nil, nil)
+	result := &scheduling.SchedulingResult{
+		PrimaryProfileName: dpTestProfile,
+		ProfileResults: map[string]*scheduling.ProfileRunResult{
+			dpTestProfile: {TargetEndpoints: []scheduling.Endpoint{endpoint}},
+		},
+	}
+
+	headers := runDPRankHandler(map[string]string{}, nil, result)
+
+	assert.Equal(t, "4", headers[routing.DataParallelRankHeader])
 }
 
 // TestDPRankHeaderHandlerStripsLegacyInternalHeaderAlways covers the early
