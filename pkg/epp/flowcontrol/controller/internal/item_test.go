@@ -35,12 +35,13 @@ func TestFlowItem_New(t *testing.T) {
 	req := mocks.NewMockFlowControlRequest(100, "req-1", flowcontrol.FlowKey{})
 
 	enqueueTime := time.Now()
-	item := NewItem(req, time.Minute, enqueueTime)
+	item := NewItem(context.Background(), req, time.Minute, enqueueTime)
 
 	require.NotNil(t, item, "NewItem should not return a nil item")
 	assert.Equal(t, enqueueTime, item.EnqueueTime(), "EnqueueTime should be populated")
 	assert.Equal(t, time.Minute, item.EffectiveTTL(), "EffectiveTTL should be populated")
 	assert.Same(t, req, item.OriginalRequest(), "OriginalRequest should be populated")
+	assert.Equal(t, context.Background(), item.lifecycleCtx, "lifecycle context should be populated")
 	assert.Nil(t, item.FinalState(), "a new item must not have a final state")
 	select {
 	case <-item.Done():
@@ -119,7 +120,7 @@ func TestFlowItem_Finalize_Idempotency(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			item := NewItem(req, time.Minute, now)
+			item := NewItem(context.Background(), req, time.Minute, now)
 
 			// First call
 			tc.firstCall(item)
@@ -220,7 +221,7 @@ func TestFlowItem_Finalize_InferOutcome(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			req := mocks.NewMockFlowControlRequest(100, "req-1", flowcontrol.FlowKey{})
-			item := NewItem(req, time.Minute, now)
+			item := NewItem(context.Background(), req, time.Minute, now)
 			if tc.isQueued {
 				item.SetHandle(&mocks.MockQueueItemHandle{})
 			}

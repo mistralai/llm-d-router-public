@@ -27,7 +27,11 @@ The EPP acts as the routing intelligence engine. Its resource usage scales prima
   of the inflight-request sizing above. The global `flowControl.maxRequests` / `maxBytes` caps
   default to unlimited, so set a global `maxBytes` under the container memory limit: at the per-band
   default, a handful of bands clears the sizing guidance below before any band cap engages. Lower
-  these limits (or set a shorter `defaultRequestTTL`) to trade queueing for earlier shedding. A
+  these limits (or set a shorter `defaultRequestTTL`) to trade queueing for earlier shedding. Each
+  `priorityBands` entry and default-band template may set its own `defaultRequestTTL`; omission
+  inherits the global value, while an explicit value replaces it and `0s` makes that band's queue
+  wait unbounded. A request may supply a shorter bound with `x-llm-d-inference-ttl`; invalid and
+  non-positive values are ignored, and a request cannot extend the selected operator bound. A
   `noEndpointRequestTTL` sized for a cold start holds bodies for that whole budget while the pool is
   empty, so the band caps, not the budget, become what bounds queue memory during a scale-from-zero.
 - **Sizing Guidelines**:

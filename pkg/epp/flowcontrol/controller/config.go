@@ -54,13 +54,11 @@ const (
 
 // Config holds the configuration for the `FlowController`.
 type Config struct {
-	// DefaultRequestTTL is the default Time-To-Live applied to requests that do not specify their own
-	// TTL hint. Because the admission adapter does not currently plumb a per-request hint, this value
-	// governs every request entering flow control while the candidate pool has endpoints.
-	// Optional: Defaults to `defaultRequestTTL` (60s). An explicit zero disables eviction in that
-	// regime, and, unless `NoEndpointRequestTTL` overrides it, in the empty-pool regime as well; such
-	// requests are then bounded only by request context cancellation (client disconnect or gateway
-	// timeout).
+	// DefaultRequestTTL is the queue-wait bound inherited by priority bands that do not configure one.
+	// A positive request TTL only applies when it is shorter than the selected operator-configured
+	// bound; a longer value does not extend that bound.
+	// Optional: Defaults to `defaultRequestTTL` (60s). An explicit zero disables eviction while the pool
+	// has endpoints and, unless `NoEndpointRequestTTL` overrides it, while the pool is empty as well.
 	DefaultRequestTTL time.Duration
 
 	// NoEndpointRequestTTL is the queue-wait budget that replaces `DefaultRequestTTL` while the candidate

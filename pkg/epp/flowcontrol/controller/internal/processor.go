@@ -304,6 +304,18 @@ func (p *Processor) enqueue(item *FlowItem) {
 		return
 	}
 
+	if err := item.lifecycleCtx.Err(); err != nil {
+		item.Finalize(context.Cause(item.lifecycleCtx))
+		p.recordDrop(item.FinalState().Outcome)
+		return
+	}
+
+	if ttl := item.EffectiveTTL(); ttl > 0 && !p.clock.Now().Before(item.EnqueueTime().Add(ttl)) {
+		item.Finalize(types.ErrTTLExpired)
+		p.recordDrop(item.FinalState().Outcome)
+		return
+	}
+
 	// --- Configuration Validation ---
 	managedQ, err := p.registry.ManagedQueue(key)
 	if err != nil {

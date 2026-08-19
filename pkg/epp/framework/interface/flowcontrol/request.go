@@ -45,10 +45,8 @@ type FlowControlRequest interface {
 	// ReceivedTimestamp returns the timestamp when the request was received by the server.
 	ReceivedTimestamp() time.Time
 
-	// InitialEffectiveTTL returns the suggested Time-To-Live for this request.
-	// This value is treated as a hint; the `controller.FlowController` may override it based on its own configuration or
-	// policies. A zero value indicates the request has no specific TTL preference, and a system-wide default should be
-	// applied.
+	// InitialEffectiveTTL returns the requested Time-To-Live for this request. The controller applies it
+	// only when positive and clamps it to the selected operator-configured bound.
 	InitialEffectiveTTL() time.Duration
 
 	// ID returns an optional, user-facing unique identifier for this specific request. It is intended for logging,
@@ -116,8 +114,7 @@ type QueueItemAccessor interface {
 	EnqueueTime() time.Time
 
 	// EffectiveTTL is the Time-To-Live assigned to this item by the `controller.FlowController`, taking into account the
-	// request's preference (`FlowControlRequest.InitialEffectiveTTL()`) and any `controller.FlowController` or per-flow
-	// defaults/policies.
+	// request's hint (`FlowControlRequest.InitialEffectiveTTL()`) and the selected operator-configured bound.
 	//
 	// It is the queue-wait budget for the regime in which the candidate pool has endpoints. While the pool has none, the
 	// wait is bounded by a separate controller-level budget that this value does not describe, so an item may outlive it.

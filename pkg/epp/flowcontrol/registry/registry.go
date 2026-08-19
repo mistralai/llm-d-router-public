@@ -376,7 +376,7 @@ func (fr *FlowRegistry) provisionPriorityBandLocked(priority int) {
 	if priority < 0 && fr.config.DefaultNegativePriorityBand != nil {
 		template = fr.config.DefaultNegativePriorityBand
 	}
-	newBand := *template
+	newBand := *clonePriorityBandConfig(template)
 	newBand.Priority = priority
 	fr.config.PriorityBands[priority] = &newBand
 

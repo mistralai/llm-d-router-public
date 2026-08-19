@@ -54,6 +54,7 @@ type FlowItem struct {
 	enqueueTime     time.Time
 	effectiveTTL    time.Duration
 	originalRequest flowcontrol.FlowControlRequest
+	lifecycleCtx    context.Context
 
 	// --- Synchronized State ---
 
@@ -81,11 +82,17 @@ type FlowItem struct {
 var _ flowcontrol.QueueItemAccessor = &FlowItem{}
 
 // NewItem allocates and initializes a new FlowItem for a request lifecycle.
-func NewItem(req flowcontrol.FlowControlRequest, effectiveTTL time.Duration, enqueueTime time.Time) *FlowItem {
+func NewItem(
+	lifecycleCtx context.Context,
+	req flowcontrol.FlowControlRequest,
+	effectiveTTL time.Duration,
+	enqueueTime time.Time,
+) *FlowItem {
 	return &FlowItem{
 		enqueueTime:     enqueueTime,
 		effectiveTTL:    effectiveTTL,
 		originalRequest: req,
+		lifecycleCtx:    lifecycleCtx,
 		done:            make(chan *FinalState, 1),
 	}
 }

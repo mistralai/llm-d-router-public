@@ -198,7 +198,7 @@ func (h *testHarness) waitForFinalization(item *FlowItem) (types.QueueOutcome, e
 func (h *testHarness) newTestItem(id string, key flowcontrol.FlowKey, ttl time.Duration) *FlowItem {
 	h.t.Helper()
 	req := fwkfcmocks.NewMockFlowControlRequest(100, id, key)
-	return NewItem(req, ttl, h.clock.Now())
+	return NewItem(context.Background(), req, ttl, h.clock.Now())
 }
 
 // addQueue centrally registers a new mock queue for a given flow, ensuring all harness components are aware of it.
@@ -574,6 +574,42 @@ func TestProcessor(t *testing.T) {
 		t.Run("enqueue", func(t *testing.T) {
 			t.Parallel()
 			testErr := errors.New("something went wrong")
+
+			t.Run("should reject an item whose TTL expired before admission", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+				q := h.addQueue(testFlow)
+				item := h.newTestItem("req-expired", testFlow, testTTL)
+				h.clock.Step(testTTL)
+
+				h.processor.enqueue(item)
+
+				require.NotNil(t, item.FinalState())
+				assert.Equal(t, types.QueueOutcomeRejectedOther, item.FinalState().Outcome)
+				assert.ErrorIs(t, item.FinalState().Err, types.ErrTTLExpired)
+				assert.Zero(t, q.Len())
+			})
+
+			t.Run("should reject an item whose lifecycle expired while buffered", func(t *testing.T) {
+				t.Parallel()
+				h := newTestHarness(t, testCleanupTick)
+				q := h.addQueue(testFlow)
+				lifecycleCtx, cancel := context.WithCancelCause(context.Background())
+				item := NewItem(
+					lifecycleCtx,
+					fwkfcmocks.NewMockFlowControlRequest(100, "req-parent-expired", testFlow),
+					time.Hour,
+					h.clock.Now(),
+				)
+				cancel(context.DeadlineExceeded)
+
+				h.processor.enqueue(item)
+
+				require.NotNil(t, item.FinalState())
+				assert.Equal(t, types.QueueOutcomeRejectedOther, item.FinalState().Outcome)
+				assert.ErrorIs(t, item.FinalState().Err, types.ErrTTLExpired)
+				assert.Zero(t, q.Len())
+			})
 
 			testCases := []struct {
 				name         string
@@ -1690,7 +1726,7 @@ func TestProcessor_QueueWaitBudget(t *testing.T) {
 					regimeSince = base.Add(tc.regimeAfter)
 				}
 
-				item := NewItem(fwkfcmocks.NewMockFlowControlRequest(100, "req-budget", testFlow), itemTTL, base)
+				item := NewItem(context.Background(), fwkfcmocks.NewMockFlowControlRequest(100, "req-budget", testFlow), itemTTL, base)
 				regime := &regimeSample{empty: tc.poolEmpty, since: regimeSince}
 				outcome, expired := isExpired(item, base.Add(tc.elapsed), regime, noEndpoint)
 
