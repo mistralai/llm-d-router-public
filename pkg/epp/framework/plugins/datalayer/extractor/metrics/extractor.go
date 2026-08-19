@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -50,6 +51,7 @@ const (
 
 	CacheConfigBlockSizeInfoMetricName = "block_size"
 	CacheConfigNumGPUBlocksMetricName  = "num_gpu_blocks"
+	dataParallelEngineLabel            = "engine"
 )
 
 // Extractor implements the metrics extraction based on the model
@@ -126,7 +128,7 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 	updated := false
 
 	if spec := mapping.TotalQueuedRequests; spec != nil { // extract queued requests
-		if metric, err := spec.getLatestMetric(families); err != nil {
+		if metric, err := getLatestMetricForEndpoint(spec, families, ep); err != nil {
 			errs = append(errs, err)
 		} else {
 			clone.WaitingQueueSize = int(extractValue(metric))
@@ -135,7 +137,7 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 	}
 
 	if spec := mapping.TotalRunningRequests; spec != nil { // extract running requests
-		if metric, err := spec.getLatestMetric(families); err != nil {
+		if metric, err := getLatestMetricForEndpoint(spec, families, ep); err != nil {
 			errs = append(errs, err)
 		} else {
 			clone.RunningRequestsSize = int(extractValue(metric))
@@ -144,7 +146,7 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 	}
 
 	if spec := mapping.KVCacheUtilization; spec != nil { // extract KV cache usage
-		if metric, err := spec.getLatestMetric(families); err != nil {
+		if metric, err := getLatestMetricForEndpoint(spec, families, ep); err != nil {
 			errs = append(errs, err)
 		} else {
 			clone.KVCacheUsagePercent = extractValue(metric)
@@ -196,7 +198,7 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 	}
 
 	for _, custom := range mapping.CustomMetrics {
-		metric, err := custom.Spec.getLatestMetric(families)
+		metric, err := getLatestMetricForEndpoint(custom.Spec, families, ep)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("custom metric %q: %w", custom.AttributeKey, err))
 			continue
@@ -224,6 +226,21 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 		return errors.Join(errs...)
 	}
 	return nil
+}
+
+func getLatestMetricForEndpoint(spec *Spec, families sourcemetrics.PrometheusMetricMap,
+	ep fwkdl.Endpoint,
+) (*dto.Metric, error) {
+	meta := ep.GetMetadata()
+	if meta == nil || meta.DataParallelRank == nil {
+		return spec.getLatestMetric(families)
+	}
+	labels := maps.Clone(spec.Labels)
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[dataParallelEngineLabel] = strconv.Itoa(*meta.DataParallelRank)
+	return (&Spec{Name: spec.Name, Labels: labels}).getLatestMetric(families)
 }
 
 // getEngineTypeFromEndpoint extracts the engine type from endpoint metadata labels.

@@ -285,6 +285,37 @@ func TestProducer_EnsureSubscriber_SharedPortPassesRankAndReplayEndpoints(t *tes
 	assert.Equal(t, 1, *subscribers.dataParallelRanks[1])
 }
 
+func TestProducer_EnsureSubscriber_SharedPortRankEndpointPassesMetadataRank(t *testing.T) {
+	cfg := kvevents.DefaultConfig()
+	cfg.DiscoverPods = true
+	cfg.PodDiscoveryConfig = kvevents.DefaultPodReconcilerConfig()
+	cfg.PodDiscoveryConfig.SocketPort = 5557
+
+	subscribers := &fakeSubscriberManager{}
+	p := &Producer{
+		typedName:          plugin.TypedName{Type: PluginType, Name: PluginType},
+		subscribersManager: subscribers,
+		kvEventsConfig:     cfg,
+		subscriberCtx:      context.Background(),
+	}
+	rank := 3
+
+	require.NoError(t, p.ensureSubscriber(context.Background(), &fwkdl.EndpointMetadata{
+		ID:               k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a-rank-3"},
+		Address:          "10.0.0.1",
+		Port:             "8000",
+		RankIndex:        rank,
+		DataParallelRank: &rank,
+	}))
+
+	assert.Equal(t, []string{"ns/pod-a-rank-3"}, subscribers.ids)
+	assert.Equal(t, []string{"10.0.0.1:8000"}, subscribers.sourceEndpoints)
+	assert.Equal(t, []string{"tcp://10.0.0.1:5560"}, subscribers.endpoints)
+	require.Len(t, subscribers.dataParallelRanks, 1)
+	require.NotNil(t, subscribers.dataParallelRanks[0])
+	assert.Equal(t, rank, *subscribers.dataParallelRanks[0])
+}
+
 // RankIndex=0 must dial the base SocketPort unchanged.
 func TestProducer_ExtractEndpoint_SingleRankUsesBaseSocketPort(t *testing.T) {
 	ctx := discardCtx(t)

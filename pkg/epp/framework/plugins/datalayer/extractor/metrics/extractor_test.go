@@ -42,6 +42,35 @@ const (
 	customMetricsConfigKey              = "customMetrics"
 )
 
+func TestGetLatestMetricForSharedPortRankEndpoint(t *testing.T) {
+	rank := 1
+	ep := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{DataParallelRank: &rank}, nil)
+	spec := &Spec{Name: defaultTotalRunningRequestsMetric}
+	families := sourcemetrics.PrometheusMetricMap{
+		defaultTotalRunningRequestsMetric: {
+			Type: dto.MetricType_GAUGE.Enum(),
+			Metric: []*dto.Metric{
+				{
+					Label: []*dto.LabelPair{{Name: proto.String("engine"), Value: proto.String("0")}},
+					Gauge: &dto.Gauge{Value: ptr.To(2.0)},
+				},
+				{
+					Label: []*dto.LabelPair{{Name: proto.String("engine"), Value: proto.String("1")}},
+					Gauge: &dto.Gauge{Value: ptr.To(7.0)},
+				},
+			},
+		},
+	}
+
+	metric, err := getLatestMetricForEndpoint(spec, families, ep)
+	if err != nil {
+		t.Fatalf("getLatestMetricForEndpoint: %v", err)
+	}
+	if got := extractValue(metric); got != 7 {
+		t.Fatalf("selected metric = %v, want 7", got)
+	}
+}
+
 func TestExtractorExtract(t *testing.T) {
 	ctx := context.Background()
 

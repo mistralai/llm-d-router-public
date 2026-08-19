@@ -112,18 +112,34 @@ type Datastore interface {
 // compile-time type assertion
 var _ Datastore = &datastore{}
 
-// NewDatastore creates a new data store.
-func NewDatastore(parentCtx context.Context, epFactory datalayer.EndpointFactory) Datastore {
-	// Initialize with defaults
-	return &datastore{
-		parentCtx:     parentCtx,
-		pool:          nil,
-		mu:            sync.RWMutex{},
-		objectives:    make(map[string]*v1alpha2.InferenceObjective),
-		modelRewrites: newModelRewriteStore(),
-		pods:          &sync.Map{},
-		epf:           epFactory,
+// Option configures the datastore.
+type Option func(*datastore)
+
+// WithDataParallelSize expands each pod behind one shared target port into
+// one logical endpoint per data-parallel rank.
+func WithDataParallelSize(size int) Option {
+	return func(ds *datastore) {
+		ds.dataParallelSize = size
 	}
+}
+
+// NewDatastore creates a new data store.
+func NewDatastore(parentCtx context.Context, epFactory datalayer.EndpointFactory, opts ...Option) Datastore {
+	// Initialize with defaults
+	ds := &datastore{
+		parentCtx:        parentCtx,
+		pool:             nil,
+		mu:               sync.RWMutex{},
+		objectives:       make(map[string]*v1alpha2.InferenceObjective),
+		modelRewrites:    newModelRewriteStore(),
+		pods:             &sync.Map{},
+		epf:              epFactory,
+		dataParallelSize: 1,
+	}
+	for _, opt := range opts {
+		opt(ds)
+	}
+	return ds
 }
 
 type datastore struct {
@@ -139,6 +155,9 @@ type datastore struct {
 	// key: types.NamespacedName, value: fwkdl.Endpoint
 	pods *sync.Map
 	epf  datalayer.EndpointFactory
+	// dataParallelSize is greater than one only for shared-port data
+	// parallelism, where every rank is a logical scheduling endpoint.
+	dataParallelSize int
 	// needsResync forces the next PoolSet to run podResyncAll even when the pool is unchanged.
 	// PoolSet stores the pool before resyncing, so without this flag a PoolSet retried after a
 	// resync failure would compare the incoming pool against the already-stored identical pool
@@ -170,6 +189,9 @@ func (ds *datastore) PoolSet(ctx context.Context, reader client.Reader, endpoint
 	if endpointPool == nil {
 		ds.Clear()
 		return nil
+	}
+	if err := ds.validateEndpointPool(endpointPool); err != nil {
+		return err
 	}
 	logger := log.FromContext(ctx)
 	ds.mu.Lock()
@@ -323,27 +345,50 @@ func (ds *datastore) podUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.P
 	if pool == nil {
 		return nil
 	}
+	if err := ds.validateEndpointPool(pool); err != nil {
+		return err
+	}
 
 	labels := make(map[string]string, len(pod.GetLabels()))
 	maps.Copy(labels, pod.GetLabels())
 
 	pods := []*fwkdl.EndpointMetadata{}
 	activePorts := extractActivePorts(pod, pool.TargetPorts)
-	for idx, port := range pool.TargetPorts {
-		if !activePorts.Has(port) {
-			continue
+	if ds.dataParallelSize > 1 {
+		port := pool.TargetPorts[0]
+		if activePorts.Has(port) {
+			for rank := range ds.dataParallelSize {
+				rankValue := rank
+				pods = append(pods, &fwkdl.EndpointMetadata{
+					ID:               createEndpointNamespacedName(pod, rank),
+					Name:             pod.Name,
+					Address:          pod.Status.PodIP,
+					NodeAddress:      pod.Status.HostIP,
+					Port:             strconv.Itoa(port),
+					MetricsHost:      net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(port)),
+					Labels:           labels,
+					RankIndex:        rank,
+					DataParallelRank: &rankValue,
+				})
+			}
 		}
-		pods = append(pods,
-			&fwkdl.EndpointMetadata{
-				ID:          createEndpointNamespacedName(pod, idx),
-				Name:        pod.Name,
-				Address:     pod.Status.PodIP,
-				NodeAddress: pod.Status.HostIP,
-				Port:        strconv.Itoa(port),
-				MetricsHost: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(port)),
-				Labels:      labels,
-				RankIndex:   idx,
-			})
+	} else {
+		for idx, port := range pool.TargetPorts {
+			if !activePorts.Has(port) {
+				continue
+			}
+			pods = append(pods,
+				&fwkdl.EndpointMetadata{
+					ID:          createEndpointNamespacedName(pod, idx),
+					Name:        pod.Name,
+					Address:     pod.Status.PodIP,
+					NodeAddress: pod.Status.HostIP,
+					Port:        strconv.Itoa(port),
+					MetricsHost: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(port)),
+					Labels:      labels,
+					RankIndex:   idx,
+				})
+		}
 	}
 
 	if len(pods) == 0 {
@@ -376,14 +421,14 @@ func (ds *datastore) podUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.P
 	}
 
 	// remove endpoints that are no longer active in the pool
-	for idx, port := range pool.TargetPorts {
+	for rank := range ds.endpointCount(pool) {
+		port := pool.TargetPorts[min(rank, len(pool.TargetPorts)-1)]
 		if activePorts.Has(port) {
 			continue
 		}
 
-		namespacedName := createEndpointNamespacedName(pod, idx)
-		if ep, ok := ds.pods.Load(namespacedName); ok {
-			ds.pods.Delete(namespacedName)
+		namespacedName := createEndpointNamespacedName(pod, rank)
+		if ep, ok := ds.pods.LoadAndDelete(namespacedName); ok {
 			ds.epf.ReleaseEndpoint(ep.(fwkdl.Endpoint))
 		}
 	}
@@ -468,8 +513,8 @@ func (ds *datastore) podResyncAll(ctx context.Context, reader client.Reader) err
 			continue
 		}
 		// Calculate expected endpoint names based on current targetPorts.
-		for idx := range ds.pool.TargetPorts {
-			activeEndpoints.Insert(createEndpointNamespacedName(&pod, idx))
+		for rank := range ds.endpointCount(ds.pool) {
+			activeEndpoints.Insert(createEndpointNamespacedName(&pod, rank))
 		}
 		if err := ds.podUpdateOrAddIfNotExist(ctx, &pod, ds.pool); err != nil {
 			// Propagate so PoolSet fails; needsResync makes the retried PoolSet resync again.
@@ -490,6 +535,23 @@ func (ds *datastore) podResyncAll(ctx context.Context, reader client.Reader) err
 	})
 
 	return errors.Join(errs...)
+}
+
+func (ds *datastore) endpointCount(pool *datalayer.EndpointPool) int {
+	if ds.dataParallelSize > 1 {
+		return ds.dataParallelSize
+	}
+	return len(pool.TargetPorts)
+}
+
+func (ds *datastore) validateEndpointPool(pool *datalayer.EndpointPool) error {
+	if ds.dataParallelSize < 1 {
+		return fmt.Errorf("data-parallel size must be positive, got %d", ds.dataParallelSize)
+	}
+	if ds.dataParallelSize > 1 && len(pool.TargetPorts) != 1 {
+		return fmt.Errorf("shared-port data parallelism requires exactly one target port, got %d", len(pool.TargetPorts))
+	}
+	return nil
 }
 
 // extractActivePorts extracts the active ports from a pod's annotations.

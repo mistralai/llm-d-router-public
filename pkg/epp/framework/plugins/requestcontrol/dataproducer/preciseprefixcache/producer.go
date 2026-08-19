@@ -373,10 +373,12 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		lookups = append(lookups, promptLookup{keys: blockKeys, keyToPods: keyToPods})
 	}
 
-	// Scores must be summed per rank before collapsing because one rank serves
-	// every prompt in the request.
+	// Legacy shared-port discovery exposes one endpoint per pod, so collapse
+	// its rank scores after summing prompts. Logical rank endpoints consume the
+	// rank-qualified scores directly and stay independent through scheduling.
 	aggregatedScores, winningRanks := kvcache.CollapseDPScoresToPods(aggregatedRankScores)
-	if request != nil && len(winningRanks) > 0 && p.sharedPortDataParallelEnabled() {
+	if request != nil && len(winningRanks) > 0 && p.sharedPortDataParallelEnabled() &&
+		!hasLogicalRankEndpoints(endpoints) {
 		request.PutAttribute(preciseprefixcacheconstants.WinningRanksDataKey, winningRanks)
 	}
 
@@ -387,14 +389,22 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 			continue
 		}
 		addr := fmt.Sprintf("%s:%s", md.Address, md.Port)
+		winningRank := routing.NoDataParallelRank
 		matchLen := int(aggregatedScores[addr])
+		if md.DataParallelRank != nil {
+			winningRank = *md.DataParallelRank
+			rankKey, err := routing.BuildDPScoringKey(addr, winningRank)
+			if err != nil {
+				return fmt.Errorf("build score key for endpoint %q: %w", md.ID, err)
+			}
+			matchLen = int(aggregatedRankScores[rankKey])
+		}
 		if matchLen > maxMatch {
 			maxMatch = matchLen
 		}
 		cachedBlocks := 0
 		cachedBlocksByTier := map[string]int{}
-		winningRank := routing.NoDataParallelRank
-		if rank, ok := winningRanks[addr]; ok {
+		if rank, ok := winningRanks[addr]; ok && md.DataParallelRank == nil {
 			winningRank = rank
 		}
 		for _, lu := range lookups {
@@ -425,6 +435,15 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	logger.V(logging.TRACE).Info("Produce completed",
 		"blockKeys", totalBlocks, "scores", aggregatedScores)
 	return nil
+}
+
+func hasLogicalRankEndpoints(endpoints []scheduling.Endpoint) bool {
+	for _, endpoint := range endpoints {
+		if meta := endpoint.GetMetadata(); meta != nil && meta.DataParallelRank != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Producer) sharedPortDataParallelEnabled() bool {

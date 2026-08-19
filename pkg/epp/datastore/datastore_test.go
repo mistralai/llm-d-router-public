@@ -19,6 +19,7 @@ package datastore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"reflect"
 	"strconv"
@@ -841,6 +842,44 @@ func TestEndpointMetadata(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestSharedPortDataParallelExpandsPodIntoRankEndpoints(t *testing.T) {
+	ctx := context.Background()
+	ds := NewDatastore(ctx, &mockEndpointFactory{}, WithDataParallelSize(3)).WithEndpointPool(&datalayer.EndpointPool{
+		Selector:    labels.Everything(),
+		TargetPorts: []int{8000},
+	})
+
+	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1))
+	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod2))
+
+	endpoints := ds.PodList(AllPodsPredicate)
+	require.Len(t, endpoints, 6)
+	byName := make(map[string]*fwkdl.EndpointMetadata, len(endpoints))
+	for _, endpoint := range endpoints {
+		byName[endpoint.GetMetadata().ID.Name] = endpoint.GetMetadata()
+	}
+
+	for _, pod := range []*corev1.Pod{pod1, pod2} {
+		for rank := range 3 {
+			meta := byName[fmt.Sprintf("%s-rank-%d", pod.Name, rank)]
+			require.NotNil(t, meta)
+			assert.Equal(t, pod.Status.PodIP, meta.Address)
+			assert.Equal(t, "8000", meta.Port)
+			require.NotNil(t, meta.DataParallelRank)
+			assert.Equal(t, rank, *meta.DataParallelRank)
+		}
+	}
+}
+
+func TestSharedPortDataParallelRejectsMultipleTargetPorts(t *testing.T) {
+	ds := NewDatastore(t.Context(), &mockEndpointFactory{}, WithDataParallelSize(3))
+	err := ds.PoolSet(t.Context(), fake.NewFakeClient(), &datalayer.EndpointPool{
+		Selector:    labels.Everything(),
+		TargetPorts: []int{8000, 8001},
+	})
+	require.ErrorContains(t, err, "requires exactly one target port")
 }
 
 func TestActivePortFiltering(t *testing.T) {
