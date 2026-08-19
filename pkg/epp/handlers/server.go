@@ -737,6 +737,15 @@ func (r *RequestContext) updateStateAndSendIfNeeded(srv extProcPb.ExternalProces
 		r.RequestRunning = true
 		// Dump the response so a new stream message can begin
 		r.reqBodyResp = nil
+		// Release the raw request body. The bytes have already been chunked
+		// into reqBodyResp (as slice headers into the same backing array) and
+		// sent to Envoy. Nothing in the request lifecycle reads RawBody past
+		// this point — all subsequent phases (scheduling result, response
+		// header/body plugins) operate on SchedulingRequest.Body, which is a
+		// separate parsed representation. For multimodal requests this frees
+		// the raw image bytes (often tens of MB) for the full inference wait
+		// (60-700s) instead of retaining them on reqCtx until the stream ends.
+		r.Request.RawBody = nil
 	}
 	if r.RequestState == BodyRequestResponsesComplete && r.reqTrailerResp != nil {
 		// Trailers in requests are not guaranteed
