@@ -55,7 +55,14 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 			p.subscribersManager.RemoveSubscriber(ctx, subscriberID)
 		}
 		if meta.Address != "" {
-			if err := p.kvCacheIndexer.KVBlockIndex().Clear(ctx, fmt.Sprintf("%s:%s", meta.Address, meta.Port)); err != nil {
+			podIdentifier := fmt.Sprintf("%s:%s", meta.Address, meta.Port)
+			var err error
+			if meta.DataParallelRank != nil {
+				err = p.kvCacheIndexer.KVBlockIndex().ClearRank(ctx, podIdentifier, *meta.DataParallelRank)
+			} else {
+				err = p.kvCacheIndexer.KVBlockIndex().Clear(ctx, podIdentifier)
+			}
+			if err != nil {
 				logger.Error(err, "Failed to clear index entries for removed endpoint",
 					"endpoint", endpointKey, "address", meta.Address, "port", meta.Port)
 			}
@@ -93,6 +100,9 @@ func (p *Producer) ensureSubscriber(ctx context.Context, meta *fwkdl.EndpointMet
 }
 
 func (p *Producer) subscriberRanks(meta *fwkdl.EndpointMetadata) []int {
+	if meta.DataParallelRank != nil {
+		return []int{*meta.DataParallelRank}
+	}
 	size := p.kvEventsConfig.PodDiscoveryConfig.DataParallelSize
 	if size <= 1 {
 		return []int{meta.GetRankIndex()}

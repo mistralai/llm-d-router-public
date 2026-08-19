@@ -3,18 +3,20 @@
 # This is epp-precise-prefix-cache-config.yaml plus dp-rank-header-handler.
 # Use it for vLLM's Internal LB and Hybrid LB modes, where the ranks of a pod
 # sit behind a single HTTP port and there is no per-rank endpoint to route to.
-# The scheduler picks a pod, then dp-rank-header-handler pins the request to
-# the rank holding the best prefix match by setting x-data-parallel-rank,
-# bypassing vLLM's internal queue-based balancing.
+# Run EPP with --endpoint-data-parallel-size=8 so endpoint discovery exposes
+# every (pod, rank) pair to the scheduler. With the Helm chart, set
+# router.modelServers.dataParallelSize=8 instead. The scheduler picks one
+# logical endpoint, then dp-rank-header-handler pins the request to its rank by
+# setting x-data-parallel-rank, bypassing vLLM's internal queue-based balancing.
 #
 # For External LB, where each rank is its own endpoint on its own port, use
 # dp-epp-config.yaml instead. Do not configure dp-rank-header-handler there;
 # External LB routes to the rank-specific endpoint directly.
 #
-# Ranks are learned from KV events, so this requires the precise producer --
-# the approximate prefix cache does not track which rank cached a block. Note
-# that vLLM offsets its ZMQ publisher port by the rank (base port + N), so each
-# rank still publishes on its own socket even though they share an HTTP port.
+# Precise cache state is learned per rank from KV events. vLLM offsets its ZMQ
+# publisher port by the rank (base port + N), so each rank publishes on its own
+# socket even though all ranks share one HTTP port. The logical endpoint rank
+# selects the corresponding socket.
 apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:
@@ -36,7 +38,6 @@ plugins:
         discoverPods: true
         podDiscoveryConfig:
           socketPort: 5557
-          dataParallelSize: 8       # set to the number of local ranks behind the shared HTTP port
       indexerConfig:
         kvBlockIndexConfig:
           enableMetrics: true       # enable kv-block index metrics (prometheus)
