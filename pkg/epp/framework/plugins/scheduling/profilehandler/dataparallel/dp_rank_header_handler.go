@@ -35,7 +35,12 @@ const DPRankHeaderHandlerType = "dp-rank-header-handler"
 var _ requestcontrol.PreRequest = &DPRankHeaderHandler{}
 
 // DPRankHeaderHandlerFactory defines the factory function for the DPRankHeaderHandler.
-func DPRankHeaderHandlerFactory(name string, _ *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {
+func DPRankHeaderHandlerFactory(name string, _ *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
+	if handle != nil {
+		if err := registerDPRankMetrics(handle.Metrics()); err != nil {
+			return nil, err
+		}
+	}
 	return NewDPRankHeaderHandler().WithName(name), nil
 }
 
@@ -87,14 +92,14 @@ func (p *DPRankHeaderHandler) PreRequest(_ context.Context, request *scheduling.
 	if schedulingResult == nil {
 		return nil
 	}
+	endpoint := selectedEndpoint(schedulingResult)
+	if endpoint == nil {
+		return nil
+	}
 	ranks, present := scheduling.ReadRequestAttribute[map[string]int](
 		request, preciseprefixcacheconstants.WinningRanksDataKey)
 	if !present {
-		return nil
-	}
-
-	endpoint := selectedEndpoint(schedulingResult)
-	if endpoint == nil {
+		recordDPRankRoutingDecision(p.typedName.Name, routingDecisionVLLMInternal, noDataParallelRankLabel)
 		return nil
 	}
 
@@ -104,10 +109,12 @@ func (p *DPRankHeaderHandler) PreRequest(_ context.Context, request *scheduling.
 	address := fmt.Sprintf("%s:%s", endpoint.Address, endpoint.Port)
 	rank, found := ranks[address]
 	if !found || rank < 0 {
+		recordDPRankRoutingDecision(p.typedName.Name, routingDecisionVLLMInternal, noDataParallelRankLabel)
 		return nil
 	}
 
 	request.Headers[routing.DataParallelRankHeader] = strconv.Itoa(rank)
+	recordDPRankRoutingDecision(p.typedName.Name, routingDecisionPreciseKV, strconv.Itoa(rank))
 	return nil
 }
 
