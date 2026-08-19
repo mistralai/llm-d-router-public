@@ -129,6 +129,10 @@ spec:
               - --pool-group
               - "inference.networking.k8s.io"
           {{- end }}
+          {{- if gt (.Values.router.modelServers.dataParallelSize | default 1 | int) 1 }}
+              - --endpoint-data-parallel-size
+              - {{ .Values.router.modelServers.dataParallelSize | quote }}
+          {{- end }}
               - --zap-encoder
               - "json"
               - --config-file

@@ -132,6 +132,51 @@ func TestEndpointTargetPorts(t *testing.T) {
 	}
 }
 
+func TestEndpointDataParallelSize(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantSize  int
+		wantError bool
+	}{
+		{
+			name:     "shared port",
+			args:     []string{"--endpoint-target-ports", "8080", "--endpoint-data-parallel-size", "8"},
+			wantSize: 8,
+		},
+		{
+			name:      "multiple ports rejected",
+			args:      []string{"--endpoint-target-ports", "8080,8081", "--endpoint-data-parallel-size", "8"},
+			wantSize:  8,
+			wantError: true,
+		},
+		{
+			name:      "zero rejected",
+			args:      []string{"--endpoint-target-ports", "8080", "--endpoint-data-parallel-size", "0"},
+			wantSize:  0,
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := pflag.NewFlagSet(tt.name, pflag.ContinueOnError)
+			opts := NewOptions()
+			opts.AddFlags(fs)
+			args := append([]string{"--endpoint-selector", "app=vllm", "--config-file", testConfigFile}, tt.args...)
+			require.NoError(t, fs.Parse(args))
+			require.NoError(t, opts.Complete())
+			err := opts.Validate()
+			if tt.wantError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tt.wantSize, opts.EndpointDataParallelSize)
+		})
+	}
+}
+
 func TestGRPCFlags(t *testing.T) {
 	tests := []struct {
 		name                string

@@ -48,17 +48,17 @@ func NewDPRankHeaderHandler() *DPRankHeaderHandler {
 	return &DPRankHeaderHandler{typedName: plugin.TypedName{Type: DPRankHeaderHandlerType}}
 }
 
-// DPRankHeaderHandler pins a request to the data-parallel rank that holds the
-// best prefix match on the endpoint scheduling selected.
+// DPRankHeaderHandler pins a request to the selected logical data-parallel
+// endpoint's rank.
 //
 // It exists for vLLM's Internal and Hybrid LB modes, where every rank sits
 // behind one shared HTTP port and there is no rank-specific endpoint to route
 // to. The x-data-parallel-rank header is the only way to bypass vLLM's internal
 // queue-based balancing and reach the rank that already holds the KV blocks.
 //
-// Configure it only with a precise prefix cache producer using shared-port
-// data parallelism. Under External LB, each rank is already a separate endpoint
-// and must be addressed by that endpoint rather than this header.
+// Legacy shared-port discovery can also supply a precise-cache winning rank
+// through request attributes. Under External LB, each rank is addressed by a
+// distinct network endpoint and carries no DataParallelRank metadata.
 type DPRankHeaderHandler struct {
 	typedName plugin.TypedName
 }
@@ -74,8 +74,8 @@ func (p *DPRankHeaderHandler) WithName(name string) *DPRankHeaderHandler {
 	return p
 }
 
-// PreRequest translates the winning ranks recorded during scoring into an
-// x-data-parallel-rank header for the selected endpoint.
+// PreRequest writes the selected logical endpoint's rank, or the legacy
+// precise-cache winning rank, to x-data-parallel-rank.
 func (p *DPRankHeaderHandler) PreRequest(_ context.Context, request *scheduling.InferenceRequest,
 	schedulingResult *scheduling.SchedulingResult,
 ) {
@@ -85,7 +85,8 @@ func (p *DPRankHeaderHandler) PreRequest(_ context.Context, request *scheduling.
 	if request.Headers == nil {
 		request.Headers = make(map[string]string)
 	}
-	// Strip values from clients and older router versions before forwarding.
+	// A client cannot choose a rank and bypass EPP placement. Strip the legacy
+	// internal header too so it can never leak to the model server.
 	delete(request.Headers, routing.DataParallelWinningRanksHeader)
 	delete(request.Headers, routing.DataParallelRankHeader)
 
@@ -94,6 +95,12 @@ func (p *DPRankHeaderHandler) PreRequest(_ context.Context, request *scheduling.
 	}
 	endpoint := selectedEndpoint(schedulingResult)
 	if endpoint == nil {
+		return
+	}
+	if endpoint.DataParallelRank != nil && *endpoint.DataParallelRank >= 0 {
+		rank := *endpoint.DataParallelRank
+		request.Headers[routing.DataParallelRankHeader] = strconv.Itoa(rank)
+		recordDPRankRoutingDecision(p.typedName.Name, routingDecisionEndpoint, strconv.Itoa(rank))
 		return
 	}
 	ranks, present := scheduling.ReadRequestAttribute[map[string]int](
