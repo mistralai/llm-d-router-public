@@ -47,11 +47,15 @@ Pins a request to the selected logical endpoint's rank by setting
 `x-data-parallel-rank` after endpoint selection. This is for vLLM Internal and
 Hybrid LB deployments where multiple local ranks share one serving endpoint.
 
-Configure EPP with `--endpoint-data-parallel-size` greater than `1`, or set the
-equivalent Helm value `router.modelServers.dataParallelSize`. This makes each
-`(pod, rank)` independently schedulable while retaining the pod's shared
-serving address. The handler pins every request to the rank selected by the
-normal scheduling pipeline.
+When this handler is configured, EPP detects each pod's local rank count from
+the `engine` labels on `vllm:num_requests_running`. This makes each `(pod,
+rank)` independently schedulable while retaining the pod's shared serving
+address. Pods with different rank counts can share one InferencePool.
+
+`--endpoint-data-parallel-size`, or the equivalent Helm value
+`router.modelServers.dataParallelSize`, provides a fallback when metrics do not
+expose the rank count. The handler pins every request to the rank selected by
+the normal scheduling pipeline.
 
 When precise prefix cache routing is enabled, logical endpoint metadata also
 selects each rank's KV-event socket. The producer's
@@ -63,7 +67,7 @@ LB; each rank is already a separate network endpoint there.
 # Helm values
 router:
   modelServers:
-    dataParallelSize: 8
+    dataParallelSize: 8 # optional fallback
 
 # EndpointPickerConfig
 plugins:

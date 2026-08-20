@@ -77,6 +77,16 @@ func TestResolveDiscovery_NotEndpointDiscovery(t *testing.T) {
 	assert.ErrorContains(t, err, "EndpointDiscovery")
 }
 
+func TestHasPluginType(t *testing.T) {
+	assert.False(t, hasPluginType(nil, "wanted"))
+	assert.False(t, hasPluginType(&configapi.EndpointPickerConfig{
+		Plugins: []configapi.PluginSpec{{Type: "other"}},
+	}, "wanted"))
+	assert.True(t, hasPluginType(&configapi.EndpointPickerConfig{
+		Plugins: []configapi.PluginSpec{{Type: "other"}, {Type: "wanted"}},
+	}, "wanted"))
+}
+
 type notDiscoveryPlugin struct{}
 
 func (p *notDiscoveryPlugin) TypedName() fwkplugin.TypedName {
