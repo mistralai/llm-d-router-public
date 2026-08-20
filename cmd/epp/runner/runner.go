@@ -371,9 +371,16 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 		return nil, nil, err
 	}
 
+	var dataParallelSizeDetector datastore.DataParallelSizeDetector
+	if hasPluginType(rawConfig, dataparallel.DPRankHeaderHandlerType) {
+		dataParallelSizeDetector, err = sourcemetrics.NewDataParallelSizeDetector(opts.TotalRunningRequestsMetric)
+		if err != nil {
+			return nil, nil, fmt.Errorf("create data-parallel size detector: %w", err)
+		}
+	}
 	ds, err := setupDatastore(ctx, epf, startCrdReconcilers,
 		gknn.Namespace, gknn.Name, opts.EndpointSelector, opts.EndpointTargetPorts,
-		opts.EndpointDataParallelSize)
+		opts.EndpointDataParallelSize, dataParallelSizeDetector)
 	if err != nil {
 		setupLog.Error(err, "Failed to setup datastore")
 		return nil, nil, err
@@ -557,18 +564,36 @@ func NewEndpointPoolFromOptions(
 
 func setupDatastore(ctx context.Context, epFactory datalayer.EndpointFactory,
 	startCrdReconcilers bool, namespace, name string, endpointSelector labels.Selector, endpointTargetPorts []int,
-	dataParallelSize int,
+	dataParallelSize int, dataParallelSizeDetector datastore.DataParallelSizeDetector,
 ) (datastore.Datastore, error) {
+	datastoreOptions := []datastore.Option{
+		datastore.WithDataParallelSize(dataParallelSize),
+	}
+	if dataParallelSizeDetector != nil {
+		datastoreOptions = append(datastoreOptions, datastore.WithDataParallelSizeDetector(dataParallelSizeDetector))
+	}
 
 	if startCrdReconcilers {
-		return datastore.NewDatastore(ctx, epFactory, datastore.WithDataParallelSize(dataParallelSize)), nil
+		return datastore.NewDatastore(ctx, epFactory, datastoreOptions...), nil
 	}
 	endpointPool, err := NewEndpointPoolFromOptions(namespace, name, endpointSelector, endpointTargetPorts)
 	if err != nil {
 		setupLog.Error(err, "Failed to construct endpoint pool from options")
 		return nil, err
 	}
-	return datastore.NewDatastore(ctx, epFactory, datastore.WithDataParallelSize(dataParallelSize)).WithEndpointPool(endpointPool), nil
+	return datastore.NewDatastore(ctx, epFactory, datastoreOptions...).WithEndpointPool(endpointPool), nil
+}
+
+func hasPluginType(config *configapi.EndpointPickerConfig, pluginType string) bool {
+	if config == nil {
+		return false
+	}
+	for _, plugin := range config.Plugins {
+		if plugin.Type == pluginType {
+			return true
+		}
+	}
+	return false
 }
 
 // registerInTreePlugins registers the factory functions of all known plugins

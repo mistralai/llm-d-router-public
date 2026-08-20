@@ -85,7 +85,7 @@ type Options struct {
 	//
 	EndpointSelector            labels.Selector // Parsed selector to filter model server pods on. Set via --endpoint-selector flag and parsed in Complete().
 	EndpointTargetPorts         []int           // Target ports of model server pods.
-	EndpointDataParallelSize    int             // Logical ranks per pod when all ranks share one target port.
+	EndpointDataParallelSize    int             // Fallback logical ranks per pod when automatic discovery is unavailable.
 	DisableEndpointSubsetFilter bool            // Disables respecting destination endpoint subset metadata in EPP.
 	EmitEndpointScores          bool            // Enables emitting per-endpoint scheduler scores in the request-path dynamic metadata.
 	//
@@ -193,7 +193,7 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntSliceVar(&opts.EndpointTargetPorts, "endpoint-target-ports", opts.EndpointTargetPorts, "Target ports of model server pods. "+
 		"Format: a comma-separated list of numbers without whitespace (e.g., '3000,3001,3002').")
 	fs.IntVar(&opts.EndpointDataParallelSize, "endpoint-data-parallel-size", opts.EndpointDataParallelSize,
-		"Number of logical data-parallel rank endpoints per pod when ranks share one serving port.")
+		"Fallback number of logical data-parallel rank endpoints per pod when metrics discovery is unavailable.")
 	fs.BoolVar(&opts.DisableEndpointSubsetFilter, "disable-endpoint-subset-filter", opts.DisableEndpointSubsetFilter,
 		"Disables respecting the destination endpoint subset metadata for dispatching requests in EPP.")
 	fs.BoolVar(&opts.EmitEndpointScores, "emit-endpoint-scores", opts.EmitEndpointScores,
