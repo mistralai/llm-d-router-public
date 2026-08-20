@@ -3,11 +3,12 @@
 # This is epp-precise-prefix-cache-config.yaml plus dp-rank-header-handler.
 # Use it for vLLM's Internal LB and Hybrid LB modes, where the ranks of a pod
 # sit behind a single HTTP port and there is no per-rank endpoint to route to.
-# Run EPP with --endpoint-data-parallel-size=8 so endpoint discovery exposes
-# every (pod, rank) pair to the scheduler. With the Helm chart, set
-# router.modelServers.dataParallelSize=8 instead. The scheduler picks one
-# logical endpoint, then dp-rank-header-handler pins the request to its rank by
-# setting x-data-parallel-rank, bypassing vLLM's internal queue-based balancing.
+# EPP detects each pod's rank count from vLLM's per-engine metrics. The
+# --endpoint-data-parallel-size flag and router.modelServers.dataParallelSize
+# Helm value provide a fallback when metrics do not expose the rank count. The
+# scheduler picks one logical endpoint, then dp-rank-header-handler pins the
+# request to its rank by setting x-data-parallel-rank, bypassing vLLM's internal
+# queue-based balancing.
 #
 # For External LB, where each rank is its own endpoint on its own port, use
 # dp-epp-config.yaml instead. Do not configure dp-rank-header-handler there;
