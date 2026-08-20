@@ -162,7 +162,7 @@ inferenceObjectives: []
 modelServers:
   type: vllm # vllm, sglang, triton-tensorrt-llm, trtllm-serve, triton
   protocol: http # http, grpc
-  dataParallelSize: 1 # Set above 1 when ranks share one serving port.
+  dataParallelSize: 1 # Fallback when shared-port rank discovery is unavailable.
   targetPorts:
     - number: 8000
   # matchLabels: # REQUIRED in parent charts if creating inference pool
