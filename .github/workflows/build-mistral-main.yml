@@ -83,4 +83,6 @@ jobs:
               args+=(--no-update-main)
             fi
           fi
-          uv run --project mistral-release update-mistral-main "${args[@]}"
+          # --frozen: use the committed lockfile as-is, so uv never re-resolves and
+          # rewrites uv.lock (which would dirty the checked-out mistral-branches tree).
+          uv run --frozen --project mistral-release update-mistral-main "${args[@]}"
