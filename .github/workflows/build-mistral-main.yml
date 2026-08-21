@@ -1,0 +1,68 @@
+name: Build mistral-main branch
+
+# Rebuilds `mistral-main` = upstream/main + the mistral-specific commits listed in
+# .mistral_branches.txt, and (optionally) mirrors `main` to upstream/main, then
+# force-pushes. Triggered manually. See mistral-release/ for the logic.
+#
+# The default GITHUB_TOKEN force-pushes the branches. This works only if they are
+# NOT protected (or the github-actions actor is on the protection bypass list).
+# Otherwise swap the checkout token for a PAT/App token allowed to force-push them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push results to origin (uncheck for a dry-run)"
+        type: boolean
+        default: true
+      update_main:
+        description: "Also mirror main to the latest upstream/main"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-mistral-main
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mistral-branches
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: mistral-branches
+          fetch-depth: 0
+          # Swap in a PAT/App token here (e.g. secrets.MISTRAL_MAIN_PAT) if `main`
+          # or `mistral-main` are protected against the default github-actions actor.
+          token: ${{ github.token }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/llm-d/llm-d-router.git \
+            || git remote set-url upstream https://github.com/llm-d/llm-d-router.git
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+
+      - name: Rebuild main + mistral-main
+        # GH_TOKEN lets the tool's gh pre-flight check query upstream PRs.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=()
+          if [ "${{ inputs.push }}" = "true" ]; then args+=(--push); fi
+          if [ "${{ inputs.update_main }}" = "true" ]; then
+            args+=(--update-main)
+          else
+            args+=(--no-update-main)
+          fi
+          uv run --project mistral-release update-mistral-main "${args[@]}"
