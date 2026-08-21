@@ -940,13 +940,15 @@ func TestSharedPortDataParallelDetectsRanksPerPod(t *testing.T) {
 }
 
 func TestSharedPortDataParallelDetectsRanksPerPodDuringPoolResync(t *testing.T) {
+	const namespace = "default"
+
 	ctx := context.Background()
 	readyPod1 := pod1.DeepCopy()
-	readyPod1.Namespace = "default"
+	readyPod1.Namespace = namespace
 	readyPod1.Labels = map[string]string{"app": "vllm"}
 	readyPod1.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 	readyPod2 := pod2.DeepCopy()
-	readyPod2.Namespace = "default"
+	readyPod2.Namespace = namespace
 	readyPod2.Labels = map[string]string{"app": "vllm"}
 	readyPod2.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 
@@ -960,7 +962,7 @@ func TestSharedPortDataParallelDetectsRanksPerPodDuringPoolResync(t *testing.T) 
 		WithDataParallelSizeDetector(detector),
 	)
 	pool := &datalayer.EndpointPool{
-		Namespace:   "default",
+		Namespace:   namespace,
 		Selector:    labels.SelectorFromSet(labels.Set{"app": "vllm"}),
 		TargetPorts: []int{8000},
 	}
@@ -1067,8 +1069,35 @@ func TestSharedPortDataParallelKeepsRanksWhenDetectionFails(t *testing.T) {
 
 	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1))
 	detector.set(pod1.Name, 0, false, errors.New("metrics unavailable"))
-	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1))
+	require.ErrorIs(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1), errDataParallelSizeDetectionPending)
 	require.Len(t, ds.PodList(AllPodsPredicate), 3)
+}
+
+func TestSharedPortDataParallelKeepsRanksWhenDetectionIsPending(t *testing.T) {
+	ctx := context.Background()
+	detector := &fakeDataParallelSizeDetector{
+		sizes:    map[string]int{pod1.Name: 3},
+		detected: map[string]bool{pod1.Name: true},
+		errs:     map[string]error{},
+	}
+	ds := NewDatastore(ctx, &mockEndpointFactory{}, WithDataParallelSizeDetector(detector)).WithEndpointPool(&datalayer.EndpointPool{
+		Selector:    labels.Everything(),
+		TargetPorts: []int{8000},
+	})
+
+	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1))
+	detector.set(pod1.Name, 0, false, nil)
+	require.ErrorIs(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1), errDataParallelSizeDetectionPending)
+
+	endpoints := ds.PodList(AllPodsPredicate)
+	require.Len(t, endpoints, 3)
+	byName := make(map[string]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		byName[endpoint.GetMetadata().ID.Name] = struct{}{}
+	}
+	for rank := range 3 {
+		assert.Contains(t, byName, fmt.Sprintf("%s-rank-%d", pod1.Name, rank))
+	}
 }
 
 func TestSharedPortDataParallelUsesConfiguredSizeWhenRanksAreNotDetected(t *testing.T) {
@@ -1086,7 +1115,34 @@ func TestSharedPortDataParallelUsesConfiguredSizeWhenRanksAreNotDetected(t *test
 		TargetPorts: []int{8000},
 	})
 
-	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1))
+	require.ErrorIs(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1), errDataParallelSizeDetectionPending)
+	require.Len(t, ds.PodList(AllPodsPredicate), 3)
+}
+
+func TestPoolSetDataParallelDetectionRetriedAfterMetricsBecomeAvailable(t *testing.T) {
+	ctx := context.Background()
+	readyPod := pod1.DeepCopy()
+	readyPod.Namespace = "default"
+	readyPod.Labels = map[string]string{"app": "vllm"}
+	readyPod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	detector := &fakeDataParallelSizeDetector{
+		sizes:    map[string]int{},
+		detected: map[string]bool{},
+		errs:     map[string]error{},
+	}
+	ds := NewDatastore(ctx, &mockEndpointFactory{}, WithDataParallelSizeDetector(detector))
+	pool := &datalayer.EndpointPool{
+		Namespace:   "default",
+		Selector:    labels.SelectorFromSet(labels.Set{"app": "vllm"}),
+		TargetPorts: []int{8000},
+	}
+	fakeClient := fake.NewClientBuilder().WithObjects(readyPod).Build()
+
+	require.ErrorIs(t, ds.PoolSet(ctx, fakeClient, pool), errDataParallelSizeDetectionPending)
+	require.Len(t, ds.PodList(AllPodsPredicate), 1)
+
+	detector.set(pod1.Name, 3, true, nil)
+	require.NoError(t, ds.PoolSet(ctx, fakeClient, pool))
 	require.Len(t, ds.PodList(AllPodsPredicate), 3)
 }
 
