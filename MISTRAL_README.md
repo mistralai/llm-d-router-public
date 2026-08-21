@@ -2,17 +2,17 @@
 
 This fork of `llm-d/llm-d-router` keeps our not-yet-upstreamed changes as a set of
 small feature branches that are replayed on top of upstream to produce a single
-consumable branch. The replay is done by `scripts/update-mistral-main.py`, driven
-by `.mistral_branches.txt`.
+consumable branch. The replay is done by the `mistral-release` tool (in
+`mistral-release/`), driven by `.mistral_branches.txt`.
 
 ## Branches
 
 - **`main`**: an exact mirror of `upstream/main` (`llm-d/llm-d-router`). Updated by
-  the script. Do not commit here.
+  the tool. Do not commit here.
 - **`mistral-main`**: `main` plus every mistral-specific commit from the branches
   listed in `.mistral_branches.txt`. Rebuilt from scratch on every update. This is
   the branch to deploy and run in dev and prod.
-- **`mistral-branches`**: holds the tooling only, the rebuild script,
+- **`mistral-branches`**: holds the tooling only, the `mistral-release/` package,
   `.mistral_branches.txt`, the CI workflow and this file. Edit the branch list
   here.
 - **feature branches**: small, self-contained change each, based directly on `main`.
@@ -40,13 +40,13 @@ comment linking that PR:
 myuser/my-fix    # <what it does> (upstream: https://github.com/llm-d/llm-d-router/pull/NNNN)
 ```
 
-Once the upstream PR merges, drop the branch from the list: the script detects it
+Once the upstream PR merges, drop the branch from the list: the tool detects it
 as already present upstream and skips it anyway, and the `gh` pre-flight check
 flags it so you know it can go.
 
 ## Rebuild mistral-main
 
-Run this from the `mistral-branches` worktree (that branch owns the script and the
+Run this from the `mistral-branches` worktree (that branch owns the tool and the
 list). It works from any worktree of the repo, but running it elsewhere reads the
 list from `origin/mistral-branches` rather than your local edits.
 
@@ -57,13 +57,13 @@ exact `.mistral_branches.txt`, so any build documents the list that produced it.
 Dry-run (default, touches nothing):
 
 ```sh
-uv run scripts/update-mistral-main.py
+uv run --project mistral-release update-mistral-main
 ```
 
 Apply (fast-forwards `main` to `upstream/main` and force-pushes `mistral-main`):
 
 ```sh
-uv run scripts/update-mistral-main.py --push
+uv run --project mistral-release update-mistral-main --push
 ```
 
 `main` is only fast-forwarded; if it has diverged from `upstream/main` the push
@@ -93,7 +93,7 @@ the `mistral-branches` worktree, add your branch to `.mistral_branches.txt`
 (uncommitted is fine), and pick a throwaway target branch:
 
 ```sh
-uv run scripts/update-mistral-main.py --target-branch myuser/try --push
+uv run --project mistral-release update-mistral-main --target-branch myuser/try --push
 ```
 
 To just check whether an edit builds cleanly before pushing it, a plain dry-run on
@@ -101,7 +101,7 @@ To just check whether an edit builds cleanly before pushing it, a plain dry-run 
 
 ```sh
 # edit .mistral_branches.txt, then:
-uv run scripts/update-mistral-main.py
+uv run --project mistral-release update-mistral-main
 ```
 
 The dry-run uses your uncommitted list and prints a notice that it is doing so. A
@@ -150,4 +150,14 @@ on future rebuilds, enable rerere once so git records and replays your resolutio
 
 ```sh
 git config --global rerere.enabled true
+```
+
+## Developing the tool
+
+The rebuild logic lives in the `mistral-release/` uv package (`src/mistral_release/`,
+split into `gitcmd`, `config`, `rebuild`, `checks`, `remote`, `cli`). Run the tests
+against isolated throwaway git repos with:
+
+```sh
+uv run --project mistral-release pytest
 ```
