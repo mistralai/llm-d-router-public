@@ -360,40 +360,51 @@ def rebuild(
     return result
 
 
-def push_branch(
+@dataclass
+class PushSpec:
+    """A branch update to push: ``branch`` to ``new_sha``, force-updated or not."""
+
+    branch: str
+    new_sha: str
+    force: bool
+
+
+def push_branches(
     origin_remote: str,
-    target: str,
-    new_sha: str,
+    specs: list[PushSpec],
     do_push: bool,
     cwd: Path,
-    force: bool,
 ) -> None:
-    """Reports and (when ``do_push``) pushes ``new_sha`` to ``origin/target``.
+    """Reports and (when ``do_push``) pushes all ``specs`` in one atomic push.
 
-    A branch that does not yet exist on the remote is created. An existing one is
-    updated with ``--force-with-lease`` when ``force`` is set; otherwise a plain
-    push is attempted, which fails (raising GitError) unless it fast-forwards.
+    Branches already at their target are reported and skipped. A forced spec uses
+    ``--force-with-lease`` against its current remote value; a non-forced one is a
+    plain update that must fast-forward. With ``--atomic`` every ref updates or none
+    do, so a rejected branch leaves the others unchanged too. Raises GitError if the
+    push is rejected.
     """
-    remote_ref = f"{origin_remote}/{target}"
-    expected = git("rev-parse", "--verify", "--quiet", remote_ref, cwd=cwd, check=False)
-    expected_sha = expected.stdout.strip() or None
+    refspecs: list[str] = []
+    lease_args: list[str] = []
+    for spec in specs:
+        remote_ref = f"{origin_remote}/{spec.branch}"
+        expected = git(
+            "rev-parse", "--verify", "--quiet", remote_ref, cwd=cwd, check=False
+        )
+        expected_sha = expected.stdout.strip() or None
+        if expected_sha == spec.new_sha:
+            print(f"  {remote_ref}: already up to date ({spec.new_sha[:12]})")
+            continue
+        current = expected_sha[:12] if expected_sha else "(new branch)"
+        verb = "pushing" if do_push else "would push"
+        mode = "force" if spec.force else "fast-forward"
+        print(f"  {remote_ref}: {verb} {current} -> {spec.new_sha[:12]} ({mode})")
+        refspecs.append(f"{spec.new_sha}:refs/heads/{spec.branch}")
+        if spec.force and expected_sha:
+            lease_args.append(f"--force-with-lease={spec.branch}:{expected_sha}")
 
-    if expected_sha == new_sha:
-        print(f"  {remote_ref}: already up to date ({new_sha[:12]})")
+    if not do_push or not refspecs:
         return
-
-    current = expected_sha[:12] if expected_sha else "(new branch)"
-    verb = "pushing" if do_push else "would push"
-    mode = "force" if force else "fast-forward"
-    print(f"  {remote_ref}: {verb} {current} -> {new_sha[:12]} ({mode})")
-    if not do_push:
-        return
-
-    refspec = f"{new_sha}:refs/heads/{target}"
-    push_args = ["push", origin_remote, refspec]
-    if force and expected_sha:
-        push_args.append(f"--force-with-lease={target}:{expected_sha}")
-    git(*push_args, cwd=cwd)
+    git("push", "--atomic", origin_remote, *refspecs, *lease_args, cwd=cwd)
 
 
 def worktree_for_branch(branch: str, cwd: Path) -> Path | None:
@@ -686,36 +697,25 @@ def main(argv: list[str] | None = None) -> int:
             f"= {base_ref} + {len(result.applied)} commit(s)"
         )
 
-        print(f"\n{'Pushing' if args.push else 'Dry-run (pass --push to apply)'}:")
+        specs: list[PushSpec] = []
         if update_main:
-            try:
-                push_branch(
-                    args.origin_remote,
-                    args.main_branch,
-                    base_sha,
-                    args.push,
-                    repo_root,
-                    force=args.force_push_main,
-                )
-            except GitError as exc:
+            specs.append(PushSpec(args.main_branch, base_sha, args.force_push_main))
+        specs.append(PushSpec(target_branch, result.new_sha, force=True))
+
+        print(f"\n{'Pushing' if args.push else 'Dry-run (pass --push to apply)'}:")
+        try:
+            push_branches(args.origin_remote, specs, args.push, repo_root)
+        except GitError as exc:
+            print(
+                f"error: push failed (no branch was updated):\n{exc}", file=sys.stderr
+            )
+            if update_main and not args.force_push_main:
                 print(
-                    f"error: pushing {args.main_branch} failed:\n{exc}", file=sys.stderr
+                    f"If {args.main_branch} does not fast-forward from its remote, re-run "
+                    "with --force-push-main.",
+                    file=sys.stderr,
                 )
-                if not args.force_push_main:
-                    print(
-                        f"{args.main_branch} does not fast-forward from its remote; re-run "
-                        "with --force-push-main to overwrite it.",
-                        file=sys.stderr,
-                    )
-                return 1
-        push_branch(
-            args.origin_remote,
-            target_branch,
-            result.new_sha,
-            args.push,
-            repo_root,
-            force=True,
-        )
+            return 1
 
         if args.push and not args.no_update_local:
             print("\nUpdating local branches/worktrees:")

@@ -1,4 +1,4 @@
-name: Update mistral-main
+name: Build mistral-main branch
 
 # Rebuilds `mistral-main` = upstream/main + the mistral-specific commits listed in
 # .mistral_branches.txt, and mirrors `main` to upstream/main, then force-pushes
