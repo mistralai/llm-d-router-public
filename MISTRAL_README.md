@@ -77,7 +77,7 @@ local branch with no worktree is just repointed. So a worktree sitting on `main`
 `mistral-main` ends up at the rebuilt commit rather than drifting behind. Pass
 `--no-update-local` to skip this and only update the remote.
 
-Or trigger the **Update mistral-main** GitHub Action (manual dispatch).
+Or trigger the **Build mistral-main branch** GitHub Action (manual dispatch).
 
 Before replaying, it checks each listed branch and prints a diagnostic when a
 branch is stacked on another listed branch or already appears in an upstream merged
