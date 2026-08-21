@@ -46,7 +46,7 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Rebuild and push main + mistral-main
-        # GH_TOKEN lets the script's gh pre-flight check query upstream PRs.
+        # GH_TOKEN lets the tool's gh pre-flight check query upstream PRs.
         env:
           GH_TOKEN: ${{ github.token }}
-        run: uv run scripts/update-mistral-main.py --push
+        run: uv run --project mistral-release update-mistral-main --push
