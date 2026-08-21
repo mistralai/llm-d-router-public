@@ -2,11 +2,34 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 
 from mistral_release.gitcmd import GitError, git, git_out
 
 DEFAULT_CONFIG = ".mistral_branches.txt"
+
+
+def reserved_conflicts(branches: list[str], reserved: Iterable[str]) -> list[str]:
+    """Returns the sorted reserved names that wrongly appear in the branch list.
+
+    ``main`` and the rebuilt target are produced from the list, never a source of
+    commits, so listing them is always a mistake. An empty result means the list is
+    clean.
+    """
+    reserved_set = set(reserved)
+    return sorted({b for b in branches if b in reserved_set})
+
+
+def is_triggering_branch(
+    triggered_by: str, main_branch: str, branches: list[str]
+) -> bool:
+    """Returns whether a push to ``triggered_by`` should rebuild the target.
+
+    A push matters only when it lands on the main branch (a new upstream base) or on
+    one of the feature branches that feed the rebuild. Any other push is a no-op.
+    """
+    return triggered_by == main_branch or triggered_by in branches
 
 
 def parse_config_text(text: str) -> list[str]:
