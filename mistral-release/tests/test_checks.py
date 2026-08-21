@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from mistral_release.checks import parse_slug, preflight_checks
 
 
