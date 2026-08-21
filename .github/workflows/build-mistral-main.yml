@@ -2,13 +2,25 @@ name: Build mistral-main branch
 
 # Rebuilds `mistral-main` = upstream/main + the mistral-specific commits listed in
 # .mistral_branches.txt, and (optionally) mirrors `main` to upstream/main, then
-# force-pushes. Triggered manually. See mistral-release/ for the logic.
+# force-pushes. See mistral-release/ for the logic.
+#
+# Runs on every push, but the tool exits cleanly unless the pushed branch is `main`
+# or one of the branches listed in .mistral_branches.txt (--triggered-by). Push
+# events only ever rebuild mistral-main and never touch `main`. A manual dispatch can
+# additionally mirror `main` to upstream/main via the update_main input.
 #
 # The default GITHUB_TOKEN force-pushes the branches. This works only if they are
 # NOT protected (or the github-actions actor is on the protection bypass list).
 # Otherwise swap the checkout token for a PAT/App token allowed to force-push them.
+# Pushes made with the default GITHUB_TOKEN do NOT start a new workflow run, so the
+# tool's own pushes to `main` and `mistral-main` never trigger this workflow again.
+# (If you swap in a PAT, that loop-guard is lost; the --triggered-by check still
+# stops a push to `mistral-main` early, but a `main` update would start one more run.)
 
 on:
+  push:
+    branches:
+      - "**"
   workflow_dispatch:
     inputs:
       push:
@@ -59,10 +71,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           args=()
-          if [ "${{ inputs.push }}" = "true" ]; then args+=(--push); fi
-          if [ "${{ inputs.update_main }}" = "true" ]; then
-            args+=(--update-main)
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Automatic push: rebuild mistral-main only, and only when the pushed
+            # branch actually feeds it. --triggered-by also forces --no-update-main.
+            args+=(--push --triggered-by "${{ github.ref_name }}")
           else
-            args+=(--no-update-main)
+            if [ "${{ inputs.push }}" = "true" ]; then args+=(--push); fi
+            if [ "${{ inputs.update_main }}" = "true" ]; then
+              args+=(--update-main)
+            else
+              args+=(--no-update-main)
+            fi
           fi
           uv run --project mistral-release update-mistral-main "${args[@]}"
