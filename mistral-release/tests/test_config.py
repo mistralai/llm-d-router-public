@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from mistral_release.config import config_source, load_config, parse_config_text
+from mistral_release.config import (
+    config_source,
+    is_triggering_branch,
+    load_config,
+    parse_config_text,
+    reserved_conflicts,
+)
 
 
 def test_parse_strips_comments_and_whitespace():
@@ -63,6 +69,29 @@ def test_config_source_ref_when_not_on_branch(sandbox):
     assert kind == "ref"
     assert value == "origin/mistral-branches"
     assert "committed on the remote" in desc
+
+
+def test_reserved_conflicts_flags_main_and_target():
+    branches = ["main", "feat/a", "mistral-main", "mistral-branches"]
+    assert reserved_conflicts(branches, {"main", "mistral-main"}) == [
+        "main",
+        "mistral-main",
+    ]
+
+
+def test_reserved_conflicts_clean_list_is_empty():
+    branches = ["feat/a", "feat/b", "mistral-branches"]
+    assert reserved_conflicts(branches, {"main", "mistral-main"}) == []
+
+
+def test_is_triggering_branch():
+    branches = ["mistral-branches", "feat/a"]
+    assert is_triggering_branch("main", "main", branches) is True
+    assert is_triggering_branch("feat/a", "main", branches) is True
+    assert is_triggering_branch("mistral-branches", "main", branches) is True
+    assert is_triggering_branch("feat/other", "main", branches) is False
+    # the rebuilt target itself is not a source branch, so its push is a no-op
+    assert is_triggering_branch("mistral-main", "main", branches) is False
 
 
 def test_load_config_from_ref(sandbox):

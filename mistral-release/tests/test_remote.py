@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from mistral_release.gitcmd import GitError, worktree_for_branch
 from mistral_release.remote import (
     PushSpec,

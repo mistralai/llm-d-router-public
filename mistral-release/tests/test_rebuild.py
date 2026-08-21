@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from mistral_release.rebuild import ConflictError, rebuild
 
 
