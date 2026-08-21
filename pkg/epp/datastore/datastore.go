@@ -44,6 +44,9 @@ import (
 
 var (
 	errPoolNotSynced = errors.New("InferencePool is not initialized in data store")
+	// errDataParallelSizeDetectionPending makes Kubernetes reconcilers retry pods whose
+	// metrics endpoint is not ready without dropping the fallback or last detected ranks.
+	errDataParallelSizeDetectionPending = errors.New("data-parallel size detection pending")
 	// errRegistrationDropped reports an endpoint that could not be tracked: its collector is
 	// still registered from an earlier registration (an upsert overlapping an in-flight delete)
 	// or failed to start. Callers match it with errors.Is to decide whether to retry.
@@ -93,8 +96,8 @@ type Datastore interface {
 	// PodList lists pods matching the given predicate.
 	PodList(predicate func(fwkdl.Endpoint) bool) []fwkdl.Endpoint
 	// PodUpdateOrAddIfNotExist stores or updates the endpoints for the given pod. It returns an
-	// error when an endpoint registration was dropped (see upsertEndpoint); the pod is then not
-	// tracked by the datastore and the caller must retry (e.g. by requeuing the reconcile).
+	// error when endpoint registration was dropped or data-parallel size detection is pending;
+	// the caller must retry (e.g. by requeuing the reconcile).
 	PodUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.Pod) error
 	PodDelete(podName string)
 
@@ -381,7 +384,7 @@ func (ds *datastore) podUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.P
 
 	pods := []*fwkdl.EndpointMetadata{}
 	activePorts := extractActivePorts(pod, pool.TargetPorts)
-	dataParallelSize, rankAware := ds.dataParallelSizeForPod(ctx, pod, pool, labels, activePorts)
+	dataParallelSize, rankAware, detectionErr := ds.dataParallelSizeForPod(ctx, pod, pool, labels, activePorts)
 	if rankAware {
 		port := pool.TargetPorts[0]
 		if activePorts.Has(port) {
@@ -427,6 +430,9 @@ func (ds *datastore) podUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.P
 
 	added := false
 	var errs []error
+	if detectionErr != nil {
+		errs = append(errs, detectionErr)
+	}
 	existingEpSet := sets.Set[types.NamespacedName]{}
 	for _, endpointMetadata := range pods {
 		existingEpSet.Insert(endpointMetadata.ID)
@@ -465,10 +471,10 @@ func (ds *datastore) podUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.P
 
 func (ds *datastore) dataParallelSizeForPod(ctx context.Context, pod *corev1.Pod, pool *datalayer.EndpointPool,
 	labels map[string]string, activePorts sets.Set[int],
-) (int, bool) {
+) (int, bool, error) {
 	fallbackSize := ds.dataParallelSize
 	if ds.dataParallelSizeDetector == nil || len(pool.TargetPorts) != 1 || !activePorts.Has(pool.TargetPorts[0]) {
-		return fallbackSize, fallbackSize > 1
+		return fallbackSize, fallbackSize > 1, nil
 	}
 
 	port := pool.TargetPorts[0]
@@ -486,22 +492,35 @@ func (ds *datastore) dataParallelSizeForPod(ctx context.Context, pod *corev1.Pod
 		if currentSize, rankAware, found := ds.currentDataParallelSize(pod); found {
 			log.FromContext(ctx).Error(err, "Failed to detect data-parallel size, keeping existing endpoints",
 				"pod", pod.Name, "size", currentSize)
-			return currentSize, rankAware
+			return currentSize, rankAware, fmt.Errorf("%w: %w", errDataParallelSizeDetectionPending, err)
 		}
 		log.FromContext(ctx).Error(err, "Failed to detect data-parallel size, using configured fallback",
 			"pod", pod.Name, "size", fallbackSize)
-		return fallbackSize, fallbackSize > 1
+		return fallbackSize, fallbackSize > 1, fmt.Errorf("%w: %w", errDataParallelSizeDetectionPending, err)
 	}
 	if !detected {
-		return fallbackSize, fallbackSize > 1
+		logger := log.FromContext(ctx).V(logutil.DEBUG)
+		if currentSize, rankAware, found := ds.currentDataParallelSize(pod); found {
+			logger.Info("Data-parallel size not detected, keeping existing endpoints",
+				"pod", pod.Name, "size", currentSize)
+			return currentSize, rankAware, errDataParallelSizeDetectionPending
+		}
+		logger.Info("Data-parallel size not detected, using configured fallback",
+			"pod", pod.Name, "size", fallbackSize)
+		return fallbackSize, fallbackSize > 1, errDataParallelSizeDetectionPending
 	}
 	if size < 1 {
 		err := fmt.Errorf("detected data-parallel size must be positive, got %d", size)
+		if currentSize, rankAware, found := ds.currentDataParallelSize(pod); found {
+			log.FromContext(ctx).Error(err, "Keeping existing data-parallel endpoints",
+				"pod", pod.Name, "size", currentSize)
+			return currentSize, rankAware, fmt.Errorf("%w: %w", errDataParallelSizeDetectionPending, err)
+		}
 		log.FromContext(ctx).Error(err, "Using configured data-parallel size fallback",
 			"pod", pod.Name, "size", fallbackSize)
-		return fallbackSize, fallbackSize > 1
+		return fallbackSize, fallbackSize > 1, fmt.Errorf("%w: %w", errDataParallelSizeDetectionPending, err)
 	}
-	return size, size > 1
+	return size, size > 1, nil
 }
 
 func (ds *datastore) currentDataParallelSize(pod *corev1.Pod) (size int, rankAware bool, found bool) {
