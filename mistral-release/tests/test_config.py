@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from mistral_release.config import (
+    branches_branch_guard_applies,
     config_source,
     is_triggering_branch,
     load_config,
@@ -92,6 +93,34 @@ def test_is_triggering_branch():
     assert is_triggering_branch("feat/other", "main", branches) is False
     # the rebuilt target itself is not a source branch, so its push is a no-op
     assert is_triggering_branch("mistral-main", "main", branches) is False
+
+
+def test_branches_branch_guard_applies():
+    # interactive run on the branches branch with no explicit target: guard applies
+    assert (
+        branches_branch_guard_applies(
+            "mistral-branches", "mistral-branches", None, None
+        )
+        is True
+    )
+    # automated push run (triggered_by set) is the canonical path: exempt
+    assert (
+        branches_branch_guard_applies(
+            "mistral-branches", "mistral-branches", None, "mistral-branches"
+        )
+        is False
+    )
+    # explicit target (personal test) has its own rules: guard does not apply
+    assert (
+        branches_branch_guard_applies(
+            "mistral-branches", "mistral-branches", "myuser/try", None
+        )
+        is False
+    )
+    # run from any other branch: guard does not apply
+    assert (
+        branches_branch_guard_applies("main", "mistral-branches", None, None) is False
+    )
 
 
 def test_load_config_from_ref(sandbox):
