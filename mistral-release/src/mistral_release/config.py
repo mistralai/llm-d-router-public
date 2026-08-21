@@ -32,6 +32,27 @@ def is_triggering_branch(
     return triggered_by == main_branch or triggered_by in branches
 
 
+def branches_branch_guard_applies(
+    current_branch: str,
+    branches_branch: str,
+    target_branch: str | None,
+    triggered_by: str | None,
+) -> bool:
+    """Returns whether the divergent-branches-branch guard should be evaluated.
+
+    The guard stops an interactive run from pushing a non-canonical build off local
+    edits to the branches branch. It applies only when run on that branch with no
+    explicit target. An automated push run (``triggered_by`` set) is the canonical
+    path and is exempt, since CI legitimately runs on the branches branch and may
+    have an incidentally dirty tree (e.g. a re-resolved lockfile).
+    """
+    return (
+        triggered_by is None
+        and current_branch == branches_branch
+        and target_branch is None
+    )
+
+
 def parse_config_text(text: str) -> list[str]:
     """Returns the ordered branch list from config file contents.
 
