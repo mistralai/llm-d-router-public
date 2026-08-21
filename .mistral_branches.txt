@@ -14,5 +14,7 @@
 # Commits already present upstream (by patch id) or already applied by an
 # earlier branch in this list are skipped automatically.
 
-mistral-branches      # this branch: the rebuild script, this list and the CI workflow
-lfm/combined-fixes    # cross-replica sync decouple, RawBody release, drop unused publisher const (no upstream PR yet)
+mistral-branches                  # this branch: the rebuild script, this list and the CI workflow
+lfm/combined-fixes                # cross-replica sync decouple, RawBody release, drop unused publisher const (no upstream PR yet)
+mk/260819-routing-metrics         # 2 custom routing metrics (https://github.com/llm-d/llm-d-router/pull/2494)
+mk/260821-no-fairness-metric      # allows to reduce the cardinality of fairness metrics (https://github.com/llm-d/llm-d-router/pull/2495)
