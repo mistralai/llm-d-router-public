@@ -21,7 +21,12 @@ import tempfile
 from pathlib import Path
 
 from mistral_release.checks import preflight_checks
-from mistral_release.config import config_source, load_config
+from mistral_release.config import (
+    config_source,
+    is_triggering_branch,
+    load_config,
+    reserved_conflicts,
+)
 from mistral_release.gitcmd import GitError, git, git_out, is_ancestor
 from mistral_release.rebuild import ConflictError, rebuild
 from mistral_release.remote import (
@@ -96,6 +101,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--strict", action="store_true", help="treat pre-flight warnings as errors"
+    )
+    parser.add_argument(
+        "--triggered-by",
+        default=None,
+        help="branch whose push triggered this run (CI push events). The rebuild "
+        "runs only if it is the main branch or a listed feature branch; otherwise "
+        "the run exits cleanly. In this mode the main branch is never updated.",
     )
     parser.add_argument(
         "--push",
@@ -187,6 +199,26 @@ def _run(args: argparse.Namespace) -> int:
     if not branches:
         print("error: no branches listed in the config source.", file=sys.stderr)
         return 2
+
+    reserved = reserved_conflicts(branches, {args.main_branch, DEFAULT_TARGET_BRANCH})
+    if reserved:
+        print(
+            f"error: {', '.join(reserved)} must not be listed in the branch config: "
+            "they are built from the other branches, not a source of commits.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.triggered_by is not None:
+        # A push-triggered run mirrors CI: it only ever rebuilds the target and never
+        # touches the main branch, whatever --update-main would otherwise select.
+        update_main = False
+        if not is_triggering_branch(args.triggered_by, args.main_branch, branches):
+            print(
+                f"Push to '{args.triggered_by}' does not affect {target_branch}: it is "
+                f"neither '{args.main_branch}' nor a listed branch. Nothing to do."
+            )
+            return 0
 
     base_ref = f"{args.upstream_remote}/{args.upstream_branch}"
     base_sha = git_out("rev-parse", base_ref, cwd=repo_root)

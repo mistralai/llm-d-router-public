@@ -77,7 +77,22 @@ local branch with no worktree is just repointed. So a worktree sitting on `main`
 `mistral-main` ends up at the rebuilt commit rather than drifting behind. Pass
 `--no-update-local` to skip this and only update the remote.
 
-Or trigger the **Build mistral-main branch** GitHub Action (manual dispatch).
+## Automatic rebuilds (CI)
+
+The **Build mistral-main branch** GitHub Action rebuilds `mistral-main` for you.
+
+- **On every push**: the action runs, but the tool exits cleanly and does nothing
+  unless the pushed branch is `main` or one of the branches listed in
+  `.mistral_branches.txt`. When it is, `mistral-main` is rebuilt and force-pushed.
+  A push-triggered run never touches `main`. So pushing a feature branch that is in
+  the list (or updating `mistral-branches`) is enough to refresh `mistral-main`.
+- **Manual dispatch**: use it to force a rebuild, to run a dry-run (uncheck *push*),
+  or to also mirror `main` to the latest `upstream/main` (check *update main*).
+
+The tool's own pushes do not start another run: with the default `GITHUB_TOKEN`,
+GitHub does not re-trigger workflows from pushes it makes, and a push to
+`mistral-main` is a no-op anyway since it is not a listed branch. So a manual
+dispatch that updates `main` does not loop back into another build.
 
 Before replaying, it checks each listed branch and prints a diagnostic when a
 branch is stacked on another listed branch or already appears in an upstream merged
