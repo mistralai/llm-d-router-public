@@ -396,6 +396,55 @@ def push_branch(
     git(*push_args, cwd=cwd)
 
 
+def worktree_for_branch(branch: str, cwd: Path) -> Path | None:
+    """Returns the path of the worktree that has ``branch`` checked out, or None."""
+    path: str | None = None
+    for line in git_out("worktree", "list", "--porcelain", cwd=cwd).splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree ") :]
+        elif line == f"branch refs/heads/{branch}" and path is not None:
+            return Path(path)
+    return None
+
+
+def update_local_branch(branch: str, new_sha: str, cwd: Path) -> None:
+    """Moves the local ``branch`` (and its worktree, if any) to ``new_sha``.
+
+    Does nothing if the branch does not exist locally or already points at
+    ``new_sha``. A branch checked out in a clean worktree is updated with a hard
+    reset (untracked files are kept); a worktree with uncommitted tracked changes is
+    left alone with a warning, so no local work is discarded.
+    """
+    head = git(
+        "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", cwd=cwd, check=False
+    )
+    if head.returncode != 0:
+        return
+    current = head.stdout.strip()
+    if current == new_sha:
+        print(f"  local {branch}: already at {new_sha[:12]}")
+        return
+
+    worktree = worktree_for_branch(branch, cwd)
+    if worktree is None:
+        git("branch", "-f", branch, new_sha, cwd=cwd)
+        print(f"  local {branch}: {current[:12]} -> {new_sha[:12]}")
+        return
+
+    if git_out("status", "--porcelain", "--untracked-files=no", cwd=worktree):
+        print(
+            f"  local {branch}: worktree {worktree} has uncommitted changes; left as is.\n"
+            f"    update it manually with: git -C {worktree} reset --hard {new_sha[:12]}",
+            file=sys.stderr,
+        )
+        return
+
+    git("reset", "--hard", new_sha, cwd=worktree)
+    print(
+        f"  local {branch}: worktree {worktree} reset {current[:12]} -> {new_sha[:12]}"
+    )
+
+
 def branches_branch_diverged(
     repo_root: Path, origin_remote: str, branches_branch: str
 ) -> bool:
@@ -472,6 +521,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--push",
         action="store_true",
         help="force-push results to origin (default: dry-run)",
+    )
+    parser.add_argument(
+        "--no-update-local",
+        action="store_true",
+        help="do not move local branches/worktrees to match what was pushed",
     )
     return parser
 
@@ -662,6 +716,12 @@ def main(argv: list[str] | None = None) -> int:
             repo_root,
             force=True,
         )
+
+        if args.push and not args.no_update_local:
+            print("\nUpdating local branches/worktrees:")
+            if update_main:
+                update_local_branch(args.main_branch, base_sha, repo_root)
+            update_local_branch(target_branch, result.new_sha, repo_root)
         return 0
     finally:
         git("worktree", "remove", "--force", str(tmp), check=False)
