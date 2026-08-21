@@ -70,6 +70,13 @@ uv run scripts/update-mistral-main.py --push
 fails until you pass `--force-push-main`. `mistral-main` (or any `--target-branch`)
 is always force-pushed.
 
+On `--push`, local branches are moved to match what was pushed: a branch checked
+out in a worktree is hard-reset when that worktree is clean (untracked files are
+kept), or left untouched with a warning if it has uncommitted tracked changes; a
+local branch with no worktree is just repointed. So a worktree sitting on `main` or
+`mistral-main` ends up at the rebuilt commit rather than drifting behind. Pass
+`--no-update-local` to skip this and only update the remote.
+
 Or trigger the **Update mistral-main** GitHub Action (manual dispatch).
 
 Before replaying, it checks each listed branch and prints a diagnostic when a
