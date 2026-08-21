@@ -1,0 +1,52 @@
+name: Update mistral-main
+
+# Rebuilds `mistral-main` = upstream/main + the mistral-specific commits listed in
+# .mistral_branches.txt, and mirrors `main` to upstream/main, then force-pushes
+# both. Triggered manually. See scripts/update-mistral-main.py for the logic.
+#
+# The default GITHUB_TOKEN force-pushes `main` and `mistral-main`. This works only
+# if those branches are NOT protected (or the github-actions actor is on the
+# protection bypass list). Otherwise swap the checkout token for a PAT/App token
+# whose actor is allowed to force-push them.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-mistral-main
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mistral-branches
+        uses: actions/checkout@v4
+        with:
+          ref: mistral-branches
+          fetch-depth: 0
+          # Swap in a PAT/App token here (e.g. secrets.MISTRAL_MAIN_PAT) if `main`
+          # or `mistral-main` are protected against the default github-actions actor.
+          token: ${{ github.token }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/llm-d/llm-d-router.git \
+            || git remote set-url upstream https://github.com/llm-d/llm-d-router.git
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Rebuild and push main + mistral-main
+        # GH_TOKEN lets the script's gh pre-flight check query upstream PRs.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: uv run scripts/update-mistral-main.py --push
