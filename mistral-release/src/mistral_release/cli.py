@@ -22,6 +22,7 @@ from pathlib import Path
 
 from mistral_release.checks import preflight_checks
 from mistral_release.config import (
+    branches_branch_guard_applies,
     config_source,
     is_triggering_branch,
     load_config,
@@ -160,13 +161,9 @@ def _run(args: argparse.Namespace) -> int:
         git("fetch", args.upstream_remote, args.upstream_branch, cwd=repo_root)
         git("fetch", "--prune", args.origin_remote, cwd=repo_root)
 
-    if (
-        current_branch == args.branches_branch
-        and args.target_branch is None
-        and branches_branch_diverged(
-            repo_root, args.origin_remote, args.branches_branch
-        )
-    ):
+    if branches_branch_guard_applies(
+        current_branch, args.branches_branch, args.target_branch, args.triggered_by
+    ) and branches_branch_diverged(repo_root, args.origin_remote, args.branches_branch):
         if args.push:
             print(
                 f"error: on '{args.branches_branch}' with local state that differs from "
