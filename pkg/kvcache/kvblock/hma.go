@@ -34,6 +34,13 @@ type GroupCatalog struct {
 	entries map[string]map[GroupID]GroupMetadata
 }
 
+// GroupCatalogSnapshotEntry holds one pod's KV cache group metadata.
+type GroupCatalogSnapshotEntry struct {
+	PodIdentifier string        `json:"podIdentifier"`
+	GroupID       GroupID       `json:"groupId"`
+	Metadata      GroupMetadata `json:"metadata"`
+}
+
 // NewGroupCatalog creates a new, empty GroupCatalog.
 func NewGroupCatalog() *GroupCatalog {
 	return &GroupCatalog{
@@ -63,4 +70,41 @@ func (c *GroupCatalog) Get(podID string, g GroupID) (GroupMetadata, bool) {
 	}
 	meta, ok := groups[g]
 	return meta, ok
+}
+
+// Snapshot returns a copy of all learned group metadata.
+func (c *GroupCatalog) Snapshot() []GroupCatalogSnapshotEntry {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make([]GroupCatalogSnapshotEntry, 0)
+	for podIdentifier, groups := range c.entries {
+		for groupID, metadata := range groups {
+			result = append(result, GroupCatalogSnapshotEntry{
+				PodIdentifier: podIdentifier, GroupID: groupID, Metadata: metadata,
+			})
+		}
+	}
+	return result
+}
+
+// Restore replaces the catalog with snapshot entries.
+func (c *GroupCatalog) Restore(snapshot []GroupCatalogSnapshotEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]map[GroupID]GroupMetadata)
+	for _, entry := range snapshot {
+		groups := c.entries[entry.PodIdentifier]
+		if groups == nil {
+			groups = make(map[GroupID]GroupMetadata)
+			c.entries[entry.PodIdentifier] = groups
+		}
+		groups[entry.GroupID] = entry.Metadata
+	}
+}
+
+// Clear removes all group metadata for a pod.
+func (c *GroupCatalog) Clear(podIdentifier string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, podIdentifier)
 }

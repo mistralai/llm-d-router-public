@@ -513,3 +513,18 @@ func TestParseCipherSuites(t *testing.T) {
 	_, err = parseCipherSuites([]string{"BOGUS"})
 	require.Error(t, err)
 }
+
+func TestCheckpointPortValidation(t *testing.T) {
+	for _, port := range []string{"-1", "65536", "9090", "9002", "9003"} {
+		t.Run(port, func(t *testing.T) {
+			fs := pflag.NewFlagSet(t.Name(), pflag.ContinueOnError)
+			opts := NewOptions()
+			opts.AddFlags(fs)
+			require.NoError(t, fs.Parse([]string{
+				"--pool-name", testPoolName, "--config-file", testConfigFile,
+				"--checkpoint-port", port,
+			}))
+			require.Error(t, opts.Validate())
+		})
+	}
+}

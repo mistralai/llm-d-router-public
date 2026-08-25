@@ -146,7 +146,7 @@ func DefaultConfig() *Config {
 }
 
 // Pool is a sharded worker pool that processes events from ZMQ subscribers.
-// It ensures that events for the same PodIdentifier are processed in order.
+// It ensures that events from the same publisher stream are processed in order.
 // Pool keeps transient event-stream state while durable key mappings are
 // delegated to the Index.
 type Pool struct {
@@ -161,11 +161,19 @@ type Pool struct {
 	// tier, KV-cache group, DP rank) and a store must be counted only after
 	// Index.Add succeeds — both of which only the Pool observes.
 	dedup *eventDedupFilter
-	wg    sync.WaitGroup
+	// checkpointMu makes index, dedup, and consumed sequences one consistent
+	// checkpoint boundary.
+	checkpointMu      sync.RWMutex
+	checkpointWriteMu sync.Mutex
+	lastConsumedMu    sync.RWMutex
+	lastConsumedSeq   map[string]uint64
+	replaysInProgress map[string]struct{}
+	wg                sync.WaitGroup
 	// queueDepth mirrors the number of tasks queued across all shards. It is
 	// tracked incrementally rather than by summing queue.Len() so that the
 	// depth gauge stays O(1) on the enqueue/dequeue hot path.
 	queueDepth atomic.Int64
+	started    atomic.Bool
 }
 
 // NewPool creates a Pool with a sharded worker setup.
@@ -183,13 +191,15 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 	}
 
 	p := &Pool{
-		queues:         make([]workqueue.TypedRateLimitingInterface[*RawMessage], cfg.Concurrency),
-		concurrency:    cfg.Concurrency,
-		index:          index,
-		tokenProcessor: tokenProcessor,
-		adapter:        adapter,
-		groupCatalog:   kvblock.NewGroupCatalog(),
-		dedup:          newEventDedupFilter(),
+		queues:            make([]workqueue.TypedRateLimitingInterface[*RawMessage], cfg.Concurrency),
+		concurrency:       cfg.Concurrency,
+		index:             index,
+		tokenProcessor:    tokenProcessor,
+		adapter:           adapter,
+		groupCatalog:      kvblock.NewGroupCatalog(),
+		dedup:             newEventDedupFilter(),
+		lastConsumedSeq:   make(map[string]uint64),
+		replaysInProgress: make(map[string]struct{}),
 	}
 
 	for i := 0; i < p.concurrency; i++ {
@@ -219,6 +229,7 @@ func (p *Pool) Start(ctx context.Context) {
 	logger.Info("Starting sharded event processing pool", "workers", p.concurrency)
 
 	metrics.PoolCapacity.Set(float64(p.concurrency))
+	p.started.Store(true)
 
 	p.wg.Add(p.concurrency)
 	for i := 0; i < p.concurrency; i++ {
@@ -250,7 +261,10 @@ func (p *Pool) Shutdown(ctx context.Context) {
 // It hashes the sharding key to select a queue, ensuring messages for the
 // same source endpoint always go to the same worker (ordered queue).
 func (p *Pool) AddTask(task *RawMessage) {
-	key := task.SourceEndpoint
+	key := task.StreamID
+	if key == "" {
+		key = task.SourceEndpoint
+	}
 	if key == "" {
 		key = p.adapter.ShardingKey(task)
 	}
@@ -268,8 +282,8 @@ func (p *Pool) AddTask(task *RawMessage) {
 }
 
 // resetForSource queues a pod reset on the same shard as its event stream.
-func (p *Pool) resetForSource(topic, sourceEndpoint string) {
-	p.AddTask(&RawMessage{Topic: topic, SourceEndpoint: sourceEndpoint, reset: true})
+func (p *Pool) resetForSource(topic, sourceEndpoint, streamID string) {
+	p.AddTask(&RawMessage{Topic: topic, SourceEndpoint: sourceEndpoint, StreamID: streamID, reset: true})
 }
 
 // worker is the main processing loop for a single worker goroutine.
@@ -303,6 +317,9 @@ func (p *Pool) worker(ctx context.Context, workerIndex int) {
 
 // processRawMessage decodes the raw message payload using the adapter and processes the resulting event batch.
 func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
+	p.checkpointMu.RLock()
+	defer p.checkpointMu.RUnlock()
+
 	logger := log.FromContext(ctx)
 	if msg.reset {
 		podID := msg.SourceEndpoint
@@ -310,6 +327,14 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 			podID = p.adapter.ShardingKey(msg)
 		}
 		p.clearPod(ctx, podID)
+		p.lastConsumedMu.Lock()
+		streamID := msg.StreamID
+		if streamID == "" {
+			streamID = podID
+		}
+		delete(p.lastConsumedSeq, streamID)
+		delete(p.replaysInProgress, streamID)
+		p.lastConsumedMu.Unlock()
 		return
 	}
 
@@ -323,6 +348,36 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 	}
 
 	p.processEventBatch(ctx, &batch, podID, modelName)
+	source := msg.StreamID
+	if source == "" {
+		source = msg.SourceEndpoint
+	}
+	if source == "" {
+		source = p.adapter.ShardingKey(msg)
+	}
+	p.lastConsumedMu.Lock()
+	p.lastConsumedSeq[source] = msg.Sequence
+	p.lastConsumedMu.Unlock()
+}
+
+func (p *Pool) markReplayInProgress(streamID string) {
+	p.lastConsumedMu.Lock()
+	defer p.lastConsumedMu.Unlock()
+	p.replaysInProgress[streamID] = struct{}{}
+}
+
+func (p *Pool) markReplayComplete(streamID string) {
+	p.lastConsumedMu.Lock()
+	defer p.lastConsumedMu.Unlock()
+	delete(p.replaysInProgress, streamID)
+}
+
+// LastConsumedSequence returns the last sequence consumed for a source.
+func (p *Pool) LastConsumedSequence(source string) (uint64, bool) {
+	p.lastConsumedMu.RLock()
+	defer p.lastConsumedMu.RUnlock()
+	seq, ok := p.lastConsumedSeq[source]
+	return seq, ok
 }
 
 func (p *Pool) clearPod(ctx context.Context, podIdentifier string) {
@@ -332,6 +387,7 @@ func (p *Pool) clearPod(ctx context.Context, podIdentifier string) {
 			"podIdentifier", podIdentifier)
 	}
 	p.dedup.clear(podIdentifier)
+	p.groupCatalog.Clear(podIdentifier)
 }
 
 // realignExtraFeatures converts per-engine-block extra features to per-canonical-block

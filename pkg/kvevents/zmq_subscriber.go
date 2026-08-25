@@ -64,7 +64,7 @@ func newZMQSubscriber(
 	podIdentifier, sourceEndpoint, endpoint, replayEndpoint, topicFilter string,
 	remote bool,
 ) *zmqSubscriber {
-	return &zmqSubscriber{
+	subscriber := &zmqSubscriber{
 		pool:           pool,
 		podIdentifier:  podIdentifier,
 		sourceEndpoint: sourceEndpoint,
@@ -73,6 +73,13 @@ func newZMQSubscriber(
 		remote:         remote,
 		topicFilter:    topicFilter,
 	}
+	if seq, ok := pool.LastConsumedSequence(endpoint); ok {
+		subscriber.lastSeq = seq
+		subscriber.hasLastSeq = true
+		subscriber.lastLiveSeq = seq
+		subscriber.hasLastLiveSeq = true
+	}
+	return subscriber
 }
 
 // parseEventFrame validates and extracts a live or replayed event frame.
@@ -149,10 +156,15 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 	}
 
 	// Rebuild the index from buffered events without waiting for live traffic.
-	if z.replayEndpoint != "" && !z.hasLastSeq && z.canAttemptReplay() {
+	if z.replayEndpoint != "" && z.hasLastSeq && z.canAttemptReplay() {
+		logger.Info("Catching up restored KV-event stream",
+			"endpoint", z.endpoint, "replayEndpoint", z.replayEndpoint,
+			"lastAppliedSeq", z.lastSeq)
+		z.requestReplay(ctx, z.lastSeq+1, true)
+	} else if z.replayEndpoint != "" && !z.hasLastSeq && z.canAttemptReplay() {
 		logger.Info("Requesting proactive replay on connect",
 			"endpoint", z.endpoint, "replayEndpoint", z.replayEndpoint)
-		z.requestReplay(ctx, 0)
+		z.requestReplay(ctx, 0, true)
 	}
 
 	debugLogger := logger.V(logging.DEBUG)
@@ -184,12 +196,12 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			logger.Info("Detected event sequence reset, rebuilding index",
 				"lastLiveSeq", z.lastLiveSeq, "currentSeq", seq,
 				"endpoint", z.endpoint)
-			z.pool.resetForSource(topic, z.sourceEndpoint)
+			z.pool.resetForSource(topic, z.sourceEndpoint, z.endpoint)
 			z.lastSeq = 0
 			z.hasLastSeq = false
 			z.lastReplayFailure = time.Time{}
 			replayAttempted = true
-			z.requestReplay(ctx, 0)
+			z.requestReplay(ctx, 0, true)
 		}
 
 		if z.hasLastLiveSeq && seq == z.lastLiveSeq {
@@ -214,7 +226,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 				"lastSeq", z.lastSeq, "currentSeq", seq, "missed", missed,
 				"endpoint", z.endpoint)
 			replayAttempted = true
-			if !z.requestReplay(ctx, z.lastSeq+1) {
+			if !z.requestReplay(ctx, z.lastSeq+1, false) {
 				continue
 			}
 		}
@@ -225,7 +237,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			}
 			logger.Info("Joining mid-stream, requesting full replay",
 				"currentSeq", seq, "endpoint", z.endpoint)
-			if !z.requestReplay(ctx, 0) {
+			if !z.requestReplay(ctx, 0, true) {
 				continue
 			}
 		}
@@ -250,6 +262,7 @@ func (z *zmqSubscriber) addTask(topic string, seq uint64, payload []byte) {
 		Sequence:       seq,
 		Payload:        payload,
 		SourceEndpoint: z.sourceEndpoint,
+		StreamID:       z.endpoint,
 	})
 }
 
@@ -258,16 +271,22 @@ func (z *zmqSubscriber) canAttemptReplay() bool {
 }
 
 func (z *zmqSubscriber) invalidateReplay(topic string) {
-	z.pool.resetForSource(topic, z.sourceEndpoint)
+	z.pool.resetForSource(topic, z.sourceEndpoint, z.endpoint)
 	z.lastSeq = 0
 	z.hasLastSeq = false
 	z.lastReplayFailure = time.Now()
 }
 
 // requestReplay requests buffered events starting from startSeq.
-func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool {
+func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64, emptyOK bool) (success bool) {
 	logger := log.FromContext(ctx).WithName("zmq-replay")
 	debugLogger := logger.V(logging.DEBUG)
+	z.pool.markReplayInProgress(z.endpoint)
+	defer func() {
+		if success {
+			z.pool.markReplayComplete(z.endpoint)
+		}
+	}()
 
 	replayCtx, cancel := context.WithTimeout(ctx, replayTimeout)
 	defer cancel()
@@ -384,7 +403,7 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 			return false
 		}
 		if complete {
-			if replayed == 0 && startSeq > 0 {
+			if replayed == 0 && startSeq > 0 && !emptyOK {
 				err := fmt.Errorf("incomplete replay: sequence %d was not available", startSeq)
 				z.invalidateReplay(z.topicFilter)
 				metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-incomplete").Inc()

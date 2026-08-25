@@ -65,6 +65,9 @@ type RawMessage struct {
 	Payload []byte
 	// SourceEndpoint is the serving endpoint associated with the subscriber.
 	SourceEndpoint string
+	// StreamID identifies the publisher sequence space. For per-pod discovery
+	// this is the rank-specific ZMQ endpoint.
+	StreamID string
 	// reset clears the message's pod before later messages on the same queue.
 	reset bool
 }

@@ -146,6 +146,32 @@ type Index interface {
 	Clear(ctx context.Context, podIdentifier string) error
 }
 
+// IndexSnapshot is the durable state of an in-memory index. Speculative
+// entries are excluded because they are tied to in-flight requests.
+type IndexSnapshot struct {
+	Entries        []IndexSnapshotEntry    `json:"entries"`
+	EngineMappings []EngineMappingSnapshot `json:"engineMappings"`
+}
+
+// IndexSnapshotEntry holds the confirmed pod entries for a request key.
+type IndexSnapshotEntry struct {
+	RequestKey BlockHash  `json:"requestKey"`
+	Pods       []PodEntry `json:"pods"`
+}
+
+// EngineMappingSnapshot holds one engine key's request-key chain.
+type EngineMappingSnapshot struct {
+	EngineKey   BlockHash   `json:"engineKey"`
+	RequestKeys []BlockHash `json:"requestKeys"`
+}
+
+// Snapshotter is implemented by index backends that can be checkpointed.
+type Snapshotter interface {
+	Snapshot() (IndexSnapshot, error)
+	ValidateSnapshot(IndexSnapshot) error
+	Restore(IndexSnapshot) error
+}
+
 // KeyType indicates whether a key passed to Evict is an engine key or a request key.
 type KeyType int
 

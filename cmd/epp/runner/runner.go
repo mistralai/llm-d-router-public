@@ -39,6 +39,7 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -438,6 +439,20 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 	} else if err = runserver.SetupPluginStateDebugHandler(mgr, r.PluginHandle); err != nil {
 		setupLog.Error(err, "Failed to setup plugin state debug handler")
 		return nil, nil, err
+	}
+	if opts.CheckpointPort > 0 {
+		checkpointProducer, checkpointErr := configuredKVEventCheckpointProducer(r.PluginHandle)
+		if checkpointErr != nil {
+			setupLog.Error(checkpointErr, "Failed to configure checkpoint server")
+			return nil, nil, checkpointErr
+		}
+		checkpointServer := manager.RunnableFunc(func(ctx context.Context) error {
+			return runserver.ServeKVEventCheckpoint(ctx, opts.CheckpointPort, checkpointProducer.WriteKVEventCheckpoint)
+		})
+		if err = mgr.Add(runnable.NoLeaderElection(checkpointServer)); err != nil {
+			setupLog.Error(err, "Failed to setup checkpoint server")
+			return nil, nil, err
+		}
 	}
 
 	// --- Initialize Core EPP Components ---
@@ -1211,7 +1226,37 @@ func (r *Runner) runWithFileDiscovery(ctx context.Context, opts *runserver.Optio
 	g.Add("metrics", func(ctx context.Context) error {
 		return serveMetrics(ctx, opts.MetricsPort, opts.EnablePprof)
 	})
+	if opts.CheckpointPort > 0 {
+		checkpointProducer, err := configuredKVEventCheckpointProducer(r.PluginHandle)
+		if err != nil {
+			return err
+		}
+		g.Add("checkpoint", func(ctx context.Context) error {
+			return runserver.ServeKVEventCheckpoint(ctx, opts.CheckpointPort, checkpointProducer.WriteKVEventCheckpoint)
+		})
+	}
 	return g.Run(ctx)
+}
+
+func configuredKVEventCheckpointProducer(plugins fwkplugin.HandlePlugins) (*preciseproducer.Producer, error) {
+	if plugins == nil {
+		return nil, errors.New("checkpoint-port requires a configured precise-prefix-cache producer")
+	}
+	var selected *preciseproducer.Producer
+	for _, candidate := range plugins.GetAllPlugins() {
+		producer, ok := candidate.(*preciseproducer.Producer)
+		if !ok || !producer.KVEventCheckpointEnabled() {
+			continue
+		}
+		if selected != nil {
+			return nil, errors.New("checkpoint-port requires exactly one checkpoint-enabled precise-prefix-cache producer")
+		}
+		selected = producer
+	}
+	if selected == nil {
+		return nil, errors.New("checkpoint-port requires a checkpoint-enabled precise-prefix-cache producer")
+	}
+	return selected, nil
 }
 
 // metricsShutdownTimeout bounds graceful shutdown of the metrics server so a

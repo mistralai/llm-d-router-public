@@ -115,6 +115,15 @@ type eventDedupFilter struct {
 	refs map[string]map[dedupKey]int // podIdentifier -> per-block reference count
 }
 
+type dedupSnapshotEntry struct {
+	PodIdentifier    string `json:"podIdentifier"`
+	DeviceTier       string `json:"deviceTier"`
+	GroupIdx         int    `json:"groupIdx"`
+	DataParallelRank int    `json:"dataParallelRank"`
+	BlockHash        uint64 `json:"blockHash"`
+	Count            int    `json:"count"`
+}
+
 func newEventDedupFilter() *eventDedupFilter {
 	return &eventDedupFilter{refs: make(map[string]map[dedupKey]int)}
 }
@@ -191,4 +200,46 @@ func (f *eventDedupFilter) clear(podIdentifier string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.refs, podIdentifier)
+}
+
+func (f *eventDedupFilter) snapshot() []dedupSnapshotEntry {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	entries := make([]dedupSnapshotEntry, 0)
+	for podIdentifier, bucket := range f.refs {
+		for key, count := range bucket {
+			entries = append(entries, dedupSnapshotEntry{
+				PodIdentifier: podIdentifier, DeviceTier: key.deviceTier,
+				GroupIdx: key.groupIdx, DataParallelRank: key.dataParallelRank,
+				BlockHash: key.blockHash, Count: count,
+			})
+		}
+	}
+	return entries
+}
+
+func (f *eventDedupFilter) restore(entries []dedupSnapshotEntry) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refs = make(map[string]map[dedupKey]int)
+	for _, entry := range entries {
+		if entry.Count <= 0 {
+			continue
+		}
+		bucket := f.refs[entry.PodIdentifier]
+		if bucket == nil {
+			bucket = make(map[dedupKey]int)
+			f.refs[entry.PodIdentifier] = bucket
+		}
+		bucket[dedupKey{
+			deviceTier: entry.DeviceTier, groupIdx: entry.GroupIdx,
+			dataParallelRank: entry.DataParallelRank, blockHash: entry.BlockHash,
+		}] = entry.Count
+	}
 }

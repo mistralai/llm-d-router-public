@@ -104,6 +104,7 @@ type Options struct {
 	Tracing                 bool     // Enables emitting traces.
 	HealthChecking          bool     // Enables health checking.
 	MetricsPort             int      // The metrics port exposed by EPP. (TODO: uint16)
+	CheckpointPort          int      // The dedicated HTTP port for operator-triggered checkpoint writes. Zero disables it.
 	GRPCHealthPort          int      // The port used for gRPC liveness and readiness probes. (TODO: uint16)
 	EnablePprof             bool     // Enables pprof handlers.
 	CertPath                string   // The path to the certificate for secure serving.
@@ -150,6 +151,7 @@ func NewOptions() *Options {
 		LoggingOptions:                   *logging.NewOptions(),
 		Tracing:                          true,
 		MetricsPort:                      9090,
+		CheckpointPort:                   0,
 		GRPCHealthPort:                   9003,
 		EnablePprof:                      true,
 		SecureServing:                    true,
@@ -213,6 +215,8 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&opts.Tracing, "tracing", opts.Tracing, "Enables emitting traces.")
 	fs.BoolVar(&opts.HealthChecking, "health-checking", opts.HealthChecking, "Enables health checking.")
 	fs.IntVar(&opts.MetricsPort, "metrics-port", opts.MetricsPort, "The metrics port exposed by EPP.")
+	fs.IntVar(&opts.CheckpointPort, "checkpoint-port", opts.CheckpointPort,
+		"Loopback-only HTTP port for the /checkpoint API. Zero disables the checkpoint server.")
 	fs.IntVar(&opts.GRPCHealthPort, "grpc-health-port", opts.GRPCHealthPort,
 		"The port used for gRPC liveness and readiness probes.")
 	fs.BoolVar(&opts.EnablePprof, "enable-pprof", opts.EnablePprof,
@@ -397,6 +401,14 @@ func (opts *Options) Validate() error {
 	}
 	if opts.GRPCMaxSendMsgSize < 0 {
 		return fmt.Errorf("grpc-max-send-msg-size must be non-negative, got %d", opts.GRPCMaxSendMsgSize)
+	}
+	if opts.CheckpointPort < 0 || opts.CheckpointPort > 65535 {
+		return fmt.Errorf("checkpoint-port must be between 0 and 65535, got %d", opts.CheckpointPort)
+	}
+	if opts.CheckpointPort > 0 &&
+		(opts.CheckpointPort == opts.MetricsPort || opts.CheckpointPort == opts.GRPCHealthPort ||
+			opts.CheckpointPort == opts.GRPCPort) {
+		return errors.New("checkpoint-port must differ from metrics-port, grpc-health-port, and grpc-port")
 	}
 
 	// Validate deprecated metric flags are not explicitly set

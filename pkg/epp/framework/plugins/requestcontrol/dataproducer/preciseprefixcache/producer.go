@@ -18,6 +18,8 @@ package preciseprefixcache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,6 +57,9 @@ type PluginConfig struct {
 	TokenProcessorConfig *kvblock.TokenProcessorConfig `json:"tokenProcessorConfig"`
 	IndexerConfig        *kvcache.Config               `json:"indexerConfig"`
 	KVEventsConfig       *kvevents.Config              `json:"kvEventsConfig"`
+	// CheckpointPath enables disk checkpoint restore and operator-triggered
+	// writes. The path must reside on storage shared with the replacement EPP.
+	CheckpointPath string `json:"checkpointPath,omitempty"`
 	// SpeculativeIndexing seeds predicted cache entries for the selected
 	// endpoint(s) immediately after a routing decision, so the next
 	// same-prefix request hits without waiting for engine confirmation.
@@ -109,6 +114,9 @@ type Producer struct {
 	speculativeEnabled bool
 
 	blockSizeTokens int
+	checkpointPath  string
+	checkpointID    string
+	eventPool       *kvevents.Pool
 
 	// Plugin-lifetime, not request-scoped: SubscriberManager binds each
 	// subscriber's goroutine to the ctx passed at registration.
@@ -158,6 +166,21 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 // The kvcache indexer, KV-events pool, and any local ZMQ subscriber start
 // in background goroutines bound to ctx.
 func New(ctx context.Context, name string, config PluginConfig) (*Producer, error) {
+	if config.CheckpointPath != "" {
+		if config.KVEventsConfig == nil || !config.KVEventsConfig.DiscoverPods ||
+			config.KVEventsConfig.PodDiscoveryConfig == nil {
+			return nil, errors.New("checkpointing requires per-pod KV-event discovery")
+		}
+		if config.KVEventsConfig.PodDiscoveryConfig.EffectiveReplayPort() < 0 {
+			return nil, errors.New("checkpointing requires KV-event replay")
+		}
+		if config.IndexerConfig == nil || config.IndexerConfig.KVBlockIndexConfig == nil ||
+			config.IndexerConfig.KVBlockIndexConfig.InMemoryConfig == nil ||
+			config.IndexerConfig.KVBlockIndexConfig.RedisConfig != nil ||
+			config.IndexerConfig.KVBlockIndexConfig.CostAwareMemoryConfig != nil {
+			return nil, errors.New("checkpointing requires the in-memory KV-block index")
+		}
+	}
 	if config.TokenProcessorConfig == nil {
 		config.TokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
 	}
@@ -187,6 +210,12 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		return nil, fmt.Errorf("failed to create KV-events engine adapter: %w", err)
 	}
 	pool := kvevents.NewPool(config.KVEventsConfig, indexer.KVBlockIndex(), tokenProcessor, adapter)
+	checkpointID := checkpointFingerprint(config.TokenProcessorConfig, tokenProcessor.BlockSize(),
+		config.IndexerConfig.KVBlockIndexConfig.InMemoryConfig)
+	if _, err := pool.RestoreCheckpoint(config.CheckpointPath, checkpointID); err != nil {
+		log.FromContext(ctx).Error(err, "Ignoring unusable KV-event checkpoint and rebuilding from replay",
+			"path", config.CheckpointPath)
+	}
 	pool.Start(ctx)
 
 	subscribersManager := kvevents.NewSubscriberManager(pool)
@@ -214,8 +243,49 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		speculativeTTL:     speculativeTTL,
 		speculativeEnabled: config.SpeculativeIndexing,
 		blockSizeTokens:    tokenProcessor.BlockSize(),
+		checkpointPath:     config.CheckpointPath,
+		checkpointID:       checkpointID,
+		eventPool:          pool,
 		subscriberCtx:      ctx,
 	}, nil
+}
+
+func checkpointFingerprint(config *kvblock.TokenProcessorConfig, blockSize int,
+	indexConfig *kvblock.InMemoryIndexConfig,
+) string {
+	hashSeed := ""
+	hashAlgorithm := kvblock.HashAlgorithmCBORFNV
+	if config != nil {
+		hashSeed = config.HashSeed
+		if config.HashAlgorithm != "" {
+			hashAlgorithm = config.HashAlgorithm
+		}
+	}
+	data, _ := json.Marshal(struct {
+		BlockSizeTokens int    `json:"blockSizeTokens"`
+		HashSeed        string `json:"hashSeed"`
+		HashAlgorithm   string `json:"hashAlgorithm"`
+		IndexSize       int    `json:"indexSize"`
+		PodCacheSize    int    `json:"podCacheSize"`
+	}{
+		BlockSizeTokens: blockSize, HashSeed: hashSeed, HashAlgorithm: hashAlgorithm,
+		IndexSize: indexConfig.Size, PodCacheSize: indexConfig.PodCacheSize,
+	})
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
+// WriteKVEventCheckpoint writes the configured KV-event checkpoint.
+func (p *Producer) WriteKVEventCheckpoint() (kvevents.CheckpointResult, error) {
+	if p.eventPool == nil {
+		return kvevents.CheckpointResult{}, errors.New("KV-event pool is not configured")
+	}
+	return p.eventPool.WriteCheckpoint(p.checkpointPath, p.checkpointID)
+}
+
+// KVEventCheckpointEnabled reports whether durable KV-event checkpoints are configured.
+func (p *Producer) KVEventCheckpointEnabled() bool {
+	return p.checkpointPath != ""
 }
 
 // TypedName returns the plugin's registered type and name.

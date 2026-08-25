@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/jellydator/ttlcache/v3"
@@ -38,6 +39,38 @@ import (
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	"github.com/llm-d/llm-d-router/test/utils"
 )
+
+func TestNewRestoresCheckpointBeforeStarting(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	tokenConfig := &kvblock.TokenProcessorConfig{BlockSizeTokens: 16, HashSeed: "checkpoint-test"}
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(tokenConfig)
+	require.NoError(t, err)
+	sourceIndex, err := kvblock.NewInMemoryIndex(kvblock.DefaultInMemoryIndexConfig())
+	require.NoError(t, err)
+	entry := kvblock.PodEntry{PodIdentifier: "10.0.0.1:8000", DeviceTier: "gpu"}
+	require.NoError(t, sourceIndex.Add(ctx, []kvblock.BlockHash{11}, []kvblock.BlockHash{101}, []kvblock.PodEntry{entry}))
+	sourcePool := kvevents.NewPool(kvevents.DefaultConfig(), sourceIndex, tokenProcessor, nil)
+	indexerConfig, err := kvcache.NewDefaultConfig()
+	require.NoError(t, err)
+	checkpointPath := filepath.Join(t.TempDir(), "index.checkpoint")
+	_, err = sourcePool.WriteCheckpoint(checkpointPath, checkpointFingerprint(
+		tokenConfig, 16, indexerConfig.KVBlockIndexConfig.InMemoryConfig))
+	require.NoError(t, err)
+	eventsConfig := kvevents.DefaultConfig()
+	eventsConfig.PodDiscoveryConfig.ReplaySocketPort = 5558
+	producer, err := New(ctx, "precise", PluginConfig{
+		TokenProcessorConfig: tokenConfig,
+		IndexerConfig:        indexerConfig,
+		KVEventsConfig:       eventsConfig,
+		CheckpointPath:       checkpointPath,
+	})
+	require.NoError(t, err)
+
+	entries, err := producer.kvCacheIndexer.KVBlockIndex().Lookup(ctx, []kvblock.BlockHash{101}, nil)
+	require.NoError(t, err)
+	require.Equal(t, []kvblock.PodEntry{entry}, entries[101])
+}
 
 type fakeKVCacheIndexer struct {
 	computeFromTokens func(ctx context.Context, tokens []uint32, model string, extra []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error)
