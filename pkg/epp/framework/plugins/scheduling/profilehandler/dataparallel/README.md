@@ -48,7 +48,7 @@ Pins a request to the selected logical endpoint's rank by setting
 Hybrid LB deployments where multiple local ranks share one serving endpoint.
 
 When this handler is configured, EPP detects each pod's local rank count from
-the `engine` labels on `vllm:num_requests_running`. This makes each `(pod,
+the `engine` labels on `vllm:cache_config_info`. This makes each `(pod,
 rank)` independently schedulable while retaining the pod's shared serving
 address. Pods with different rank counts can share one InferencePool.
 
