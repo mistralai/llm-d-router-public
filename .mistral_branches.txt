@@ -15,7 +15,7 @@
 # earlier branch in this list are skipped automatically.
 
 mistral-branches                  # this branch: the rebuild script, this list and the CI workflow
-lfm/combined-fixes                # cross-replica sync decouple, RawBody release, drop unused publisher const (no upstream PR yet)
+lfm/combined-fixes-composition-test # cross-replica sync decouple and RawBody release
 lfm/dp-aware-routing-v2           # shared-port data-parallel routing and rank autodiscovery
 mk/260819-routing-metrics         # 2 custom routing metrics (https://github.com/llm-d/llm-d-router/pull/2494)
 mk/260821-no-fairness-metric      # allows to reduce the cardinality of fairness metrics (https://github.com/llm-d/llm-d-router/pull/2495)
