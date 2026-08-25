@@ -41,8 +41,8 @@ func TestDataParallelSizeDetector(t *testing.T) {
 	}{
 		{
 			name: "one engine",
-			metrics: `# TYPE vllm:num_requests_running gauge
-vllm:num_requests_running{model_name="model",engine="0"} 0
+			metrics: `# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{model_name="model",engine="0"} 1
 `,
 			wantSize:     1,
 			wantDetected: true,
@@ -51,9 +51,24 @@ vllm:num_requests_running{model_name="model",engine="0"} 0
 			name: "eight engines",
 			metrics: func() string {
 				var result strings.Builder
-				result.WriteString("# TYPE vllm:num_requests_running gauge\n")
+				result.WriteString("# TYPE vllm:cache_config_info gauge\n")
 				for rank := range 8 {
-					fmt.Fprintf(&result, "vllm:num_requests_running{model_name=\"model\",engine=\"%d\"} 0\n", rank)
+					fmt.Fprintf(&result, "vllm:cache_config_info{model_name=\"model\",engine=\"%d\"} 1\n", rank)
+				}
+				return result.String()
+			}(),
+			wantSize:     8,
+			wantDetected: true,
+		},
+		{
+			name: "complete topology with partial request activity",
+			metrics: func() string {
+				var result strings.Builder
+				result.WriteString("# TYPE vllm:num_requests_running gauge\n")
+				result.WriteString("vllm:num_requests_running{model_name=\"model\",engine=\"0\"} 1\n")
+				result.WriteString("# TYPE vllm:cache_config_info gauge\n")
+				for rank := range 8 {
+					fmt.Fprintf(&result, "vllm:cache_config_info{model_name=\"model\",engine=\"%d\"} 1\n", rank)
 				}
 				return result.String()
 			}(),
@@ -62,14 +77,20 @@ vllm:num_requests_running{model_name="model",engine="0"} 0
 		},
 		{
 			name: "duplicate engines across models",
-			metrics: `# TYPE vllm:num_requests_running gauge
-vllm:num_requests_running{model_name="model-a",engine="0"} 0
-vllm:num_requests_running{model_name="model-a",engine="1"} 0
-vllm:num_requests_running{model_name="model-b",engine="0"} 0
-vllm:num_requests_running{model_name="model-b",engine="1"} 0
+			metrics: `# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{model_name="model-a",engine="0"} 1
+vllm:cache_config_info{model_name="model-a",engine="1"} 1
+vllm:cache_config_info{model_name="model-b",engine="0"} 1
+vllm:cache_config_info{model_name="model-b",engine="1"} 1
 `,
 			wantSize:     2,
 			wantDetected: true,
+		},
+		{
+			name: "request activity metric alone",
+			metrics: `# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="model",engine="0"} 1
+`,
 		},
 		{
 			name: "metric absent",
@@ -79,16 +100,16 @@ unrelated 1
 		},
 		{
 			name: "non-contiguous engines",
-			metrics: `# TYPE vllm:num_requests_running gauge
-vllm:num_requests_running{model_name="model",engine="0"} 0
-vllm:num_requests_running{model_name="model",engine="2"} 0
+			metrics: `# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{model_name="model",engine="0"} 1
+vllm:cache_config_info{model_name="model",engine="2"} 1
 `,
 			wantError: "contiguous",
 		},
 		{
 			name: "invalid engine label",
-			metrics: `# TYPE vllm:num_requests_running gauge
-vllm:num_requests_running{model_name="model",engine="rank-0"} 0
+			metrics: `# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{model_name="model",engine="rank-0"} 1
 `,
 			wantError: "engine label",
 		},

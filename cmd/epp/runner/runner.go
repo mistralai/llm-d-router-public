@@ -373,7 +373,7 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 
 	var dataParallelSizeDetector datastore.DataParallelSizeDetector
 	if hasPluginType(rawConfig, dataparallel.DPRankHeaderHandlerType) {
-		dataParallelSizeDetector, err = sourcemetrics.NewDataParallelSizeDetector(opts.TotalRunningRequestsMetric)
+		dataParallelSizeDetector, err = sourcemetrics.NewDataParallelSizeDetector(opts.CacheInfoMetric)
 		if err != nil {
 			return nil, nil, fmt.Errorf("create data-parallel size detector: %w", err)
 		}
