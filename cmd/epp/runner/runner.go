@@ -118,6 +118,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/prefixcacheaffinity"
 	sessionaffinityfilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sessionaffinity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/sloheadroomtier"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/tokenloadshortlist"
 	topologyaffinityfilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/topologyaffinity"
 	utilizationfilter "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/utilization"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/picker/maxscore"
@@ -583,6 +584,7 @@ func (r *Runner) registerInTreePlugins() {
 	fwkplugin.Register(endpointattributefilter.EndpointAttributeFilterType, fwkplugin.StabilityAlpha, endpointattributefilter.EndpointAttributeFilterFactory)
 	fwkplugin.Register(topologyaffinityfilter.FilterType, fwkplugin.StabilityAlpha, topologyaffinityfilter.Factory)
 	fwkplugin.Register(utilizationfilter.UtilizationFilterType, fwkplugin.StabilityAlpha, utilizationfilter.Factory)
+	fwkplugin.Register(tokenloadshortlist.FilterType, fwkplugin.StabilityAlpha, tokenloadshortlist.Factory)
 
 	// dataparallel profile handler
 	// Beta
