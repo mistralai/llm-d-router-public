@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	defaultDataParallelSizeMetric = "vllm:num_requests_running"
+	defaultDataParallelSizeMetric = "vllm:cache_config_info"
 	dataParallelEngineLabel       = "engine"
 	dataParallelDetectionTimeout  = 2 * time.Second
 )

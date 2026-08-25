@@ -41,7 +41,7 @@ to `vllm` when omitted.
 
 For vLLM Internal or Hybrid LB, where all local DP ranks share one HTTP
 endpoint, configure `dp-rank-header-handler`. EPP detects each pod's local rank
-count from the `engine` labels on `vllm:num_requests_running` and exposes each
+count from the `engine` labels on `vllm:cache_config_info` and exposes each
 rank to the scheduler as a logical endpoint. Pods with different DP sizes can
 share one InferencePool.
 
