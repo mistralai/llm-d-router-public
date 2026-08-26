@@ -7,15 +7,16 @@ consumable branch. The replay is done by the `mistral-release` tool (in
 
 ## Branches
 
-- **`main`**: an exact mirror of `upstream/main` (`llm-d/llm-d-router`). Updated by
-  the tool. Do not commit here.
-- **`mistral-main`**: `main` plus every mistral-specific commit from the branches
-  listed in `.mistral_branches.txt`. Rebuilt from scratch on every update. This is
-  the branch to deploy and run in dev and prod.
+- **`upstream-main`**: an exact mirror of `upstream/main` (`llm-d/llm-d-router`).
+  Updated by the tool. Do not commit here. (The `origin` fork has no `main` branch;
+  the default branch is `mistral-main`.)
+- **`mistral-main`**: `upstream-main` plus every mistral-specific commit from the
+  branches listed in `.mistral_branches.txt`. Rebuilt from scratch on every update.
+  This is the branch to deploy and run in dev and prod.
 - **`mistral-branches`**: holds the tooling only, the `mistral-release/` package,
   `.mistral_branches.txt`, the CI workflow and this file. Edit the branch list
   here.
-- **feature branches**: small, self-contained change each, based directly on `main`.
+- **feature branches**: small, self-contained change each, based directly on `upstream/main`.
 
 Do not develop on top of `mistral-main`. It is force-rebuilt and its history is
 rewritten on every update, so any commit made on it is lost. Put your change on a
@@ -23,7 +24,7 @@ feature branch and add it to the list instead.
 
 ## Add a change
 
-Base the branch on the latest `main`, keep it focused on one change:
+Base the branch on the latest `upstream/main`, keep it focused on one change:
 
 ```sh
 git fetch upstream main
@@ -60,21 +61,22 @@ Dry-run (default, touches nothing):
 uv run --project mistral-release update-mistral-main
 ```
 
-Apply (fast-forwards `main` to `upstream/main` and force-pushes `mistral-main`):
+Apply (fast-forwards `upstream-main` to `upstream/main` and force-pushes `mistral-main`):
 
 ```sh
 uv run --project mistral-release update-mistral-main --push
 ```
 
-`main` is only fast-forwarded; if it has diverged from `upstream/main` the push
-fails until you pass `--force-push-main`. `mistral-main` (or any `--target-branch`)
-is always force-pushed.
+`upstream-main` is only fast-forwarded; if it has diverged from `upstream/main` the
+push fails until you pass `--force-push-main`. `mistral-main` (or any
+`--target-branch`) is always force-pushed.
 
 On `--push`, local branches are moved to match what was pushed: a branch checked
 out in a worktree is hard-reset when that worktree is clean (untracked files are
 kept), or left untouched with a warning if it has uncommitted tracked changes; a
-local branch with no worktree is just repointed. So a worktree sitting on `main` or
-`mistral-main` ends up at the rebuilt commit rather than drifting behind. Pass
+local branch with no worktree is just repointed. So a worktree sitting on
+`upstream-main` or `mistral-main` ends up at the rebuilt commit rather than drifting
+behind. Pass
 `--no-update-local` to skip this and only update the remote.
 
 ## Automatic rebuilds (CI)
@@ -82,28 +84,29 @@ local branch with no worktree is just repointed. So a worktree sitting on `main`
 The **Build mistral-main branch** GitHub Action rebuilds `mistral-main` for you.
 
 - **On every push**: the action runs, but the tool exits cleanly and does nothing
-  unless the pushed branch is `main` or one of the branches listed in
+  unless the pushed branch is `upstream-main` or one of the branches listed in
   `.mistral_branches.txt`. When it is, `mistral-main` is rebuilt and force-pushed.
-  A push-triggered run never touches `main`. So pushing a feature branch that is in
-  the list (or updating `mistral-branches`) is enough to refresh `mistral-main`.
+  A push-triggered run never touches `upstream-main`. So pushing a feature branch
+  that is in the list (or updating `mistral-branches`) is enough to refresh
+  `mistral-main`.
 - **Manual dispatch**: use it to force a rebuild, to run a dry-run (uncheck *push*),
-  or to also mirror `main` to the latest `upstream/main` (check *update main*).
+  or to also mirror `upstream-main` to the latest `upstream/main` (check *update main*).
 
 The tool's own pushes do not start another run: with the default `GITHUB_TOKEN`,
 GitHub does not re-trigger workflows from pushes it makes, and a push to
 `mistral-main` is a no-op anyway since it is not a listed branch. So a manual
-dispatch that updates `main` does not loop back into another build.
+dispatch that updates `upstream-main` does not loop back into another build.
 
 Before replaying, it checks each listed branch and prints a diagnostic when a
 branch is stacked on another listed branch or already appears in an upstream merged
-PR. A stale base (branch behind the latest `main`) is not flagged on its own, since
+PR. A stale base (branch behind the latest `upstream/main`) is not flagged on its own, since
 upstream moves fast and branches are not kept rebased; it is only mentioned as the
 first thing to try if it actually causes a conflict. A cherry-pick conflict stops
 the run and names the branch and commit to fix.
 
 ## Personal test build
 
-To try your own set of branches without touching `main` or `mistral-main`, run from
+To try your own set of branches without touching `upstream-main` or `mistral-main`, run from
 the `mistral-branches` worktree, add your branch to `.mistral_branches.txt`
 (uncommitted is fine), and pick a throwaway target branch:
 
@@ -125,8 +128,8 @@ on `mistral-branches` and its state differs from `origin/mistral-branches`
 (uncommitted edits or unpushed commits), so a local experiment can never overwrite
 the canonical `mistral-main` by accident.
 
-`main` is left untouched when the target is not `mistral-main`, and the target
-branch is created if it does not exist (only on `--push`; a dry-run creates
+`upstream-main` is left untouched when the target is not `mistral-main`, and the
+target branch is created if it does not exist (only on `--push`; a dry-run creates
 nothing). Clean up when done:
 
 ```sh
@@ -135,10 +138,10 @@ git push origin --delete myuser/try
 
 ## Keeping branches clean and resolving conflicts
 
-Every branch must sit directly on `main` and apply independently of the others.
+Every branch must sit directly on `upstream/main` and apply independently of the others.
 
 When upstream moves and a branch no longer applies, rebase that branch onto the
-new `main` and resolve the conflict there, then push it back:
+new `upstream/main` and resolve the conflict there, then push it back:
 
 ```sh
 git fetch upstream main
@@ -148,7 +151,7 @@ git push --force-with-lease origin myuser/my-fix
 ```
 
 When two of our own branches conflict with each other, they cannot both apply on a
-clean `main`. Do not stack one on the other (the pre-flight check flags that, and
+clean `upstream/main`. Do not stack one on the other (the pre-flight check flags that, and
 ordering becomes fragile). Instead express the forward fix as a single integration
 branch that merges both and resolves the conflict once:
 
