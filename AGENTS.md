@@ -4,6 +4,10 @@ llm-d Router. Go service that routes inference requests to model-serving pods vi
 
 `make help` lists targets. `make presubmit` is the pre-merge gate. All targets run inside a builder container; host Go is not required.
 
+## Mistral fork
+
+This is Mistral's fork; the default branch is `mistral-main`. Base each change as a small feature branch on `upstream-main` (or `upstream/main` if the upstream remote is set up), add it to `.mistral_branches.txt`, and the `mistral-release/` tool replays the listed branches onto `mistral-main`. `upstream-main` mirrors the upstream project's `main`; never push directly to it or to `mistral-main`. See `MISTRAL_README.md` for details.
+
 ## Agent operating rules
 
 **Allowed.** Edit code, run `make` targets, read the codebase and GitHub state.
