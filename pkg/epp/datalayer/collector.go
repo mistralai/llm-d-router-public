@@ -68,6 +68,7 @@ type Collector struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	done   chan struct{}
+	ep     fwkdl.Endpoint // the endpoint being collected; set by Start
 }
 
 // NewCollector returns a new collector.
@@ -97,8 +98,17 @@ func (c *Collector) Start(ctx context.Context, ticker Ticker, ep fwkdl.Endpoint,
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	c.cancel = cancel
+	c.ep = ep
 	go c.run(ctx, ticker, ep, dispatchers)
 	return nil
+}
+
+// Endpoint returns the endpoint this collector was started for, or nil if it
+// has not been started yet.
+func (c *Collector) Endpoint() fwkdl.Endpoint {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ep
 }
 
 // Stop cancels the collection goroutine and blocks until it has exited. Idempotent.
