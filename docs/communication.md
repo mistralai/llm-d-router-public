@@ -605,6 +605,7 @@ Two request formats are supported (see [Request Format Configuration](#request-f
 - `kv_transfer_params.do_remote_decode = true, do_remote_prefill = false` tells the prefill worker to store KV cache for remote decode
 - `mm_placeholders` use the original offsets from the render response (positions in the full token sequence)
 - Response headers listed in the pipeline's `forward_response_headers` allowlist are selected from each response-producing phase and sent with later requests. Fan-out phases select the most frequent value of each header. Client-supplied values for listed headers are discarded. This can carry EPP-stamped revision and topology metadata across encode, prefill, and decode.
+- Every coordinator phase request carries the same coordinator-owned `x-llm-d-revision-decision-id`. Revision-aware EPP plugins can use it to coordinate one revision across parallel encode requests. A client-provided value is always replaced.
 
 ---
 

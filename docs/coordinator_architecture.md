@@ -261,6 +261,7 @@ steps read and mutate. The load-bearing fields:
 | `Body` | server (parsed JSON) | every step; mutated in place as the request is enriched |
 | `OriginalPath`, `OriginalHeaders`, `OriginalBody` | server | format detection, header forwarding |
 | `Model`, `Stream` | server | request construction, response handling |
+| `RevisionDecisionID` | pipeline | EPP revision coordination across parallel and sequential phase requests |
 | `TokenIDs` | `render` | `conditional-decode`, `encode`, `prefill`, `decode` |
 | `MultimodalEntries` | `replace-media-urls` (seeded), `render` (enriched) | `encode`, `prefill`, `decode` |
 | `ECTransferParams` | `encode` (via the EC connector) | `prefill` |
@@ -275,6 +276,9 @@ allowlist response headers with `forward_response_headers`; values returned by a
 response-producing step are stored on the request context for later requests. A fan-out
 step selects the most frequent value for each configured header independently. Configured
 names are reserved for this relay, so client-provided values are not sent upstream.
+The pipeline also generates a coordinator-owned
+`x-llm-d-revision-decision-id` for every request. Any client-provided value
+under that name is discarded.
 
 ### EPP-Profile routing
 
@@ -342,6 +346,14 @@ replace the carried value, so decode can prefer the prefill slice.
 Aggregation happens after the fan-out and cannot constrain sibling encode requests.
 Strict constraints shared by those requests, such as revision selection, require
 coordination before the fan-out begins.
+
+### Revision coordination
+
+The coordinator sends the same revision decision ID to every phase. A
+revision-aware EPP plugin can use an atomic cross-replica operation to choose
+one revision for parallel encode requests and reuse it for prefill and decode.
+The decision ID is independent of `x-request-id`, so a client cannot pin a
+revision by supplying a request ID.
 
 ### Decode disaggregation deciders
 
