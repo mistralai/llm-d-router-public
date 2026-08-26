@@ -7,7 +7,7 @@
 #   - `#` starts a comment, either on its own line or after a branch name
 #   - surrounding whitespace is ignored
 #
-# Each branch should be a small feature branch based directly on `main`. Ideally
+# Each branch should be a small feature branch based directly on `upstream/main`. Ideally
 # its comment links the upstream PR that carries the same change, so once that PR
 # merges the branch can be dropped from this list. See MISTRAL_README.md.
 #
