@@ -27,11 +27,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
+	"github.com/google/uuid"
 
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 
 	"github.com/llm-d/llm-d-router/pkg/coordinator/config"
+	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline"
 )
 
@@ -43,6 +44,19 @@ type stubStep struct {
 func (s stubStep) Name() string { return s.name }
 
 func (s stubStep) Execute(context.Context, *pipeline.RequestContext) error { return s.err }
+
+type captureRevisionDecisionStep struct {
+	requestID          string
+	revisionDecisionID string
+}
+
+func (s *captureRevisionDecisionStep) Name() string { return "capture-revision-decision" }
+
+func (s *captureRevisionDecisionStep) Execute(_ context.Context, reqCtx *pipeline.RequestContext) error {
+	s.requestID = reqCtx.RequestID
+	s.revisionDecisionID = reqCtx.RevisionDecisionID
+	return nil
+}
 
 func newTestServer(stepErr error) *Server {
 	p := pipeline.New([]pipeline.Step{stubStep{name: "stub", err: stepErr}})
@@ -116,6 +130,28 @@ func TestHandleInference_SuccessMapsTo200(t *testing.T) {
 	rec := postInference(t, newTestServer(nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 on success, got %d", rec.Code)
+	}
+}
+
+func TestHandleInferenceGeneratesCoordinatorRevisionDecisionID(t *testing.T) {
+	step := &captureRevisionDecisionStep{}
+	srv, err := New(config.ServerConfig{}, pipeline.New([]pipeline.Step{step}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clientRequestID = "client-request-id"
+	rec := postInferenceWithRequestID(t, srv, clientRequestID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if step.requestID != clientRequestID {
+		t.Fatalf("request ID = %q, want %q", step.requestID, clientRequestID)
+	}
+	if step.revisionDecisionID == "" || step.revisionDecisionID == clientRequestID {
+		t.Fatalf("revision decision ID = %q, want an independent coordinator value", step.revisionDecisionID)
+	}
+	if _, err := uuid.Parse(step.revisionDecisionID); err != nil {
+		t.Fatalf("revision decision ID %q is not a UUID: %v", step.revisionDecisionID, err)
 	}
 }
 
