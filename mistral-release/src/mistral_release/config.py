@@ -13,9 +13,9 @@ DEFAULT_CONFIG = ".mistral_branches.txt"
 def reserved_conflicts(branches: list[str], reserved: Iterable[str]) -> list[str]:
     """Returns the sorted reserved names that wrongly appear in the branch list.
 
-    ``main`` and the rebuilt target are produced from the list, never a source of
-    commits, so listing them is always a mistake. An empty result means the list is
-    clean.
+    ``upstream-main`` and the rebuilt target are produced from the list, never a
+    source of commits, so listing them is always a mistake. An empty result means
+    the list is clean.
     """
     reserved_set = set(reserved)
     return sorted({b for b in branches if b in reserved_set})
