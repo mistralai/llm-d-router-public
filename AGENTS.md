@@ -6,7 +6,7 @@ llm-d Router. Go service that routes inference requests to model-serving pods vi
 
 ## Mistral fork
 
-This is Mistral's fork; the default branch is `mistral-main`. Base each change as a small feature branch on `upstream-main` (or `upstream/main` if the upstream remote is set up), add it to `.mistral_branches.txt`, and the `mistral-release/` tool replays the listed branches onto `mistral-main`. `upstream-main` mirrors the upstream project's `main`; never push directly to it or to `mistral-main`. See `MISTRAL_README.md` for details.
+This is Mistral's fork; the default branch is `mistral-main`. Base each change as a small feature branch on `upstream-main` (or `upstream/main` if the upstream remote is set up), add it to `.mistral_branches.txt`, and the `mistral-release/` tool replays the listed branches onto `mistral-main`. Edit that config file and run the tool from the `mistral-branches` branch, which owns them. `upstream-main` mirrors the upstream project's `main`; never push directly to it or to `mistral-main`. See `MISTRAL_README.md` for details.
 
 ## Agent operating rules
 
