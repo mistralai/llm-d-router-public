@@ -4,8 +4,9 @@ Rebuild the ``mistral-main`` branch from scratch on top of ``upstream/main``:
 ``mistral-main`` is reconstructed as ``upstream/main`` plus every mistral-specific
 commit contributed by the branches listed in ``.mistral_branches.txt``. Branches
 are applied in list order; commits already present upstream or applied by an
-earlier branch are skipped. ``main`` is mirrored to the latest ``upstream/main`` at
-the same time, and both branches are pushed together atomically.
+earlier branch are skipped. ``upstream-main`` is mirrored to the latest
+``upstream/main`` at the same time, and both branches are pushed together
+atomically.
 
 The rebuild happens in a throwaway detached worktree, so the current checkout is
 never touched. Nothing is pushed unless ``--push`` is given. On ``--push`` local
@@ -41,7 +42,7 @@ DEFAULT_UPSTREAM_REMOTE = "upstream"
 DEFAULT_UPSTREAM_BRANCH = "main"
 DEFAULT_ORIGIN_REMOTE = "origin"
 DEFAULT_TARGET_BRANCH = "mistral-main"
-DEFAULT_MAIN_BRANCH = "main"
+DEFAULT_MAIN_BRANCH = "upstream-main"
 DEFAULT_BRANCHES_BRANCH = "mistral-branches"
 
 

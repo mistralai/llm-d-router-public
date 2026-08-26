@@ -1,21 +1,23 @@
 name: Build mistral-main branch
 
 # Rebuilds `mistral-main` = upstream/main + the mistral-specific commits listed in
-# .mistral_branches.txt, and (optionally) mirrors `main` to upstream/main, then
-# force-pushes. See mistral-release/ for the logic.
+# .mistral_branches.txt, and (optionally) mirrors `upstream-main` to upstream/main,
+# then force-pushes. See mistral-release/ for the logic.
 #
-# Runs on every push, but the tool exits cleanly unless the pushed branch is `main`
-# or one of the branches listed in .mistral_branches.txt (--triggered-by). Push
-# events only ever rebuild mistral-main and never touch `main`. A manual dispatch can
-# additionally mirror `main` to upstream/main via the update_main input.
+# Runs on every push, but the tool exits cleanly unless the pushed branch is
+# `upstream-main` or one of the branches listed in .mistral_branches.txt
+# (--triggered-by). Push events only ever rebuild mistral-main and never touch
+# `upstream-main`. A manual dispatch can additionally mirror `upstream-main` to
+# upstream/main via the update_main input.
 #
 # The default GITHUB_TOKEN force-pushes the branches. This works only if they are
 # NOT protected (or the github-actions actor is on the protection bypass list).
 # Otherwise swap the checkout token for a PAT/App token allowed to force-push them.
 # Pushes made with the default GITHUB_TOKEN do NOT start a new workflow run, so the
-# tool's own pushes to `main` and `mistral-main` never trigger this workflow again.
-# (If you swap in a PAT, that loop-guard is lost; the --triggered-by check still
-# stops a push to `mistral-main` early, but a `main` update would start one more run.)
+# tool's own pushes to `upstream-main` and `mistral-main` never trigger this workflow
+# again. (If you swap in a PAT, that loop-guard is lost; the --triggered-by check
+# still stops a push to `mistral-main` early, but an `upstream-main` update would
+# start one more run.)
 
 on:
   push:
@@ -28,7 +30,7 @@ on:
         type: boolean
         default: true
       update_main:
-        description: "Also mirror main to the latest upstream/main"
+        description: "Also mirror upstream-main to the latest upstream/main"
         type: boolean
         default: false
 
@@ -48,8 +50,9 @@ jobs:
         with:
           ref: mistral-branches
           fetch-depth: 0
-          # Swap in a PAT/App token here (e.g. secrets.MISTRAL_MAIN_PAT) if `main`
-          # or `mistral-main` are protected against the default github-actions actor.
+          # Swap in a PAT/App token here (e.g. secrets.MISTRAL_MAIN_PAT) if
+          # `upstream-main` or `mistral-main` are protected against the default
+          # github-actions actor.
           token: ${{ github.token }}
 
       - name: Add upstream remote
@@ -65,7 +68,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
 
-      - name: Rebuild main + mistral-main
+      - name: Rebuild upstream-main + mistral-main
         # GH_TOKEN lets the tool's gh pre-flight check query upstream PRs.
         env:
           GH_TOKEN: ${{ github.token }}
