@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -88,6 +89,9 @@ func NewWithForwardResponseHeaders(steps []Step, headers []string) (*Pipeline, e
 func (p *Pipeline) Execute(ctx context.Context, reqCtx *RequestContext) error {
 	logger := log.FromContext(ctx)
 	reqCtx.forwardResponseHeaders = p.forwardResponseHeaders
+	if reqCtx.RevisionDecisionID == "" {
+		reqCtx.RevisionDecisionID = uuid.NewString()
+	}
 
 	type stepTiming struct {
 		name     string

@@ -19,6 +19,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 )
 
@@ -151,6 +152,21 @@ func TestNewWithForwardResponseHeaders_RejectsInvalidNames(t *testing.T) {
 		if _, err := NewWithForwardResponseHeaders(nil, headers); err == nil {
 			t.Fatalf("NewWithForwardResponseHeaders(%v) expected error", headers)
 		}
+	}
+}
+
+func TestPipeline_GeneratesRevisionDecisionID(t *testing.T) {
+	var decisionID string
+	p := New([]Step{&mockStep{name: "capture", fn: func(_ context.Context, rc *RequestContext) error {
+		decisionID = rc.RevisionDecisionID
+		return nil
+	}}})
+
+	if err := p.Execute(context.Background(), &RequestContext{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if decisionID == "" {
+		t.Fatal("pipeline did not generate a revision decision ID")
 	}
 }
 
