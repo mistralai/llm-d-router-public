@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 )
 
 var hopByHopHeaders = map[string]bool{
@@ -34,7 +36,8 @@ var hopByHopHeaders = map[string]bool{
 }
 
 var internalForwardingHeaders = map[string]bool{
-	"epp-profile": true,
+	"epp-profile":                         true,
+	reqcommon.RevisionDecisionIDHeaderKey: true,
 }
 
 func isForwardableHeader(name string) bool {
@@ -65,6 +68,9 @@ func (rc *RequestContext) ForwardedHeaders() map[string]string {
 			continue
 		}
 		out[key] = value
+	}
+	if rc.RevisionDecisionID != "" {
+		out[reqcommon.RevisionDecisionIDHeaderKey] = rc.RevisionDecisionID
 	}
 	return out
 }
@@ -111,13 +117,14 @@ func (rc *RequestContext) CaptureResponseHeaders(responses ...http.Header) {
 
 // RequestContext carries all state for a single request through the pipeline.
 type RequestContext struct {
-	RequestID       string
-	OriginalPath    string
-	OriginalHeaders http.Header
-	OriginalBody    []byte
-	Body            map[string]any
-	Model           string
-	Stream          bool
+	RequestID          string
+	RevisionDecisionID string
+	OriginalPath       string
+	OriginalHeaders    http.Header
+	OriginalBody       []byte
+	Body               map[string]any
+	Model              string
+	Stream             bool
 
 	// ParseDuration is the time the server spent reading and JSON-parsing the
 	// request body before the pipeline ran. Execute reports it as the first
