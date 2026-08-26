@@ -368,6 +368,7 @@ flowControl:
   - priority: 100
     orderingPolicyRef: customFCFS
     fairnessPolicyRef: customFairness
+    rejectOnGlobalSaturation: true
 `
 
 // successParserConfigText tests that configuration with parser plugin is correctly loaded.

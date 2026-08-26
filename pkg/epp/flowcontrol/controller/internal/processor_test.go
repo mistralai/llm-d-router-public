@@ -1751,6 +1751,51 @@ func TestProcessor_DropSummary(t *testing.T) {
 	})
 }
 
+func TestProcessor_RejectOnGlobalSaturation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                     string
+		saturation               float64
+		poolEmpty                bool
+		rejectOnGlobalSaturation bool
+		wantRejected             bool
+	}{
+		{name: "rejects opted-in band at global saturation", saturation: 1.0, rejectOnGlobalSaturation: true, wantRejected: true},
+		{name: "admits opted-out band at global saturation", saturation: 1.0, rejectOnGlobalSaturation: false},
+		{name: "admits opted-in band below global saturation", saturation: 0.99, rejectOnGlobalSaturation: true},
+		{name: "admits opted-in band when the pool is empty", saturation: 1.0, poolEmpty: true, rejectOnGlobalSaturation: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			h := newTestHarness(t, testCleanupTick)
+			h.addQueue(testFlow)
+			h.processor.globalSaturation = test.saturation
+			h.processor.regime.Store(&regimeSample{empty: test.poolEmpty})
+			h.CapacitySnapshotFunc = func(int) (contracts.CapacitySnapshot, error) {
+				return contracts.CapacitySnapshot{
+					Global:                   contracts.CapacityDimension{CapacityBytes: 1e9},
+					Band:                     contracts.CapacityDimension{CapacityBytes: 1e9},
+					RejectOnGlobalSaturation: test.rejectOnGlobalSaturation,
+				}, nil
+			}
+
+			item := h.newTestItem("request", testFlow, testTTL)
+			h.processor.enqueue(item)
+
+			if test.wantRejected {
+				outcome, err := h.waitForFinalization(item)
+				assert.Equal(t, types.QueueOutcomeRejectedCapacity, outcome)
+				assert.ErrorIs(t, err, types.ErrGlobalSaturation)
+				return
+			}
+			assert.Nil(t, item.FinalState(), "admitted item should remain pending")
+		})
+	}
+}
+
 // TestProcessor_QueueWaitBudget verifies that the queue-wait budget tracks the unavailability regime: the saturation
 // budget while the pool has endpoints, the no-endpoint budget while it does not, re-evaluated as the request waits
 // rather than fixed at admission.

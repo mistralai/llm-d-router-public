@@ -101,6 +101,9 @@ type Processor struct {
 	// synchronization.
 	ceilings []float64
 
+	// globalSaturation is the most recent effective detector sample. The run goroutine is its sole reader and writer.
+	globalSaturation float64
+
 	// wg is used to wait for background tasks (cleanup sweep) to complete on shutdown.
 	wg             sync.WaitGroup
 	isShuttingDown atomic.Bool
@@ -326,6 +329,14 @@ func (p *Processor) enqueue(item *FlowItem) {
 		p.recordDrop(types.QueueOutcomeRejectedOther)
 		return
 	}
+	if stats.RejectOnGlobalSaturation && p.globalSaturation >= 1.0 && !p.regime.Load().empty {
+		p.logger.V(logutil.DEBUG).Info("Rejecting request at global saturation",
+			"flowKey", key, "requestID", req.ID(), "saturation", p.globalSaturation)
+		item.FinalizeWithOutcome(types.QueueOutcomeRejectedCapacity, fmt.Errorf("%w: %w",
+			types.ErrRejected, types.ErrGlobalSaturation))
+		p.recordDrop(types.QueueOutcomeRejectedCapacity)
+		return
+	}
 	if !ok {
 		// When the pool has no endpoints, the queue is acting as a scale-from-zero waiting room. A capacity rejection in
 		// that state reflects genuine unavailability (surfaced as 503), not backpressure against a contended pool (429).
@@ -485,6 +496,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	if saturation < 0 {
 		saturation = p.saturationDetector.Saturation(ctx, pool)
 	}
+	p.globalSaturation = saturation
 
 	metrics.RecordFlowControlPoolSaturation(p.poolName, "effective", saturation)
 

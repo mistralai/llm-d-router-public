@@ -62,6 +62,17 @@ Tuning knobs, all under the `flowControl:` config section:
 * Per-band `maxRequests` / `maxBytes` — the shedding knobs. Lower them to reject excess load at the
   queue boundary instead of buffering it (for example, to approximate the legacy immediate-shed
   behavior for sheddable traffic).
+* Per-band `rejectOnGlobalSaturation` — rejects new requests with HTTP 429 when the saturation
+  detector reports at least `1.0` and the pool has endpoints. Existing queued requests are
+  unaffected. Leave it disabled for priority bands that should continue queueing at saturation.
+
+  ```yaml
+  priorityBands:
+  - priority: 100
+    rejectOnGlobalSaturation: false
+  - priority: 0
+    rejectOnGlobalSaturation: true
+  ```
 * `defaultRequestTTL` — the queue-wait budget against a pool that has endpoints, and the other way a
   request is shed. Keep it under the client or gateway deadline, and size it to the time-to-first-token
   budget you are willing to spend waiting on a saturated pool.

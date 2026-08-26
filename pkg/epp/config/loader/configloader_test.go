@@ -722,6 +722,8 @@ func TestInstantiateAndConfigure(t *testing.T) {
 					"Should use custom fairness policy name")
 				require.Equal(t, globalstrict.GlobalStrictFairnessPolicyType, band.FairnessPolicy.TypedName().Type,
 					"Should be GlobalStrict type")
+				require.True(t, band.RejectOnGlobalSaturation,
+					"Should reject new requests at global saturation")
 			},
 		},
 		{

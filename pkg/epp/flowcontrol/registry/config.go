@@ -152,6 +152,10 @@ type PriorityBandConfig struct {
 	// the default; per-band limits are always bounded, unlike the optional global limits. To effectively remove
 	// the bound, set an explicit large value.
 	MaxRequests uint64
+
+	// RejectOnGlobalSaturation rejects new requests in this band when pool saturation is at least 1.0.
+	// Requests already queued in the band are unaffected.
+	RejectOnGlobalSaturation bool
 }
 
 func (p *PriorityBandConfig) String() string {
@@ -287,6 +291,14 @@ func WithBandMaxBytes(maxBytes uint64) PriorityBandConfigOption {
 func WithBandMaxRequests(maxRequests uint64) PriorityBandConfigOption {
 	return func(p *PriorityBandConfig) error {
 		p.MaxRequests = maxRequests
+		return nil
+	}
+}
+
+// WithRejectOnGlobalSaturation configures whether this priority band rejects new requests at global saturation.
+func WithRejectOnGlobalSaturation(reject bool) PriorityBandConfigOption {
+	return func(p *PriorityBandConfig) error {
+		p.RejectOnGlobalSaturation = reject
 		return nil
 	}
 }

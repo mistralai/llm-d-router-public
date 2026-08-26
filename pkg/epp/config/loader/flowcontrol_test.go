@@ -89,8 +89,9 @@ func TestBuildRegistryConfig(t *testing.T) {
 				MaxBytes: ptr.To(resource.MustParse("100")),
 				PriorityBands: []configapi.PriorityBandConfig{
 					{
-						Priority: 1,
-						MaxBytes: ptr.To(resource.MustParse("50")),
+						Priority:                 1,
+						MaxBytes:                 ptr.To(resource.MustParse("50")),
+						RejectOnGlobalSaturation: true,
 					},
 				},
 				DefaultPriorityBand: &configapi.PriorityBandConfig{
@@ -103,6 +104,8 @@ func TestBuildRegistryConfig(t *testing.T) {
 				// Verify Explicit Band
 				require.Contains(t, cfg.PriorityBands, 1, "Configured priority band should be present")
 				assert.Equal(t, uint64(50), cfg.PriorityBands[1].MaxBytes, "Band MaxBytes should be correctly translated")
+				assert.True(t, cfg.PriorityBands[1].RejectOnGlobalSaturation,
+					"RejectOnGlobalSaturation should be correctly translated")
 
 				// Verify Default Template
 				require.NotNil(t, cfg.DefaultPriorityBand, "DefaultPriorityBand should be configured")

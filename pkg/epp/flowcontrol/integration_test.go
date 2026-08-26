@@ -354,6 +354,64 @@ func TestPriorityBackpressure(t *testing.T) {
 	require.Equal(t, "low-1", dispatchOrder[1])
 }
 
+func TestRejectOnGlobalSaturationByPriorityBand(t *testing.T) {
+	t.Parallel()
+
+	handle := testutils.NewTestHandle(t.Context())
+	oPolicy, err := fcfs.FCFSOrderingPolicyFactory("fcfs", nil, handle)
+	require.NoError(t, err)
+	fPolicy, err := globalstrict.GlobalStrictFairnessPolicyFactory("gs", nil, handle)
+	require.NoError(t, err)
+	defaults := registry.PriorityBandPolicyDefaults{
+		OrderingPolicy: oPolicy.(flowcontrol.OrderingPolicy),
+		FairnessPolicy: fPolicy.(flowcontrol.FairnessPolicy),
+	}
+
+	highBand, err := registry.NewPriorityBandConfig(10, defaults)
+	require.NoError(t, err)
+	lowBand, err := registry.NewPriorityBandConfig(0, defaults,
+		registry.WithRejectOnGlobalSaturation(true),
+	)
+	require.NoError(t, err)
+
+	h := newHarness(t, harnessOpts{
+		detector:           newBlockedDetector(),
+		bands:              []*registry.PriorityBandConfig{highBand, lowBand},
+		endpointCandidates: nonEmptyCandidates(),
+	})
+
+	highCtx, cancelHigh := context.WithCancel(h.ctx)
+	highResult := make(chan dispatchResult, 1)
+	go func() {
+		req := &testRequest{
+			id: "high-queues", key: flowcontrol.FlowKey{ID: "high", Priority: 10},
+			byteSize: 100, ttl: 5 * time.Minute,
+		}
+		outcome, err := h.fc.EnqueueAndWait(highCtx, req)
+		highResult <- dispatchResult{id: req.id, outcome: outcome, err: err}
+	}()
+	require.Eventually(t, func() bool {
+		return h.reg.Stats().PerPriorityBand[10].Len == 1
+	}, time.Second, time.Millisecond, "high-priority request should remain queued")
+
+	lowReq := &testRequest{
+		id: "low-rejects", key: flowcontrol.FlowKey{ID: "low", Priority: 0},
+		byteSize: 100, ttl: 5 * time.Minute,
+	}
+	outcome, err := h.fc.EnqueueAndWait(h.ctx, lowReq)
+	require.Equal(t, fcTypes.QueueOutcomeRejectedCapacity, outcome)
+	require.ErrorIs(t, err, fcTypes.ErrGlobalSaturation)
+	require.Zero(t, h.reg.Stats().PerPriorityBand[0].Len,
+		"rejected low-priority request should not enter its queue")
+
+	cancelHigh()
+	select {
+	case <-highResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for queued high-priority request cleanup")
+	}
+}
+
 // TestFairnessRoundRobin verifies that round-robin fairness rotates dispatch
 // across flows within a priority band.
 func TestFairnessRoundRobin(t *testing.T) {

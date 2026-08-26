@@ -143,6 +143,8 @@ type CapacitySnapshot struct {
 	Band CapacityDimension
 	// Global holds the registry-wide occupancy and limits.
 	Global CapacityDimension
+	// RejectOnGlobalSaturation indicates whether new requests in the band are rejected at saturation.
+	RejectOnGlobalSaturation bool
 }
 
 // ActiveFlowConnection represents a handle to a scoped, leased session on a flow.

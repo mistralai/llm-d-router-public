@@ -565,6 +565,12 @@ type PriorityBandConfig struct {
 	MaxRequests *resource.Quantity `json:"maxRequests,omitempty"`
 
 	// +optional
+	// RejectOnGlobalSaturation rejects new requests in this band when the saturation detector reports
+	// a value greater than or equal to 1.0. Requests already queued in the band remain queued.
+	// Defaults to false.
+	RejectOnGlobalSaturation bool `json:"rejectOnGlobalSaturation,omitempty"`
+
+	// +optional
 	// FairnessPolicyRef specifies the name of the policy that governs flow selection.
 	// If omitted, the system default ("global-strict-fairness-policy") is used.
 	FairnessPolicyRef string `json:"fairnessPolicyRef,omitempty"`
@@ -585,6 +591,10 @@ func (pbc PriorityBandConfig) String() string {
 
 	if pbc.MaxRequests != nil {
 		parts = append(parts, fmt.Sprintf("MaxRequests: %d", pbc.MaxRequests.Value()))
+	}
+
+	if pbc.RejectOnGlobalSaturation {
+		parts = append(parts, "RejectOnGlobalSaturation: true")
 	}
 
 	if pbc.FairnessPolicyRef != "" {

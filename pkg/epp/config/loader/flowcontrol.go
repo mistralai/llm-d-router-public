@@ -145,7 +145,8 @@ func buildPriorityBand(
 	band *configapi.PriorityBandConfig,
 	label string,
 ) (*registry.PriorityBandConfig, error) {
-	bandOpts := make([]registry.PriorityBandConfigOption, 0, 4)
+	bandOpts := make([]registry.PriorityBandConfigOption, 0, 5)
+	bandOpts = append(bandOpts, registry.WithRejectOnGlobalSaturation(band.RejectOnGlobalSaturation))
 
 	maxBytes, err := resolveQuantity(band.MaxBytes, label+" MaxBytes")
 	if err != nil {

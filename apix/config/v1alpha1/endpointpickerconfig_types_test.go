@@ -63,13 +63,17 @@ func TestStringers(t *testing.T) {
 				MaxBytes:          resource.NewQuantity(1024, resource.DecimalSI),
 				DefaultRequestTTL: &metav1.Duration{Duration: 30 * time.Second},
 				PriorityBands: []PriorityBandConfig{
-					{Priority: 10, MaxBytes: resource.NewQuantity(512, resource.DecimalSI)},
+					{
+						Priority:                 10,
+						MaxBytes:                 resource.NewQuantity(512, resource.DecimalSI),
+						RejectOnGlobalSaturation: true,
+					},
 				},
 				SaturationDetector: &SaturationDetectorConfig{
 					PluginRef: "test-plugin",
 				},
 			},
-			want: "{MaxBytes: 1024, MaxRequests: unlimited, DefaultRequestTTL: 30s, PriorityBands: [{Priority: 10, MaxBytes: 512}], SaturationDetector: {PluginRef: test-plugin}}",
+			want: "{MaxBytes: 1024, MaxRequests: unlimited, DefaultRequestTTL: 30s, PriorityBands: [{Priority: 10, MaxBytes: 512, RejectOnGlobalSaturation: true}], SaturationDetector: {PluginRef: test-plugin}}",
 		},
 		{
 			name: "RequestHandlerConfig",
