@@ -42,8 +42,9 @@ type setCall struct {
 }
 
 type fakeSyncer struct {
-	mu   sync.Mutex
-	sets []setCall
+	mu      sync.Mutex
+	sets    []setCall
+	deletes []setCall
 }
 
 func (s *fakeSyncer) TypedName() fwkplugin.TypedName {
@@ -61,7 +62,12 @@ func (s *fakeSyncer) Get(context.Context, fwkdl.StateKey, string, func([]any) an
 	return nil, false, nil
 }
 
-func (s *fakeSyncer) Delete(context.Context, fwkdl.StateKey, string) error { return nil }
+func (s *fakeSyncer) Delete(_ context.Context, key fwkdl.StateKey, endpointID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deletes = append(s.deletes, setCall{key: key, endpointID: endpointID})
+	return nil
+}
 
 // fakeContributor is a Plugin + CrossReplicaContributor whose supplied value
 // echoes the endpoint ID, so tests can assert routing to the right key.
@@ -78,6 +84,18 @@ func (fakeEndpointContributor) Extract(context.Context, fwkdl.EndpointEvent) err
 	return nil
 }
 
+type callbackEndpointContributor struct {
+	fakeContributor
+	onDelete func()
+}
+
+func (c callbackEndpointContributor) Extract(_ context.Context, event fwkdl.EndpointEvent) error {
+	if event.Type == fwkdl.EventDelete && c.onDelete != nil {
+		c.onDelete()
+	}
+	return nil
+}
+
 type blockingSyncer struct {
 	mu         sync.Mutex
 	setStarted chan struct{}
@@ -87,16 +105,41 @@ type blockingSyncer struct {
 	events     []string
 }
 
-type deadlineSyncer struct {
+type blockingGetSyncer struct {
 	fakeSyncer
-	deadlineObserved chan bool
+	getStarted chan struct{}
+	allowGet   chan struct{}
 }
 
-func (s *deadlineSyncer) Set(ctx context.Context, key fwkdl.StateKey, endpointID string, value any) error {
-	_, ok := ctx.Deadline()
+type parallelSyncer struct {
+	fakeSyncer
+	started chan setCall
+	release chan struct{}
+}
+
+func (s *blockingGetSyncer) Get(ctx context.Context, _ fwkdl.StateKey, _ string, _ func([]any) any) (any, bool, error) {
 	select {
-	case s.deadlineObserved <- ok:
+	case s.getStarted <- struct{}{}:
 	default:
+	}
+	select {
+	case <-s.allowGet:
+		return nil, false, nil
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+}
+
+func (s *parallelSyncer) Set(ctx context.Context, key fwkdl.StateKey, endpointID string, value any) error {
+	select {
+	case s.started <- setCall{key: key, endpointID: endpointID, value: value}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	return s.fakeSyncer.Set(ctx, key, endpointID, value)
 }
@@ -172,8 +215,10 @@ func TestCrossReplicaPublisher_PublishesForEndpoint(t *testing.T) {
 		syncer:       syncer,
 		contributors: []fwkdl.CrossReplicaContributor{fakeContributor{key: "inflight:test"}},
 	}
+	endpointID := types.NamespacedName{Namespace: "ns", Name: "ep-a"}
+	require.True(t, pub.RegisterEndpoint(endpointID))
 
-	pub.publish(context.Background(), "ns/ep-a")
+	pub.publish(context.Background(), endpointID)
 
 	require.Len(t, syncer.sets, 1)
 	assert.Equal(t, fwkdl.StateKey("inflight:test"), syncer.sets[0].key)
@@ -236,32 +281,92 @@ func TestCrossReplicaPublisher_PublishesAllEndpoints(t *testing.T) {
 	}, 2*time.Second, 5*time.Millisecond, "every registered endpoint should be published")
 }
 
-func TestCrossReplicaPublisher_SetsPerPublishDeadline(t *testing.T) {
-	syncer := &deadlineSyncer{deadlineObserved: make(chan bool, 1)}
-	r := NewRuntime(time.Second)
-	r.crossReplicaPub = &crossReplicaPublisher{
+func TestCrossReplicaPublisher_PublishesContributorsConcurrently(t *testing.T) {
+	syncer := &parallelSyncer{
+		started: make(chan setCall, 2),
+		release: make(chan struct{}),
+	}
+	pub := &crossReplicaPublisher{
+		syncer: syncer,
+		contributors: []fwkdl.CrossReplicaContributor{
+			fakeContributor{key: "inflight:test"},
+			fakeContributor{key: "queue:test"},
+		},
+	}
+	endpointID := testEndpoint("ep-a").GetMetadata().GetID()
+	require.True(t, pub.RegisterEndpoint(endpointID))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		pub.publish(context.Background(), endpointID)
+	}()
+
+	started := map[fwkdl.StateKey]bool{}
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for len(started) < 2 {
+		select {
+		case call := <-syncer.started:
+			started[call.key] = true
+		case <-timer.C:
+			close(syncer.release)
+			<-done
+			t.Fatalf("contributor publishing was sequential; started keys: %v", started)
+		}
+	}
+
+	close(syncer.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("parallel contributor publishing did not complete")
+	}
+}
+
+func TestCrossReplicaPublisher_SkipsEndpointDeletedAfterSnapshot(t *testing.T) {
+	syncer := &fakeSyncer{}
+	pub := &crossReplicaPublisher{
 		syncer:       syncer,
 		contributors: []fwkdl.CrossReplicaContributor{fakeContributor{key: "inflight:test"}},
-		interval:     time.Millisecond,
 	}
-	ep := testEndpoint("ep-a")
-	require.True(t, r.crossReplicaPub.RegisterEndpoint(ep.GetMetadata().GetID()))
+	endpointID := testEndpoint("ep-gone").GetMetadata().GetID()
+	require.True(t, pub.RegisterEndpoint(endpointID))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	r.crossReplicaPub.Start(ctx)
+	snapshot := pub.endpointSnapshot()
+	require.Len(t, snapshot, 1)
+	removed, err := pub.delete(context.Background(), endpointID)
+	require.NoError(t, err)
+	require.True(t, removed)
 
-	select {
-	case observed := <-syncer.deadlineObserved:
-		assert.True(t, observed, "cross-replica publish context must have a deadline")
-	case <-time.After(time.Second):
-		t.Fatal("cross-replica publish did not run")
+	pub.publish(context.Background(), snapshot[0])
+	assert.Empty(t, syncer.sets)
+}
+
+func TestCrossReplicaPublisher_DeletesAllContributorState(t *testing.T) {
+	syncer := &fakeSyncer{}
+	pub := &crossReplicaPublisher{
+		syncer: syncer,
+		contributors: []fwkdl.CrossReplicaContributor{
+			fakeContributor{key: "inflight:test"},
+			fakeContributor{key: "queue:test"},
+		},
 	}
+	endpointID := testEndpoint("ep-gone").GetMetadata().GetID()
+	require.True(t, pub.RegisterEndpoint(endpointID))
+
+	removed, err := pub.delete(context.Background(), endpointID)
+	require.NoError(t, err)
+	require.True(t, removed)
+	require.ElementsMatch(t, []setCall{
+		{key: "inflight:test", endpointID: "ns/ep-gone"},
+		{key: "queue:test", endpointID: "ns/ep-gone"},
+	}, syncer.deletes)
 }
 
 // Releasing an endpoint stops its publishing without tearing down a goroutine,
 // so removed endpoints cannot keep writing stale state.
-func TestCrossReplicaPublisher_StopsAfterUnregister(t *testing.T) {
+func TestCrossReplicaPublisher_StopsAfterDelete(t *testing.T) {
 	syncer := &fakeSyncer{}
 	r := NewRuntime(time.Second)
 	r.crossReplicaPub = &crossReplicaPublisher{
@@ -280,7 +385,9 @@ func TestCrossReplicaPublisher_StopsAfterUnregister(t *testing.T) {
 		return syncer.endpointIDs()["ns/ep-gone"] > 0
 	}, 2*time.Second, 5*time.Millisecond, "endpoint should publish while registered")
 
-	r.crossReplicaPub.UnregisterEndpoint(ep.GetMetadata().GetID(), nil)
+	removed, err := r.crossReplicaPub.delete(context.Background(), ep.GetMetadata().GetID())
+	require.NoError(t, err)
+	require.True(t, removed)
 	// Let any tick already in flight drain before sampling the baseline.
 	time.Sleep(50 * time.Millisecond)
 	baseline := syncer.endpointIDs()["ns/ep-gone"]
@@ -342,4 +449,82 @@ func TestReleaseEndpointWaitsForInFlightPublish(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, found, "released endpoint state must remain deleted")
 	assert.Equal(t, []string{"set", "delete"}, syncer.events)
+}
+
+func TestDeleteWaitsForInFlightGet(t *testing.T) {
+	syncer := &blockingGetSyncer{
+		getStarted: make(chan struct{}, 1),
+		allowGet:   make(chan struct{}),
+	}
+	pub := &crossReplicaPublisher{
+		syncer:       syncer,
+		contributors: []fwkdl.CrossReplicaContributor{fakeContributor{key: "inflight:test"}},
+	}
+	key := testEndpoint("ep-gone").GetMetadata().GetID()
+	require.True(t, pub.RegisterEndpoint(key))
+	spec := fakeContributor{key: "inflight:test"}.CrossReplicaState()
+
+	getDone := make(chan struct{})
+	go func() {
+		defer close(getDone)
+		_, _, _ = pub.get(context.Background(), spec, key.String())
+	}()
+	<-syncer.getStarted
+
+	deleteDone := make(chan struct{})
+	go func() {
+		defer close(deleteDone)
+		_, _ = pub.delete(context.Background(), key)
+	}()
+
+	select {
+	case <-deleteDone:
+		t.Error("delete completed while a get was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(syncer.allowGet)
+	select {
+	case <-getDone:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight get did not complete")
+	}
+	select {
+	case <-deleteDone:
+	case <-time.After(time.Second):
+		t.Fatal("delete did not complete")
+	}
+}
+
+func TestReleaseEndpointDispatchesDeleteOutsidePublisherLock(t *testing.T) {
+	syncer := &fakeSyncer{}
+	r := NewRuntime(time.Second)
+	contributor := callbackEndpointContributor{
+		fakeContributor: fakeContributor{key: "inflight:test"},
+		onDelete: func() {
+			_, _, _ = r.crossReplicaPub.get(context.Background(), fakeContributor{key: "inflight:test"}.CrossReplicaState(), "ns/ep-gone")
+		},
+	}
+	r.crossReplicaPub = &crossReplicaPublisher{
+		syncer:       syncer,
+		contributors: []fwkdl.CrossReplicaContributor{contributor},
+	}
+	source := notifications.NewEndpointDataSource(notifications.EndpointNotificationSourceType, "endpoint-source")
+	r.endpoint.Set(source)
+	r.extractors.Append(source.TypedName().Name, contributor)
+
+	ep := r.NewEndpoint(context.Background(), testEndpoint("ep-gone").GetMetadata())
+	require.NotNil(t, ep)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.ReleaseEndpoint(ep)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("endpoint delete event was dispatched while holding the publisher lock")
+	}
 }
