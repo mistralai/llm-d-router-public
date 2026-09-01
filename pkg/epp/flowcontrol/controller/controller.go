@@ -226,15 +226,20 @@ func (fc *FlowController) EnqueueAndWait(
 		req.InferencePoolName(),
 		req.ModelName(), req.TargetModelName(), reqBytes)
 
-	// 1. Create the derived context that governs this request's lifecycle (Parent Cancellation + TTL).
-	reqCtx, cancel, enqueueTime := fc.createRequestContext(ctx, req)
-	defer cancel()
+	// Capture the logical enqueue time before acquiring the flow. The band's TTL is only available
+	// from the acquired connection, but time spent acquiring it still counts against the queue budget.
+	enqueueTime := fc.clock.Now()
 
 	var finalOutcome types.QueueOutcome
 
 	// 2. Acquire a lease for the Flow.
 	// We hold this lease for the entire duration of the request (Distribution + Queueing).
 	err := fc.withConnectionWithFallback(req, func(conn contracts.ActiveFlowConnection, effectiveReq flowcontrol.FlowControlRequest) error {
+		bandDefaultRequestTTL, bandDefaultRequestTTLSet := conn.DefaultRequestTTL()
+		reqCtx, cancel, effectiveTTL := fc.createRequestContext(
+			ctx, effectiveReq, bandDefaultRequestTTL, bandDefaultRequestTTLSet, enqueueTime,
+		)
+		defer cancel()
 
 		select { // Non-blocking check on controller lifecycle.
 		case <-fc.parentCtx.Done():
@@ -246,7 +251,7 @@ func (fc *FlowController) EnqueueAndWait(
 		// Attempt to distribute the request once, passing the active connection.
 		// effectiveReq carries the fallback flow key when the requested band was not provisioned, so the
 		// item is enqueued under the band that was actually leased.
-		item, err := fc.tryDistribution(reqCtx, effectiveReq, enqueueTime, conn)
+		item, err := fc.tryDistribution(reqCtx, effectiveReq, enqueueTime, effectiveTTL, conn)
 		if err != nil {
 			// Distribution failed terminally (e.g., context cancelled during blocking submit).
 			// The item has already been finalized by tryDistribution.
@@ -336,16 +341,9 @@ func (fc *FlowController) tryDistribution(
 	reqCtx context.Context,
 	req flowcontrol.FlowControlRequest,
 	enqueueTime time.Time,
+	effectiveTTL time.Duration,
 	conn contracts.ActiveFlowConnection,
 ) (*internal.FlowItem, error) {
-	// Calculate effective TTL for item initialization (reqCtx is the enforcement mechanism).
-	effectiveTTL := fc.config.DefaultRequestTTL
-	if deadline, ok := reqCtx.Deadline(); ok {
-		if ttl := deadline.Sub(enqueueTime); ttl > 0 {
-			effectiveTTL = ttl
-		}
-	}
-
 	// We must create a fresh FlowItem on each attempt as finalization is per-lifecycle.
 	item := internal.NewItem(req, effectiveTTL, enqueueTime)
 
@@ -426,19 +424,35 @@ func (fc *FlowController) awaitFinalization(
 func (fc *FlowController) createRequestContext(
 	ctx context.Context,
 	req flowcontrol.FlowControlRequest,
-) (context.Context, context.CancelFunc, time.Time) {
-	enqueueTime := fc.clock.Now()
-	effectiveTTL := req.InitialEffectiveTTL()
-	if effectiveTTL <= 0 {
-		effectiveTTL = fc.config.DefaultRequestTTL
+	bandDefaultRequestTTL time.Duration,
+	bandDefaultRequestTTLSet bool,
+	enqueueTime time.Time,
+) (context.Context, context.CancelFunc, time.Duration) {
+	effectiveTTL := fc.config.DefaultRequestTTL
+	if bandDefaultRequestTTLSet {
+		effectiveTTL = bandDefaultRequestTTL
+	}
+	// A request may make the selected operator bound stricter, but not extend it.
+	if requestTTL := req.InitialEffectiveTTL(); requestTTL > 0 && (effectiveTTL <= 0 || requestTTL < effectiveTTL) {
+		effectiveTTL = requestTTL
 	}
 
+	var reqCtx context.Context
+	var cancel context.CancelFunc
 	if effectiveTTL > 0 {
-		reqCtx, cancel := context.WithDeadlineCause(ctx, enqueueTime.Add(effectiveTTL), types.ErrTTLExpired)
-		return reqCtx, cancel, enqueueTime
+		reqCtx, cancel = context.WithDeadlineCause(ctx, enqueueTime.Add(effectiveTTL), types.ErrTTLExpired)
+	} else {
+		reqCtx, cancel = context.WithCancel(ctx)
 	}
-	reqCtx, cancel := context.WithCancel(ctx)
-	return reqCtx, cancel, enqueueTime
+
+	// Preserve an earlier caller deadline in the TTL stored on the queue item.
+	if deadline, ok := reqCtx.Deadline(); ok {
+		if lifecycleTTL := deadline.Sub(enqueueTime); lifecycleTTL > 0 &&
+			(effectiveTTL <= 0 || lifecycleTTL < effectiveTTL) {
+			effectiveTTL = lifecycleTTL
+		}
+	}
+	return reqCtx, cancel, effectiveTTL
 }
 
 // distributeRequest submits an item to the processor with graceful backpressure.
@@ -459,6 +473,12 @@ func (fc *FlowController) distributeRequest(
 	item *internal.FlowItem,
 ) (types.QueueOutcome, error) {
 	reqID := item.OriginalRequest().ID()
+	select {
+	case <-ctx.Done():
+		return types.QueueOutcomeRejectedOther,
+			fmt.Errorf("%w: request not accepted: %w", types.ErrRejected, ctx.Err())
+	default:
+	}
 	if err := fc.processor.Submit(item); err == nil {
 		return types.QueueOutcomeNotYetFinalized, nil
 	}
