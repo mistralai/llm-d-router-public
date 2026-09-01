@@ -62,10 +62,12 @@ Tuning knobs, all under the `flowControl:` config section:
 * Per-band `maxRequests` / `maxBytes` — the shedding knobs. Lower them to reject excess load at the
   queue boundary instead of buffering it (for example, to approximate the legacy immediate-shed
   behavior for sheddable traffic).
-* `defaultRequestTTL` — the queue-wait budget, and the other way a request is shed. When the pool
-  has no endpoints the queue acts as a scale-from-zero waiting room and requests hold for the full
-  budget, so keep it under the client or gateway deadline unless you want requests to survive a cold
-  start.
+* `defaultRequestTTL` — the queue-wait budget, and the other way a request is shed. Priority-band
+  entries and templates may replace the global value, including with `0s` for unbounded queue wait.
+  Clients may shorten the selected operator bound with `x-llm-d-inference-ttl` using Go duration
+  syntax. When the pool has no endpoints the queue acts as a scale-from-zero waiting room and requests
+  hold for the full selected budget, so keep it under the client or gateway deadline unless you want
+  requests to survive a cold start.
 * The priority-holdback usage-limit policy — a gating knob, not a shedding one. It lowers the
   admission ceiling for low-priority traffic as utilization rises, so that traffic waits in queue
   rather than being rejected; it sheds only by way of the two limits above. Configure it via
