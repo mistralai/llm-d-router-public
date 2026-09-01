@@ -272,6 +272,13 @@ func (p *Processor) enqueue(item *FlowItem) {
 		return
 	}
 
+	// The active queue-wait budget includes time spent in the processor's enqueue buffer.
+	regime := p.regime.Load()
+	if isExpired(item, p.clock.Now(), regime, p.noEndpointRequestTTL) {
+		p.finalizeAndRecordDrop(item, expiryError(regime.empty))
+		return
+	}
+
 	// --- Configuration Validation ---
 	managedQ, err := p.registry.ManagedQueue(key)
 	if err != nil {
