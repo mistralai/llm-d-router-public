@@ -16,3 +16,4 @@
 
 mistral-branches                  # this branch: the rebuild script, this list and the CI workflow
 lfm/combined-fixes-composition-test # cross-replica sync decouple and RawBody release
+nzt/scoped-ttl                    # scoped flow-control queue TTLs (upstream: https://github.com/llm-d/llm-d-router/issues/2316)
