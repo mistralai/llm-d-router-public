@@ -74,25 +74,42 @@ func (rc *RequestContext) ForwardedHeaders() map[string]string {
 }
 
 // CaptureResponseHeaders records configured response headers for subsequent
-// pipeline steps. Unconfigured headers are ignored.
-func (rc *RequestContext) CaptureResponseHeaders(headers http.Header) {
+// pipeline steps. When a step has multiple responses, each response contributes
+// its first value and the most frequent value is recorded. Ties are resolved by
+// the order of the responses. Unconfigured headers are ignored.
+func (rc *RequestContext) CaptureResponseHeaders(responses ...http.Header) {
 	rc.headersMu.Lock()
 	defer rc.headersMu.Unlock()
 
 	for name := range rc.forwardResponseHeaders {
-		if values := headers.Values(name); len(values) > 0 {
-			if rc.downstreamHeaders == nil {
-				rc.downstreamHeaders = make(map[string]string)
+		counts := make(map[string]int)
+		order := make([]string, 0)
+		for _, headers := range responses {
+			values := headers.Values(name)
+			if len(values) == 0 {
+				continue
 			}
-			rc.downstreamHeaders[name] = values[0]
+			value := values[0]
+			if counts[value] == 0 {
+				order = append(order, value)
+			}
+			counts[value]++
 		}
-	}
-}
 
-// ResponseHeaderForwardingEnabled reports whether the pipeline is configured
-// to relay response headers between steps.
-func (rc *RequestContext) ResponseHeaderForwardingEnabled() bool {
-	return len(rc.forwardResponseHeaders) > 0
+		if len(order) == 0 {
+			continue
+		}
+		winner := order[0]
+		for _, value := range order[1:] {
+			if counts[value] > counts[winner] {
+				winner = value
+			}
+		}
+		if rc.downstreamHeaders == nil {
+			rc.downstreamHeaders = make(map[string]string)
+		}
+		rc.downstreamHeaders[name] = winner
+	}
 }
 
 // RequestContext carries all state for a single request through the pipeline.
