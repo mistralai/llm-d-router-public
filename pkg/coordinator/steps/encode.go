@@ -102,6 +102,7 @@ func (s *EncodeStep) Execute(ctx context.Context, reqCtx *pipeline.RequestContex
 	}
 
 	results := make([]map[string]any, len(reqCtx.MultimodalEntries))
+	responseHeaders := make([]http.Header, len(reqCtx.MultimodalEntries))
 
 	format := resolveFormat(s.useOpenAIFormat, reqCtx.OriginalPath)
 	var imageParts []map[string]any
@@ -109,24 +110,13 @@ func (s *EncodeStep) Execute(ctx context.Context, reqCtx *pipeline.RequestContex
 		imageParts = collectImageParts(reqCtx.Body)
 	}
 
-	start := 0
-	if reqCtx.ResponseHeaderForwardingEnabled() {
-		// Let one encode selection establish the relay headers before the
-		// remaining requests fan out in parallel.
-		result, err := s.executeOne(ctx, logger, reqCtx, 0, reqCtx.MultimodalEntries[0], format, imageParts)
-		if err != nil {
-			return err
-		}
-		results[0] = result
-		start = 1
-	}
-
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(s.maxParallel)
-	for i := start; i < len(reqCtx.MultimodalEntries); i++ {
+	for i := range reqCtx.MultimodalEntries {
 		g.Go(func() error {
-			result, err := s.executeOne(gCtx, logger, reqCtx, i, reqCtx.MultimodalEntries[i], format, imageParts)
+			result, headers, err := s.executeOne(gCtx, logger, reqCtx, i, reqCtx.MultimodalEntries[i], format, imageParts)
 			results[i] = result
+			responseHeaders[i] = headers
 			return err
 		})
 	}
@@ -138,6 +128,7 @@ func (s *EncodeStep) Execute(ctx context.Context, reqCtx *pipeline.RequestContex
 	for _, r := range results {
 		s.ec.MergeEncodeResponse(ctx, reqCtx, r)
 	}
+	reqCtx.CaptureResponseHeaders(responseHeaders...)
 
 	logger.V(logutil.DEFAULT).Info("all sub-requests complete", "count", len(results))
 	return nil
@@ -151,18 +142,18 @@ func (s *EncodeStep) executeOne(
 	entry pipeline.MultimodalEntry,
 	format reqcommon.APIType,
 	imageParts []map[string]any,
-) (map[string]any, error) {
+) (map[string]any, http.Header, error) {
 	body, err := s.buildEncodeBody(reqCtx, entry, format, imageParts)
 	if err != nil {
 		err = fmt.Errorf("encode[%d]: %w", index, err)
 		logger.Error(err, "encode fanout build body", "index", index)
-		return nil, err
+		return nil, nil, err
 	}
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
 		err = fmt.Errorf("encode[%d]: marshal: %w", index, err)
 		logger.Error(err, "encode fanout marshal", "index", index)
-		return nil, err
+		return nil, nil, err
 	}
 
 	path := format.Path()
@@ -180,7 +171,7 @@ func (s *EncodeStep) executeOne(
 	if err != nil {
 		err = fmt.Errorf("encode[%d]: request: %w", index, err)
 		logger.Error(err, "encode fanout request", "index", index, "path", path)
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
@@ -188,17 +179,16 @@ func (s *EncodeStep) executeOne(
 		respBody := readErrorBody(resp.Body)
 		err := upstreamError(fmt.Sprintf("%s[%d]", EncodeStepName, index), resp.StatusCode, respBody)
 		logger.Error(err, "encode fanout status", "index", index, "status", resp.StatusCode)
-		return nil, err
+		return nil, nil, err
 	}
 
 	var encResp encodeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&encResp); err != nil {
 		err = fmt.Errorf("encode[%d]: decode response: %w", index, err)
 		logger.Error(err, "encode fanout decode", "index", index)
-		return nil, err
+		return nil, nil, err
 	}
-	reqCtx.CaptureResponseHeaders(resp.Header)
-	return coerceParamsMap(logger.WithValues("index", index), encResp.ECTransferParams, "ec_transfer_params"), nil
+	return coerceParamsMap(logger.WithValues("index", index), encResp.ECTransferParams, "ec_transfer_params"), resp.Header, nil
 }
 
 func (s *EncodeStep) buildEncodeTokenIDs(fullTokenIDs []int, entry pipeline.MultimodalEntry) []int {
