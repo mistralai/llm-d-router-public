@@ -19,7 +19,6 @@ package pipeline
 import (
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -48,9 +47,6 @@ func isForwardableHeader(name string) bool {
 // Keys are normalized to lowercase so they do not collide by case with headers
 // stamped explicitly by forwarding steps (e.g. x-request-id).
 func (rc *RequestContext) ForwardedHeaders() map[string]string {
-	rc.headersMu.RLock()
-	defer rc.headersMu.RUnlock()
-
 	out := make(map[string]string)
 	for key, vals := range rc.OriginalHeaders {
 		lower := strings.ToLower(key)
@@ -78,9 +74,6 @@ func (rc *RequestContext) ForwardedHeaders() map[string]string {
 // its first value and the most frequent value is recorded. Ties are resolved by
 // the order of the responses. Unconfigured headers are ignored.
 func (rc *RequestContext) CaptureResponseHeaders(responses ...http.Header) {
-	rc.headersMu.Lock()
-	defer rc.headersMu.Unlock()
-
 	for name := range rc.forwardResponseHeaders {
 		counts := make(map[string]int)
 		order := make([]string, 0)
@@ -139,7 +132,6 @@ type RequestContext struct {
 	// decode step. Populated by PrefillStep from the prefill response; consumed
 	// by the KV connector when building the decode request.
 	KVTransferParams       map[string]any
-	headersMu              sync.RWMutex
 	forwardResponseHeaders map[string]struct{}
 	downstreamHeaders      map[string]string
 
