@@ -272,7 +272,8 @@ steps read and mutate. The load-bearing fields:
 `Host`, `Content-Length`, and `Content-Type` removed, normalized to lowercase. Steps use
 it as the base header set, then stamp the request ID and `EPP-Profile`. The pipeline can
 allowlist response headers with `forward_response_headers`; values returned by any
-response-producing step are stored on the request context for later requests. Configured
+response-producing step are stored on the request context for later requests. A fan-out
+step selects the most frequent value for each configured header independently. Configured
 names are reserved for this relay, so client-provided values are not sent upstream.
 
 ### EPP-Profile routing
@@ -331,10 +332,16 @@ pipeline:
 ```
 
 Only listed response headers are carried, and client-provided values for those
-names are discarded. In E/P/D, the first encode request
-establishes the revision for the remaining encode requests, prefill, and decode.
-Each later response can update the carried values, so decode can prefer the
-prefill slice without forwarding unrelated worker response headers.
+names are discarded. Encode requests run in parallel. After the fan-out completes,
+each response contributes its first value for each configured header. The most
+frequent value is forwarded to later phases; missing values are ignored, and ties
+use the value from the lowest encode index. This lets prefill prefer the slice that
+handled the largest number of encoded items. A later single-response phase can
+replace the carried value, so decode can prefer the prefill slice.
+
+Aggregation happens after the fan-out and cannot constrain sibling encode requests.
+Strict constraints shared by those requests, such as revision selection, require
+coordination before the fan-out begins.
 
 ### Decode disaggregation deciders
 

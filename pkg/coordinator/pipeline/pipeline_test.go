@@ -93,6 +93,39 @@ func TestPipeline_ForwardsConfiguredResponseHeadersBetweenArbitrarySteps(t *test
 	}
 }
 
+func TestPipeline_SelectsMostFrequentValueForEachForwardedHeader(t *testing.T) {
+	steps := []Step{
+		&mockStep{name: "producer", fn: func(_ context.Context, rc *RequestContext) error {
+			responses := []http.Header{
+				{"X-Route-One": {"one-b"}, "X-Route-Two": {"two-a"}},
+				{"X-Route-One": {"one-a"}, "X-Route-Two": {"two-b"}},
+				{"X-Route-One": {"one-a"}, "X-Route-Two": {"two-a"}},
+				{"X-Route-One": {"one-b"}},
+			}
+			rc.CaptureResponseHeaders(responses...)
+			return nil
+		}},
+		&mockStep{name: "consumer", fn: func(_ context.Context, rc *RequestContext) error {
+			headers := rc.ForwardedHeaders()
+			if got := headers["x-route-one"]; got != "one-b" {
+				t.Errorf("tie winner = %q, want first value %q", got, "one-b")
+			}
+			if got := headers["x-route-two"]; got != "two-a" {
+				t.Errorf("majority winner = %q, want %q", got, "two-a")
+			}
+			return nil
+		}},
+	}
+
+	p, err := NewWithForwardResponseHeaders(steps, []string{"X-Route-One", "X-Route-Two"})
+	if err != nil {
+		t.Fatalf("NewWithForwardResponseHeaders() error = %v", err)
+	}
+	if err := p.Execute(context.Background(), &RequestContext{}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+}
+
 func TestNewWithForwardResponseHeaders_RejectsInvalidNames(t *testing.T) {
 	for _, headers := range [][]string{
 		{""},
