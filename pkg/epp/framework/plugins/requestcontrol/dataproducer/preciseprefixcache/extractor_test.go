@@ -519,10 +519,29 @@ func TestProducer_RankPodMappingUsesWorkerTransportAndLeaderIdentity(t *testing.
 
 	require.Len(t, subscribers.endpoints, 1)
 	assert.Equal(t, "10.0.0.10:8000", subscribers.sourceEndpoints[0])
-	assert.Equal(t, "tcp://10.0.0.21:5557", subscribers.endpoints[0])
-	assert.Equal(t, "tcp://10.0.0.21:5657", subscribers.replayEndpoints[0])
+	assert.Equal(t, "tcp://10.0.0.21:5558", subscribers.endpoints[0])
+	assert.Equal(t, "tcp://10.0.0.21:5658", subscribers.replayEndpoints[0])
 	require.NotNil(t, subscribers.dataParallelRanks[0])
 	assert.Equal(t, 1, *subscribers.dataParallelRanks[0])
+}
+
+func TestProducer_RankPodMappingOffsetsPortsByGlobalRank(t *testing.T) {
+	subscribers := &fakeSubscriberManager{}
+	p := newRankPodMappingProducer(t, subscribers, &fakeKVBlockIndex{})
+	endpointHandler := &rankEndpointHandler{producer: p}
+	podHandler := &rankPodNotificationHandler{producer: p}
+
+	require.NoError(t, endpointHandler.Extract(context.Background(), fwkdl.EndpointEvent{
+		Type: fwkdl.EventAddOrUpdate, Endpoint: rankEndpoint("7", 3),
+	}))
+	require.NoError(t, podHandler.Extract(context.Background(), fwkdl.NotificationEvent{
+		Type:   fwkdl.EventAddOrUpdate,
+		Object: rankWorkerPod(t, "worker-7-3", "7", 3, "10.0.0.23", true),
+	}))
+
+	require.Len(t, subscribers.endpoints, 1)
+	assert.Equal(t, "tcp://10.0.0.23:5560", subscribers.endpoints[0])
+	assert.Equal(t, "tcp://10.0.0.23:5660", subscribers.replayEndpoints[0])
 }
 
 func TestProducer_RankPodMappingHandlesPodFirstOrdering(t *testing.T) {
@@ -543,7 +562,7 @@ func TestProducer_RankPodMappingHandlesPodFirstOrdering(t *testing.T) {
 	}))
 
 	require.Len(t, subscribers.endpoints, 1)
-	assert.Equal(t, "tcp://10.0.0.21:5557", subscribers.endpoints[0])
+	assert.Equal(t, "tcp://10.0.0.21:5558", subscribers.endpoints[0])
 }
 
 func TestProducer_RankPodMappingReplacesSubscriberAfterWorkerRestart(t *testing.T) {
@@ -571,8 +590,8 @@ func TestProducer_RankPodMappingReplacesSubscriberAfterWorkerRestart(t *testing.
 	}
 
 	require.Len(t, subscribers.endpoints, 2)
-	assert.Equal(t, "tcp://10.0.0.22:5557", subscribers.endpoints[0])
-	assert.Equal(t, "tcp://10.0.0.32:5557", subscribers.endpoints[1])
+	assert.Equal(t, "tcp://10.0.0.22:5559", subscribers.endpoints[0])
+	assert.Equal(t, "tcp://10.0.0.32:5559", subscribers.endpoints[1])
 	assert.Equal(t, subscribers.ids[0], subscribers.ids[1])
 	assert.Contains(t, subscribers.removed, "ns/leader-7-rank-2")
 	assert.Equal(t, "10.0.0.10:8000", clearedPod)
@@ -744,7 +763,7 @@ func TestProducer_RankPodMappingSeparatesGroups(t *testing.T) {
 	}
 
 	require.Len(t, subscribers.endpoints, 2)
-	assert.ElementsMatch(t, []string{"tcp://10.0.0.21:5557", "tcp://10.0.0.31:5557"}, subscribers.endpoints)
+	assert.ElementsMatch(t, []string{"tcp://10.0.0.21:5558", "tcp://10.0.0.31:5558"}, subscribers.endpoints)
 	assert.ElementsMatch(t, []string{"10.0.0.10:8000", "10.0.0.11:8000"}, subscribers.sourceEndpoints)
 }
 
@@ -764,8 +783,8 @@ func TestProducer_RankPodMappingSupportsMultipleRanksPerPod(t *testing.T) {
 		Object: rankWorkerPod(t, "worker-7-1", "7", 1, "10.0.0.21", true),
 	}))
 
-	assert.ElementsMatch(t, []string{"tcp://10.0.0.21:5557", "tcp://10.0.0.21:5558"}, subscribers.endpoints)
-	assert.ElementsMatch(t, []string{"tcp://10.0.0.21:5657", "tcp://10.0.0.21:5658"}, subscribers.replayEndpoints)
+	assert.ElementsMatch(t, []string{"tcp://10.0.0.21:5559", "tcp://10.0.0.21:5560"}, subscribers.endpoints)
+	assert.ElementsMatch(t, []string{"tcp://10.0.0.21:5659", "tcp://10.0.0.21:5660"}, subscribers.replayEndpoints)
 }
 
 type rankPodCaptureRegistrar struct {

@@ -283,16 +283,16 @@ func (r *rankPodResolver) desiredLocked(id types.NamespacedName) (*rankSubscript
 	if !ok {
 		return nil, nil
 	}
-	localRank := endpoint.key.rank % r.ranksPerPod
-	transportPort := r.socketPort + localRank
+	rank := endpoint.key.rank
+	transportPort := r.socketPort + rank
 	if transportPort > 65535 {
-		return nil, fmt.Errorf("KV-event port for local rank %d exceeds 65535", localRank)
+		return nil, fmt.Errorf("KV-event port for global rank %d exceeds 65535", rank)
 	}
 	replayEndpoint := ""
 	if r.replayPort > 0 {
-		replayPort := r.replayPort + localRank
+		replayPort := r.replayPort + rank
 		if replayPort > 65535 {
-			return nil, fmt.Errorf("KV-event replay port for local rank %d exceeds 65535", localRank)
+			return nil, fmt.Errorf("KV-event replay port for global rank %d exceeds 65535", rank)
 		}
 		replayEndpoint = "tcp://" + net.JoinHostPort(worker.ip, strconv.Itoa(replayPort))
 	}
