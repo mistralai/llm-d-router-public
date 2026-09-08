@@ -36,6 +36,16 @@ const (
 	ResponseCompleteExtensionPoint  = "ResponseComplete"
 )
 
+// ObjectiveKeyAttribute is the request-attribute key a RequestHeaderProcessor
+// plugin sets to select the InferenceObjective for a request. The director
+// reads it after the header processors run and prefers it over the
+// x-llm-d-inference-objective header, so a deployment can derive the objective
+// from its own configuration instead of trusting the client-supplied name.
+// The key carries no producer name: configuration names this attribute bare
+// ("attribute: objective-key"), and any plugin able to resolve an objective is
+// an acceptable source.
+var ObjectiveKeyAttribute = plugin.NewDataKey("objective-key", "")
+
 // Screener performs preliminary filtering of located endpoints before data
 // production, admission, and scheduling profiles run. Every screener sees the
 // same input set, and the framework intersects their results.
