@@ -25,7 +25,9 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/types"
 
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/test/utils"
@@ -51,11 +53,11 @@ func newProducerForPreRequest(ctx context.Context, speculativeEnabled bool, idx 
 	}
 }
 
-func primaryOnly(name string, endpoint scheduling.Endpoint) *scheduling.SchedulingResult {
+func primaryOnly(endpoint scheduling.Endpoint) *scheduling.SchedulingResult {
 	return &scheduling.SchedulingResult{
-		PrimaryProfileName: name,
+		PrimaryProfileName: "default",
 		ProfileResults: map[string]*scheduling.ProfileRunResult{
-			name: {TargetEndpoints: []scheduling.Endpoint{endpoint}},
+			"default": {TargetEndpoints: []scheduling.Endpoint{endpoint}},
 		},
 	}
 }
@@ -78,7 +80,7 @@ func TestPreRequest_SeedsSpeculativeForPrimary(t *testing.T) {
 	req := &scheduling.InferenceRequest{RequestID: "req-pre-1"}
 	p.pluginState.Write(req.RequestID, blockKeysStateKey, &blockKeysState{perPromptKeys: [][]kvblock.BlockHash{blockKeys}})
 
-	_ = p.PreRequest(ctx, req, primaryOnly("default", testEndpoints[0]))
+	_ = p.PreRequest(ctx, req, primaryOnly(testEndpoints[0]))
 
 	require.Len(t, calls, 1)
 	assert.Equal(t, blockKeys, calls[0].keys)
@@ -91,6 +93,32 @@ func TestPreRequest_SeedsSpeculativeForPrimary(t *testing.T) {
 	assert.Equal(t, [][]kvblock.BlockHash{blockKeys}, cached.Value().perPromptKeys)
 	require.Len(t, cached.Value().podEntries, 1)
 	assert.Equal(t, "10.0.0.1:8080", cached.Value().podEntries[0].PodIdentifier)
+}
+
+func TestPreRequest_SeedsSelectedDataParallelRank(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	var calls []addCall
+	idx := &fakeKVBlockIndex{
+		addFn: func(_ context.Context, _ []kvblock.BlockHash, keys []kvblock.BlockHash, entries []kvblock.PodEntry) error {
+			calls = append(calls, addCall{keys: keys, entries: entries})
+			return nil
+		},
+	}
+	p := newProducerForPreRequest(ctx, true, idx)
+	rank := 2
+	endpoint := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
+		ID: types.NamespacedName{Name: "pod-a-rank-2"}, Address: "10.0.0.1", Port: "8080",
+		DataParallelRank: &rank,
+	}, nil, nil)
+	req := &scheduling.InferenceRequest{RequestID: "req-pre-dp"}
+	p.pluginState.Write(req.RequestID, blockKeysStateKey,
+		&blockKeysState{perPromptKeys: [][]kvblock.BlockHash{{0xAA}}})
+
+	require.NoError(t, p.PreRequest(ctx, req, primaryOnly(endpoint)))
+	require.Len(t, calls, 1)
+	require.Len(t, calls[0].entries, 1)
+	require.NotNil(t, calls[0].entries[0].DataParallelRank)
+	assert.Equal(t, rank, *calls[0].entries[0].DataParallelRank)
 }
 
 // speculativeEnabled=true with empty blockKeys: PreRequest must not call
@@ -109,7 +137,7 @@ func TestPreRequest_EmptyBlockKeys_NoAdd(t *testing.T) {
 	req := &scheduling.InferenceRequest{RequestID: "req-pre-empty"}
 	p.pluginState.Write(req.RequestID, blockKeysStateKey, &blockKeysState{perPromptKeys: nil})
 
-	_ = p.PreRequest(ctx, req, primaryOnly("default", testEndpoints[0]))
+	_ = p.PreRequest(ctx, req, primaryOnly(testEndpoints[0]))
 
 	assert.Nil(t, p.speculativeCache.Get(req.RequestID))
 }
@@ -169,7 +197,7 @@ func TestPreRequest_SpeculativeDisabled_NoOp(t *testing.T) {
 	p.pluginState.Write(req.RequestID, blockKeysStateKey,
 		&blockKeysState{perPromptKeys: [][]kvblock.BlockHash{{0xDD}}})
 
-	_ = p.PreRequest(ctx, req, primaryOnly("default", testEndpoints[0]))
+	_ = p.PreRequest(ctx, req, primaryOnly(testEndpoints[0]))
 
 	assert.Nil(t, p.speculativeCache.Get(req.RequestID))
 }
