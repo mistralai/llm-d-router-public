@@ -253,16 +253,6 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 		return reqCtx, err
 	}
 
-	infObjective := d.getInferenceObjective(ctx, reqCtx)
-	priority := int(*infObjective.Spec.Priority)
-	reqCtx.Priority = priority
-	requestObjectives := fwksched.RequestObjectives{Priority: priority}
-
-	span.SetAttributes(
-		attribute.String("target_model", reqCtx.TargetModelName),
-		attribute.Int("request_prio", priority),
-	)
-
 	fairnessID, _ := metadata.GetLowerCaseHeaderValue(reqCtx.Request.Headers, metadata.FlowFairnessIDKey)
 
 	// Prepare InferenceRequest (needed for both saturation detection and Scheduler)
@@ -272,13 +262,11 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 		Body:             inferenceRequestBody,
 		Headers:          reqCtx.Request.Headers,
 		FairnessID:       fairnessID,
-		Objectives:       requestObjectives,
 		RequestSizeBytes: reqCtx.RequestSize,
 	}
 
-	logger = logger.WithValues("objectiveKey", reqCtx.ObjectiveKey, "incomingModelName", reqCtx.IncomingModelName, "targetModelName", reqCtx.TargetModelName, "priority", infObjective.Spec.Priority)
+	logger = logger.WithValues("incomingModelName", reqCtx.IncomingModelName, "targetModelName", reqCtx.TargetModelName)
 	ctx = log.IntoContext(ctx, logger)
-	logger.V(logutil.DEBUG).Info("LLM request assembled")
 
 	if err := d.runRequestHeaderProcessors(ctx, reqCtx.SchedulingRequest); err != nil {
 		return reqCtx, err
@@ -291,6 +279,26 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 			reqCtx.SchedulingRequest.FairnessID = metadata.DefaultFairnessID
 		}
 	}
+	// Derive the objective key from the objective-key attribute if a header
+	// processor set one, so the objective is resolved from deployment
+	// configuration rather than the client-supplied header.
+	if objectiveKey, ok := fwksched.ReadRequestAttribute[string](reqCtx.SchedulingRequest, fwkrc.ObjectiveKeyAttribute); ok && objectiveKey != "" {
+		reqCtx.ObjectiveKey = objectiveKey
+	}
+
+	infObjective := d.getInferenceObjective(ctx, reqCtx)
+	priority := int(*infObjective.Spec.Priority)
+	reqCtx.Priority = priority
+	reqCtx.SchedulingRequest.Objectives = fwksched.RequestObjectives{Priority: priority}
+
+	span.SetAttributes(
+		attribute.String("target_model", reqCtx.TargetModelName),
+		attribute.Int("request_prio", priority),
+	)
+
+	logger = logger.WithValues("objectiveKey", reqCtx.ObjectiveKey, "priority", priority)
+	ctx = log.IntoContext(ctx, logger)
+	logger.V(logutil.DEBUG).Info("LLM request assembled")
 
 	// Admit may block until flow control admits the request.
 	if err := d.admissionController.Admit(ctx, reqCtx, priority); err != nil {
