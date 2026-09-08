@@ -54,8 +54,8 @@ group label joins the serving endpoint to its worker pods. The rank label is the
 worker index, and `ranksPerPod` maps each worker to a consecutive range of
 global data-parallel ranks. Requests still target the leader endpoint and use
 `x-data-parallel-rank`; only the KV-event transport uses the worker pod IP.
-Each worker uses `socketPort` and `replaySocketPort` for its first local rank,
-with a port offset only when `ranksPerPod` is greater than one.
+Each rank uses `socketPort + global rank` and
+`replaySocketPort + global rank` on its worker pod.
 
 ```yaml
 plugins:
