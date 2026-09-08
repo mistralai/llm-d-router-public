@@ -1,0 +1,54 @@
+# Sample EPP config for vLLM data-parallel ranks sharing one HTTP port.
+# Run EPP with --allow-experimental-plugins. The optional
+# --endpoint-data-parallel-size flag supplies a fallback rank count while
+# vllm:cache_config_info metrics are unavailable.
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+  - type: token-producer
+    parameters:
+      modelName: hf-repo/model-name
+      vllm:
+        url: http://localhost:8000
+  - type: endpoint-notification-source
+  - type: metrics-data-source
+  - type: core-metrics-extractor
+  - type: single-profile-handler
+  - type: decode-filter
+  - type: precise-prefix-cache-producer
+    parameters:
+      tokenProcessorConfig:
+        blockSizeTokens: 64
+      kvEventsConfig:
+        discoverPods: true
+        podDiscoveryConfig:
+          socketPort: 5557
+      indexerConfig:
+        kvBlockIndexConfig:
+          enableMetrics: true
+  - type: prefix-cache-scorer
+    parameters:
+      prefixMatchInfoProducerName: precise-prefix-cache-producer
+  - type: kv-cache-utilization-scorer
+  - type: queue-scorer
+  - type: max-score-picker
+  - type: dp-rank-header-handler
+dataLayer:
+  sources:
+    - pluginRef: metrics-data-source
+      extractors:
+        - pluginRef: core-metrics-extractor
+    - pluginRef: endpoint-notification-source
+      extractors:
+        - pluginRef: precise-prefix-cache-producer
+schedulingProfiles:
+  - name: default
+    plugins:
+      - pluginRef: decode-filter
+      - pluginRef: prefix-cache-scorer
+        weight: 2.0
+      - pluginRef: kv-cache-utilization-scorer
+        weight: 1.0
+      - pluginRef: queue-scorer
+        weight: 1.0
+      - pluginRef: max-score-picker

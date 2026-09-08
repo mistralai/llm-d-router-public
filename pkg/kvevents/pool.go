@@ -318,9 +318,14 @@ func (p *Pool) AddTask(task *RawMessage) {
 	p.addQueueDepth(1)
 }
 
-// resetForSource queues a pod reset on the same shard as its event stream.
-func (p *Pool) resetForSource(topic, sourceEndpoint string) {
-	p.AddTask(&RawMessage{Topic: topic, SourceEndpoint: sourceEndpoint, reset: true})
+// resetForSource queues an engine reset on the same shard as its event stream.
+func (p *Pool) resetForSource(topic, sourceEndpoint string, dataParallelRank *int) {
+	p.AddTask(&RawMessage{
+		Topic:                 topic,
+		SourceEndpoint:        sourceEndpoint,
+		ResetDataParallelRank: dataParallelRank,
+		reset:                 true,
+	})
 }
 
 // worker is the main processing loop for a single worker goroutine.
@@ -360,7 +365,11 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 		if podID == "" {
 			podID = p.adapter.ShardingKey(msg)
 		}
-		p.clearPod(ctx, podID)
+		if msg.ResetDataParallelRank == nil {
+			p.clearPod(ctx, podID)
+		} else {
+			p.clearRank(ctx, podID, *msg.ResetDataParallelRank)
+		}
 		return
 	}
 
@@ -396,6 +405,7 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 
 	if msg.SourceEndpoint != "" {
 		podID = msg.SourceEndpoint
+		batch.DataParallelRank = msg.SourceDataParallelRank
 	}
 	if tracingActive {
 		span.SetAttributes(
@@ -438,6 +448,15 @@ func (p *Pool) clearPod(ctx context.Context, podIdentifier string) {
 			"podIdentifier", podIdentifier)
 	}
 	p.dedup.clear(podIdentifier)
+}
+
+func (p *Pool) clearRank(ctx context.Context, podIdentifier string, dataParallelRank int) {
+	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
+	if err := kvblock.ClearDataParallelRank(ctx, p.index, podIdentifier, dataParallelRank); err != nil {
+		debugLogger.Error(err, "Failed to clear data-parallel rank from index",
+			"podIdentifier", podIdentifier, "dataParallelRank", dataParallelRank)
+	}
+	p.dedup.clearRank(podIdentifier, dataParallelRank)
 }
 
 // realignExtraFeatures converts per-engine-block extra features to per-canonical-block
@@ -547,13 +566,12 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			deviceTier := normalizeDeviceTier(ev.DeviceTier)
 
 			// Scope for reference-counting this store against duplicate removes.
-			// Mirrors the index eviction identity (pod, tier, group); DP rank is
-			// the sentinel until PR #370 makes the index DP-aware.
+			// Mirrors the index eviction identity.
 			storeScope := blockScope{
 				podIdentifier:    podIdentifier,
 				deviceTier:       deviceTier,
 				groupIdx:         groupIdxOrNoGroup(ev.GroupIdx),
-				dataParallelRank: noDataParallelRank,
+				dataParallelRank: dataParallelRankOrNone(batch.DataParallelRank),
 			}
 
 			// Use LoRA name as model identifier if available, otherwise fall back to base model name.
@@ -563,7 +581,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			}
 
 			// Create PodEntry for this specific event's device tier.
-			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+			podEntries := []kvblock.PodEntry{{
+				PodIdentifier:    podIdentifier,
+				DeviceTier:       deviceTier,
+				DataParallelRank: batch.DataParallelRank,
+			}}
 			if ev.GroupIdx != nil {
 				g := kvblock.GroupID(*ev.GroupIdx)
 				if ev.KVCacheSpecKind == "" {
@@ -714,7 +736,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			}
 
 			// Create PodEntry for this specific event's device tier.
-			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+			podEntries := []kvblock.PodEntry{{
+				PodIdentifier:    podIdentifier,
+				DeviceTier:       deviceTier,
+				DataParallelRank: batch.DataParallelRank,
+			}}
 			if ev.GroupIdx != nil {
 				podEntries[0].HasGroup = true
 				podEntries[0].GroupIdx = kvblock.GroupID(*ev.GroupIdx)
@@ -728,7 +754,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				podIdentifier:    podIdentifier,
 				deviceTier:       deviceTier,
 				groupIdx:         groupIdxOrNoGroup(ev.GroupIdx),
-				dataParallelRank: noDataParallelRank,
+				dataParallelRank: dataParallelRankOrNone(batch.DataParallelRank),
 			}
 			hashesToEvict := p.dedup.filterRemove(removeScope, ev.BlockHashes)
 
@@ -762,9 +788,8 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				"deviceTier", ev.DeviceTier,
 				"modelName", modelName)
 
-			// AllBlocksCleared is pod-wide: vLLM reset its entire prefix cache
-			// (e.g. after an RLHF weight update), so drop every entry for this pod
-			// across all tiers. vLLM and SGLang both emit it with no tier annotation.
+			// AllBlocksCleared resets the emitting engine's entire prefix cache. A
+			// data-parallel rank must not clear sibling ranks sharing the pod.
 			// Index.Clear cannot scope by tier, so if an engine ever starts setting
 			// DeviceTier (a tier-scoped reset), this would over-wipe the other tiers.
 			// Surface that here so the regression does not pass silently.
@@ -773,7 +798,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 					"anyway (tier-scoped clear is not supported)",
 					"podIdentifier", podIdentifier, "deviceTier", ev.DeviceTier)
 			}
-			p.clearPod(ctx, podIdentifier)
+			if batch.DataParallelRank == nil {
+				p.clearPod(ctx, podIdentifier)
+			} else {
+				p.clearRank(ctx, podIdentifier, *batch.DataParallelRank)
+			}
 
 		default:
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)

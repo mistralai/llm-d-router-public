@@ -179,8 +179,8 @@ func (k *Indexer) ScoreTokens(
 	traceLogger.Info("matched block keys", "block-keys", blockKeys, "matches", matches)
 
 	podScores := make(map[string]float64, len(matches))
-	for pod, m := range matches {
-		podScores[pod] = m.WeightedScore
+	for podIdentifier, match := range collapseDataParallelMatches(matches) {
+		podScores[podIdentifier] = match.WeightedScore
 	}
 	// Block-level hit telemetry: requested keys held by any candidate pod,
 	// regardless of chains. The longest chain is on the matcher's span.

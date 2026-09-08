@@ -156,9 +156,9 @@ func (m *CostAwareMemoryIndex) MaxCost() int64 {
 	return m.data.MaxCost()
 }
 
-// CostPodCache wraps a sync.Map of PodEntry and provides cost calculation for memory usage estimation.
+// CostPodCache wraps a sync.Map of pod entry value identities and provides cost calculation for memory usage estimation.
 type CostPodCache struct {
-	cache sync.Map // map[PodEntry]struct{}
+	cache sync.Map // map[podEntryKey]struct{}
 	// size tracks the number of entries in cache for O(1) Len().
 	size atomic.Int64
 	// key is the request-key string this cache is stored under. It is captured so
@@ -169,14 +169,14 @@ type CostPodCache struct {
 
 // Add adds a PodEntry to the cache.
 func (c *CostPodCache) Add(entry PodEntry) {
-	if _, loaded := c.cache.LoadOrStore(entry, struct{}{}); !loaded {
+	if _, loaded := c.cache.LoadOrStore(newPodEntryKey(entry), struct{}{}); !loaded {
 		c.size.Add(1)
 	}
 }
 
 // Delete removes a PodEntry from the cache.
 func (c *CostPodCache) Delete(entry PodEntry) {
-	if _, loaded := c.cache.LoadAndDelete(entry); loaded {
+	if _, loaded := c.cache.LoadAndDelete(newPodEntryKey(entry)); loaded {
 		c.size.Add(-1)
 	}
 }
@@ -200,14 +200,14 @@ func (c *CostPodCache) CalculateByteSize(keyStr string) int64 {
 
 	// Count entries and calculate their size
 	c.cache.Range(func(key, value interface{}) bool {
-		entry, ok := key.(PodEntry)
+		entry, ok := key.(podEntryKey)
 		if !ok {
 			return true
 		}
 
 		entryCount++
-		totalBytes += int64(len(entry.PodIdentifier)) // PodIdentifier string content
-		totalBytes += int64(len(entry.DeviceTier))    // DeviceTier string content
+		totalBytes += int64(len(entry.podIdentifier)) // PodIdentifier string content
+		totalBytes += int64(len(entry.deviceTier))    // DeviceTier string content
 		totalBytes += 32                              // string headers (16 bytes each for 2 strings)
 		totalBytes += 8                               // struct padding/alignment
 		return true
@@ -300,17 +300,17 @@ func (m *CostAwareMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHa
 			if podIdentifierSet.Len() == 0 {
 				// If no pod identifiers are provided, return all pods
 				pods.cache.Range(func(k, value interface{}) bool {
-					if pod, ok := k.(PodEntry); ok {
-						podsPerKey[key] = append(podsPerKey[key], pod)
+					if pod, ok := k.(podEntryKey); ok {
+						podsPerKey[key] = append(podsPerKey[key], pod.podEntry())
 					}
 					return true
 				})
 			} else {
 				// Filter pods based on the provided pod identifiers
 				pods.cache.Range(func(k, value interface{}) bool {
-					if pod, ok := k.(PodEntry); ok {
-						if podIdentifierSet.Has(pod.PodIdentifier) {
-							podsPerKey[key] = append(podsPerKey[key], pod)
+					if pod, ok := k.(podEntryKey); ok {
+						if podIdentifierSet.Has(pod.podIdentifier) {
+							podsPerKey[key] = append(podsPerKey[key], pod.podEntry())
 						}
 					}
 					return true
@@ -414,6 +414,14 @@ func (m *CostAwareMemoryIndex) evictPodsFromRequestKey(
 // prefix chain in Lookup. Reverse-pruning it would need an O(M) scan for no
 // correctness gain.
 func (m *CostAwareMemoryIndex) Clear(ctx context.Context, podIdentifier string) error {
+	return m.clear(ctx, podIdentifier, nil)
+}
+
+func (m *CostAwareMemoryIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
+	return m.clear(ctx, podIdentifier, &dataParallelRank)
+}
+
+func (m *CostAwareMemoryIndex) clear(ctx context.Context, podIdentifier string, dataParallelRank *int) error {
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.CostAwareMemoryIndex.Clear")
 
 	keys := m.snapshotKeyIndex()
@@ -421,17 +429,18 @@ func (m *CostAwareMemoryIndex) Clear(ctx context.Context, podIdentifier string) 
 	const clearChunkSize = 1024
 	for start := 0; start < len(keys); start += clearChunkSize {
 		end := min(start+clearChunkSize, len(keys))
-		m.clearChunk(podIdentifier, keys[start:end])
+		m.clearChunk(podIdentifier, dataParallelRank, keys[start:end])
 	}
 
 	m.data.Wait()
-	traceLogger.Info("cleared pod from index", "pod", podIdentifier, "scanned", len(keys))
+	traceLogger.Info("cleared pod from index", "pod", podIdentifier,
+		"dataParallelRank", dataParallelRank, "scanned", len(keys))
 	return nil
 }
 
 // clearChunk removes the pod's entries from one chunk of request keys under a
 // single mu hold, bounding how long Clear blocks the Lookup/Add path.
-func (m *CostAwareMemoryIndex) clearChunk(podIdentifier string, keys []string) {
+func (m *CostAwareMemoryIndex) clearChunk(podIdentifier string, dataParallelRank *int, keys []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -446,8 +455,9 @@ func (m *CostAwareMemoryIndex) clearChunk(podIdentifier string, keys []string) {
 		// first keeps the deletion explicit and the iteration simple.
 		var matched []PodEntry
 		podCache.cache.Range(func(k, _ any) bool {
-			if entry, ok := k.(PodEntry); ok && entry.PodIdentifier == podIdentifier {
-				matched = append(matched, entry)
+			if entry, ok := k.(podEntryKey); ok && entry.podIdentifier == podIdentifier &&
+				entry.matchesDataParallelRank(dataParallelRank) {
+				matched = append(matched, entry.podEntry())
 			}
 			return true
 		})

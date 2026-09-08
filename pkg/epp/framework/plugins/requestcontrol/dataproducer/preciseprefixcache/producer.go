@@ -37,6 +37,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -74,6 +75,7 @@ type subscriberManager interface {
 	EnsureSubscriber(
 		ctx context.Context,
 		podIdentifier, sourceEndpoint, endpoint, replayEndpoint, topicFilter string,
+		dataParallelRank *int,
 		remoteSocket bool,
 	) error
 	RemoveSubscriber(ctx context.Context, podIdentifier string)
@@ -172,7 +174,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	subscribersManager := kvevents.NewSubscriberManager(pool)
 	if config.KVEventsConfig.ZMQEndpoint != "" {
 		if err := subscribersManager.EnsureSubscriber(ctx, "local-subscriber", "",
-			config.KVEventsConfig.ZMQEndpoint, "", config.KVEventsConfig.TopicFilter, false); err != nil {
+			config.KVEventsConfig.ZMQEndpoint, "", config.KVEventsConfig.TopicFilter, nil, false); err != nil {
 			return nil, fmt.Errorf("failed to create local subscriber for global socket mode: %w", err)
 		}
 	}
@@ -329,7 +331,7 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	var matches map[string]kvcache.PodMatch
 	totalBlocks := 0
 	for _, blockKeys := range perPromptKeys {
-		promptMatches, err := p.kvCacheIndexer.MatchBlockKeys(ctx, blockKeys, endpointSet)
+		promptMatches, err := p.kvCacheIndexer.MatchBlockKeysByEndpoint(ctx, blockKeys, endpointSet)
 		if err != nil {
 			span.SetStatus(codes.Error, err.Error())
 			return fmt.Errorf("failed to match block keys: %w", err)
@@ -354,7 +356,16 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		if md == nil {
 			continue
 		}
-		match := matches[fmt.Sprintf("%s:%s", md.Address, md.Port)]
+		podIdentifier := fmt.Sprintf("%s:%s", md.Address, md.Port)
+		rank := routing.NoDataParallelRank
+		if md.DataParallelRank != nil {
+			rank = *md.DataParallelRank
+		}
+		matchKey, err := routing.BuildDPScoringKey(podIdentifier, rank)
+		if err != nil {
+			return fmt.Errorf("build score key for endpoint %q: %w", md.ID, err)
+		}
+		match := matches[matchKey]
 		if match.BlocksByTier == nil {
 			match.BlocksByTier = map[string]int{} // no match: consumers still read a map
 		}

@@ -372,8 +372,16 @@ func (r *Runner) setup(ctx context.Context, cfg *rest.Config, opts *runserver.Op
 		return nil, nil, err
 	}
 
+	var dataParallelSizeDetector datastore.DataParallelSizeDetector
+	if hasPluginType(rawConfig, dataparallel.DPRankHeaderHandlerType) {
+		dataParallelSizeDetector, err = sourcemetrics.NewDataParallelSizeDetector(opts.CacheInfoMetric)
+		if err != nil {
+			return nil, nil, fmt.Errorf("create data-parallel size detector: %w", err)
+		}
+	}
 	ds, err := setupDatastore(ctx, epf, startCrdReconcilers,
-		gknn.Namespace, gknn.Name, opts.EndpointSelector, opts.EndpointTargetPorts)
+		gknn.Namespace, gknn.Name, opts.EndpointSelector, opts.EndpointTargetPorts,
+		opts.EndpointDataParallelSize, dataParallelSizeDetector)
 	if err != nil {
 		setupLog.Error(err, "Failed to setup datastore")
 		return nil, nil, err
@@ -559,17 +567,43 @@ func NewEndpointPoolFromOptions(
 }
 
 func setupDatastore(ctx context.Context, epFactory datalayer.EndpointFactory,
-	startCrdReconcilers bool, namespace, name string, endpointSelector labels.Selector, endpointTargetPorts []int) (datastore.Datastore, error) {
+	startCrdReconcilers bool, namespace, name string, endpointSelector labels.Selector, endpointTargetPorts []int,
+	dataParallelSize int, dataParallelSizeDetector datastore.DataParallelSizeDetector,
+) (datastore.Datastore, error) {
+	datastoreOptions := []datastore.Option{datastore.WithDataParallelSize(dataParallelSize)}
+	if dataParallelSizeDetector != nil {
+		datastoreOptions = append(datastoreOptions, datastore.WithDataParallelSizeDetector(dataParallelSizeDetector))
+	}
 
 	if startCrdReconcilers {
-		return datastore.NewDatastore(ctx, epFactory), nil
+		return datastore.NewDatastore(ctx, epFactory, datastoreOptions...), nil
 	}
 	endpointPool, err := NewEndpointPoolFromOptions(namespace, name, endpointSelector, endpointTargetPorts)
 	if err != nil {
 		setupLog.Error(err, "Failed to construct endpoint pool from options")
 		return nil, err
 	}
-	return datastore.NewDatastore(ctx, epFactory).WithEndpointPool(endpointPool), nil
+	return datastore.NewDatastore(ctx, epFactory, datastoreOptions...).WithEndpointPool(endpointPool), nil
+}
+
+func hasPluginType(config *configapi.EndpointPickerConfig, pluginType string) bool {
+	if config == nil {
+		return false
+	}
+	for _, configuredPlugin := range config.Plugins {
+		if configuredPlugin.Type == pluginType {
+			return true
+		}
+	}
+	return false
+}
+
+func validateDataParallelConfiguration(config *configapi.EndpointPickerConfig, fallbackSize int) error {
+	if fallbackSize > 1 && !hasPluginType(config, dataparallel.DPRankHeaderHandlerType) {
+		return fmt.Errorf("flag %q greater than 1 requires plugin type %q",
+			"endpoint-data-parallel-size", dataparallel.DPRankHeaderHandlerType)
+	}
+	return nil
 }
 
 // registerInTreePlugins registers the factory functions of all known plugins
@@ -595,6 +629,8 @@ func (r *Runner) registerInTreePlugins() {
 	// dataparallel profile handler
 	// Beta
 	fwkplugin.Register(dataparallel.DataParallelProfileHandlerType, fwkplugin.StabilityBeta, dataparallel.ProfileHandlerFactory)
+	// Alpha
+	fwkplugin.Register(dataparallel.DPRankHeaderHandlerType, fwkplugin.StabilityAlpha, dataparallel.DPRankHeaderHandlerFactory)
 
 	// extra scheduling scorers
 	// Beta
@@ -768,6 +804,9 @@ func (r *Runner) parseConfigurationPhaseOne(ctx context.Context, opts *runserver
 	rawConfig, featureGates, err := loader.LoadRawConfig(configBytes, logger, opts.FeatureGates...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse config - %w", err)
+	}
+	if err := validateDataParallelConfiguration(rawConfig, opts.EndpointDataParallelSize); err != nil {
+		return nil, err
 	}
 
 	r.featureGates = featureGates

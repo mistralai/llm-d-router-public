@@ -224,6 +224,36 @@ func TestProducer_EnsureSubscriber_PassesServingEndpoint(t *testing.T) {
 	assert.Equal(t, []string{"tcp://10.0.0.1:5560"}, subscribers.endpoints)
 }
 
+func TestProducer_EnsureSubscriber_PassesDataParallelRank(t *testing.T) {
+	cfg := kvevents.DefaultConfig()
+	cfg.DiscoverPods = true
+	cfg.PodDiscoveryConfig = kvevents.DefaultPodReconcilerConfig()
+	cfg.PodDiscoveryConfig.SocketPort = 5557
+	cfg.PodDiscoveryConfig.ReplaySocketPort = 5657
+
+	subscribers := &fakeSubscriberManager{}
+	p := &Producer{
+		typedName:          plugin.TypedName{Type: PluginType, Name: PluginType},
+		subscribersManager: subscribers,
+		kvEventsConfig:     cfg,
+		subscriberCtx:      context.Background(),
+	}
+	rank := 3
+
+	require.NoError(t, p.ensureSubscriber(context.Background(), &fwkdl.EndpointMetadata{
+		ID:               k8stypes.NamespacedName{Namespace: "ns", Name: "pod-a-rank-3"},
+		Address:          "10.0.0.1",
+		Port:             "8000",
+		DataParallelRank: &rank,
+	}))
+
+	assert.Equal(t, []string{"tcp://10.0.0.1:5560"}, subscribers.endpoints)
+	assert.Equal(t, []string{"tcp://10.0.0.1:5660"}, subscribers.replayEndpoints)
+	require.Len(t, subscribers.dataParallelRanks, 1)
+	require.NotNil(t, subscribers.dataParallelRanks[0])
+	assert.Equal(t, rank, *subscribers.dataParallelRanks[0])
+}
+
 // IPv6 addresses must be bracketed in the zmq endpoint.
 func TestProducer_EnsureSubscriber_IPv6BracketsEndpoint(t *testing.T) {
 	cfg := kvevents.DefaultConfig()
@@ -314,6 +344,46 @@ func TestProducer_ExtractEndpoint_DeleteClearsIndex(t *testing.T) {
 
 	ids, _ := p.subscribersManager.GetActiveSubscribers()
 	assert.Empty(t, ids)
+}
+
+func TestProducer_ExtractEndpoint_DeleteClearsOnlyDataParallelRank(t *testing.T) {
+	ctx := discardCtx(t)
+
+	var clearedPod string
+	var clearedRank int
+	fakeIndex := &fakeKVBlockIndex{
+		clearFn: func(_ context.Context, _ string) error {
+			t.Fatal("rank endpoint delete must not clear all ranks")
+			return nil
+		},
+		clearRankFn: func(_ context.Context, podIdentifier string, dataParallelRank int) error {
+			clearedPod = podIdentifier
+			clearedRank = dataParallelRank
+			return nil
+		},
+	}
+	cfg := kvevents.DefaultConfig()
+	cfg.DiscoverPods = true
+	cfg.PodDiscoveryConfig = kvevents.DefaultPodReconcilerConfig()
+	p := &Producer{
+		typedName:          plugin.TypedName{Type: PluginType, Name: PluginType},
+		subscribersManager: kvevents.NewSubscriberManager(kvevents.NewPool(cfg, nil, nil, nil)),
+		kvEventsConfig:     cfg,
+		kvCacheIndexer:     &fakeKVCacheIndexer{index: fakeIndex},
+		subscriberCtx:      context.Background(),
+	}
+	defer p.subscribersManager.Shutdown(ctx)
+	rank := 2
+	ep := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
+		ID:               k8stypes.NamespacedName{Namespace: "ns", Name: "pod-clear-rank-2"},
+		Address:          "10.0.0.99",
+		Port:             "8080",
+		DataParallelRank: &rank,
+	}, nil)
+
+	require.NoError(t, p.Extract(ctx, fwkdl.EndpointEvent{Type: fwkdl.EventDelete, Endpoint: ep}))
+	assert.Equal(t, "10.0.0.99:8080", clearedPod)
+	assert.Equal(t, rank, clearedRank)
 }
 
 // Delete by NamespacedName must work even when the event has no address.

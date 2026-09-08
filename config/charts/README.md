@@ -283,6 +283,7 @@ Configuration for the backend model servers that EPP routes traffic to. These se
 | `router.modelServers.matchLabels` | **REQUIRED** (when `create=true`). Label selector to match model server pods. | `{}` |
 | `router.modelServers.type` | Type of model servers in the pool. Options: `[vllm, sglang, triton-tensorrt-llm, trtllm-serve, triton]`. | `vllm` |
 | `router.modelServers.protocol` | Protocol used by model servers. Options: `[http, grpc]`. | `http` |
+| `router.modelServers.dataParallelSize` | Fallback rank count for vLLM Internal or Hybrid load balancing with one shared serving port. Values greater than `1` enable logical rank endpoints and the `dp-rank-header-handler` in `default-plugins.yaml`. | `1` |
 | `router.modelServers.targetPorts` | Port(s) EPP routes traffic to on the model servers. | `[{number: 8000}]` |
 | `router.modelServers.targetPortNumber` | Legacy fallback port number for GKE health check policies. | `8000` |
 

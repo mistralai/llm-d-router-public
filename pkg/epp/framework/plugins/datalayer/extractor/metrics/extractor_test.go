@@ -19,11 +19,14 @@ package metrics
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/utils/ptr"
 
@@ -41,6 +44,70 @@ const (
 	defaultCacheInfoMetric              = "vllm:cache_config_info"
 	customMetricsConfigKey              = "customMetrics"
 )
+
+func TestExtractorSelectsMetricsForDataParallelRank(t *testing.T) {
+	registry := NewMappingRegistry()
+	mapping, err := NewMapping(
+		defaultTotalQueuedRequestsMetric,
+		defaultTotalRunningRequestsMetric,
+		defaultKvCacheUsagePercentageMetric,
+		"",
+		defaultCacheInfoMetric,
+	)
+	require.NoError(t, err)
+	require.NoError(t, registry.Register(DefaultEngineType, mapping))
+	extractor, err := NewCoreMetricsExtractor(registry, "")
+	require.NoError(t, err)
+	rank := 1
+	endpoint := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{DataParallelRank: &rank}, nil)
+	families := sourcemetrics.PrometheusMetricMap{
+		defaultTotalQueuedRequestsMetric:    metricFamilyByEngine(2, 7),
+		defaultTotalRunningRequestsMetric:   metricFamilyByEngine(3, 11),
+		defaultKvCacheUsagePercentageMetric: metricFamilyByEngine(0.25, 0.75),
+		defaultCacheInfoMetric: {
+			Type: dto.MetricType_GAUGE.Enum(),
+			Metric: []*dto.Metric{
+				metricByEngineWithLabels(0, map[string]string{
+					CacheConfigBlockSizeInfoMetricName: "16",
+					CacheConfigNumGPUBlocksMetricName:  "100",
+				}),
+				metricByEngineWithLabels(1, map[string]string{
+					CacheConfigBlockSizeInfoMetricName: "32",
+					CacheConfigNumGPUBlocksMetricName:  "200",
+				}),
+			},
+		},
+	}
+
+	require.NoError(t, extractor.Extract(context.Background(), fwkdl.PollInput[sourcemetrics.PrometheusMetricMap]{
+		Payload: families, Endpoint: endpoint,
+	}))
+	assert.Equal(t, 7, endpoint.GetMetrics().WaitingQueueSize)
+	assert.Equal(t, 11, endpoint.GetMetrics().RunningRequestsSize)
+	assert.Equal(t, 0.75, endpoint.GetMetrics().KVCacheUsagePercent)
+	assert.Equal(t, 32, endpoint.GetMetrics().CacheBlockSize)
+	assert.Equal(t, 200, endpoint.GetMetrics().CacheNumBlocks)
+}
+
+func metricFamilyByEngine(values ...float64) *dto.MetricFamily {
+	metrics := make([]*dto.Metric, 0, len(values))
+	for rank, value := range values {
+		metrics = append(metrics, &dto.Metric{
+			Label: []*dto.LabelPair{{Name: proto.String("engine"), Value: proto.String(strconv.Itoa(rank))}},
+			Gauge: &dto.Gauge{Value: ptr.To(value)},
+		})
+	}
+	return &dto.MetricFamily{Type: dto.MetricType_GAUGE.Enum(), Metric: metrics}
+}
+
+func metricByEngineWithLabels(rank int, labels map[string]string) *dto.Metric {
+	pairs := make([]*dto.LabelPair, 0, 1+len(labels))
+	pairs = append(pairs, &dto.LabelPair{Name: proto.String("engine"), Value: proto.String(strconv.Itoa(rank))})
+	for name, value := range labels {
+		pairs = append(pairs, &dto.LabelPair{Name: proto.String(name), Value: proto.String(value)})
+	}
+	return &dto.Metric{Label: pairs, Gauge: &dto.Gauge{Value: ptr.To(1.0)}}
+}
 
 func TestExtractorExtract(t *testing.T) {
 	ctx := context.Background()

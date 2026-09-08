@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 )
 
@@ -43,8 +44,8 @@ const defaultTierWeight = 1.0
 // positions: positions where pos&mask == 0 poll ctx.Err().
 const matchCancellationMask = 255
 
-// PodMatch is one pod's prefix match for a key sequence. All values cover
-// the contiguous chain of keys the pod holds, counted from the first key.
+// PodMatch is one cache endpoint's prefix match for a key sequence. All values
+// cover the contiguous chain of keys the endpoint holds, counted from the first key.
 type PodMatch struct {
 	// WeightedScore sums, per block of the chain, the highest device-tier
 	// weight among the pod's entries for that block; tiers without a
@@ -59,9 +60,19 @@ type PodMatch struct {
 }
 
 // MatchBlockKeys runs the prefix matcher over keys for the pods in podFilter
-// (every pod when empty) and returns one PodMatch per pod that holds the
-// first key. Empty keys match nothing.
+// (every pod when empty) and returns the highest-scoring match for each pod.
+// Empty keys match nothing.
 func (k *Indexer) MatchBlockKeys(ctx context.Context, keys []kvblock.BlockHash,
+	podFilter sets.Set[string],
+) (map[string]PodMatch, error) {
+	matches, _, err := k.matchBlockKeys(ctx, keys, podFilter)
+	return collapseDataParallelMatches(matches), err
+}
+
+// MatchBlockKeysByEndpoint returns independent matches for logical data-parallel
+// endpoints. Rank-scoped entries are keyed by BuildDPScoringKey; other entries
+// are keyed by pod identifier.
+func (k *Indexer) MatchBlockKeysByEndpoint(ctx context.Context, keys []kvblock.BlockHash,
 	podFilter sets.Set[string],
 ) (map[string]PodMatch, error) {
 	matches, _, err := k.matchBlockKeys(ctx, keys, podFilter)
@@ -126,6 +137,23 @@ func maxMatchedBlocks(matches map[string]PodMatch) int {
 	return longest
 }
 
+func collapseDataParallelMatches(matches map[string]PodMatch) map[string]PodMatch {
+	podMatches := make(map[string]PodMatch, len(matches))
+	selectedKeys := make(map[string]string, len(matches))
+	for scoringKey, match := range matches {
+		podIdentifier, _ := routing.ParseDPScoringKey(scoringKey)
+		current, exists := podMatches[podIdentifier]
+		if !exists || match.WeightedScore > current.WeightedScore ||
+			(match.WeightedScore == current.WeightedScore && match.MatchedBlocks > current.MatchedBlocks) ||
+			(match.WeightedScore == current.WeightedScore && match.MatchedBlocks == current.MatchedBlocks &&
+				scoringKey < selectedKeys[podIdentifier]) {
+			podMatches[podIdentifier] = match
+			selectedKeys[podIdentifier] = scoringKey
+		}
+	}
+	return podMatches
+}
+
 // matchMaterialized feeds the accumulator from a Lookup result, walking keys
 // in order and stopping at the first key without entries. Pod and tier
 // ordinals are assigned per call, since materialized entries carry none.
@@ -148,7 +176,16 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		acc.beginKey(len(entries))
 		for i := range entries {
 			e := &entries[i]
-			acc.entry(e.PodIdentifier, pods.of(e.PodIdentifier), e.DeviceTier, tiers.of(e.DeviceTier), e.Speculative)
+			rank := routing.NoDataParallelRank
+			if e.DataParallelRank != nil {
+				rank = *e.DataParallelRank
+			}
+			candidate, buildErr := routing.BuildDPScoringKey(e.PodIdentifier, rank)
+			if buildErr != nil {
+				return nil, buildErr
+			}
+			acc.entry(candidate, pods.of(candidate), e.PodIdentifier,
+				e.DeviceTier, tiers.of(e.DeviceTier), e.Speculative)
 		}
 		if !acc.endKey() {
 			break
@@ -307,10 +344,17 @@ func (a *prefixAccumulator) beginKey(numEntries int) {
 }
 
 // entry records that pod holds the current key in tier.
-func (a *prefixAccumulator) entry(pod string, podOrdinal uint32, tier string, tierOrdinal uint32, speculative bool) {
+func (a *prefixAccumulator) entry(
+	pod string,
+	podOrdinal uint32,
+	filterPod string,
+	tier string,
+	tierOrdinal uint32,
+	speculative bool,
+) {
 	s, ok := a.table.lookup(podOrdinal)
 	if !ok {
-		if !a.first || (a.filter.Len() > 0 && !a.filter.Has(pod)) {
+		if !a.first || (a.filter.Len() > 0 && !a.filter.Has(filterPod)) {
 			return // the first key fixes the candidate set
 		}
 		s = a.newSlot(pod)

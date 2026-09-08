@@ -123,6 +123,54 @@ func TestProcessRawMessage_UsesSubscriberSourceEndpoint(t *testing.T) {
 	assert.ElementsMatch(t, []string{"10.0.0.1:8000", "10.0.0.1:8003"}, got)
 }
 
+func TestProcessRawMessage_UsesSubscriberDataParallelRank(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tokenProcessor := newTestPool(t, 16)
+	pool.adapter = &sourceEndpointAdapter{}
+	rank := 2
+
+	pool.processRawMessage(ctx, &RawMessage{
+		Topic:                  "kv@10.0.0.1:8000@test-model",
+		Payload:                []byte{1},
+		SourceEndpoint:         "10.0.0.1:8000",
+		SourceDataParallelRank: &rank,
+	})
+
+	keys, err := tokenProcessor.TokensToKVBlockKeys(
+		kvblock.EmptyBlockHash, makeTokens(16), "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+
+	result, err := idx.Lookup(ctx, keys, nil)
+	require.NoError(t, err)
+	require.Len(t, result[keys[0]], 1)
+	require.NotNil(t, result[keys[0]][0].DataParallelRank)
+	assert.Equal(t, rank, *result[keys[0]][0].DataParallelRank)
+}
+
+func TestProcessRawMessage_RankResetPreservesSiblingRank(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, _ := newTestPool(t, 16)
+	rank0, rank1 := 0, 1
+	key := kvblock.BlockHash(42)
+	require.NoError(t, idx.Add(ctx, nil, []kvblock.BlockHash{key}, []kvblock.PodEntry{
+		{PodIdentifier: "10.0.0.1:8000", DeviceTier: "gpu", DataParallelRank: &rank0},
+		{PodIdentifier: "10.0.0.1:8000", DeviceTier: "gpu", DataParallelRank: &rank1},
+	}))
+
+	pool.processRawMessage(ctx, &RawMessage{
+		SourceEndpoint:        "10.0.0.1:8000",
+		ResetDataParallelRank: &rank0,
+		reset:                 true,
+	})
+
+	result, err := idx.Lookup(ctx, []kvblock.BlockHash{key}, nil)
+	require.NoError(t, err)
+	require.Len(t, result[key], 1)
+	require.NotNil(t, result[key][0].DataParallelRank)
+	assert.Equal(t, rank1, *result[key][0].DataParallelRank)
+}
+
 func TestProcessRawMessage_FallsBackToTopicEndpoint(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 	pool, idx, tokenProcessor := newTestPool(t, 16)

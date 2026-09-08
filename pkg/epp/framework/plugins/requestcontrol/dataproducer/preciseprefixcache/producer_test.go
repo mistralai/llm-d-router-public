@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/jellydator/ttlcache/v3"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/kvcache"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvevents"
@@ -54,7 +55,7 @@ func (f *fakeKVCacheIndexer) ComputeBlockKeysFromTokens(ctx context.Context, tok
 
 func (f *fakeKVCacheIndexer) KVBlockIndex() kvblock.Index { return f.index }
 
-func (f *fakeKVCacheIndexer) MatchBlockKeys(ctx context.Context, keys []kvblock.BlockHash, podFilter sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+func (f *fakeKVCacheIndexer) MatchBlockKeysByEndpoint(ctx context.Context, keys []kvblock.BlockHash, podFilter sets.Set[string]) (map[string]kvcache.PodMatch, error) {
 	if f.matchBlockKeys != nil {
 		return f.matchBlockKeys(ctx, keys, podFilter)
 	}
@@ -62,8 +63,9 @@ func (f *fakeKVCacheIndexer) MatchBlockKeys(ctx context.Context, keys []kvblock.
 }
 
 type fakeKVBlockIndex struct {
-	addFn   func(ctx context.Context, prevKeys, keys []kvblock.BlockHash, entries []kvblock.PodEntry) error
-	clearFn func(ctx context.Context, podIdentifier string) error
+	addFn       func(ctx context.Context, prevKeys, keys []kvblock.BlockHash, entries []kvblock.PodEntry) error
+	clearFn     func(ctx context.Context, podIdentifier string) error
+	clearRankFn func(ctx context.Context, podIdentifier string, dataParallelRank int) error
 }
 
 func (f *fakeKVBlockIndex) Lookup(_ context.Context, _ []kvblock.BlockHash, _ sets.Set[string]) (map[kvblock.BlockHash][]kvblock.PodEntry, error) {
@@ -88,6 +90,13 @@ func (f *fakeKVBlockIndex) GetRequestKey(_ context.Context, _ kvblock.BlockHash)
 func (f *fakeKVBlockIndex) Clear(ctx context.Context, podIdentifier string) error {
 	if f.clearFn != nil {
 		return f.clearFn(ctx, podIdentifier)
+	}
+	return nil
+}
+
+func (f *fakeKVBlockIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
+	if f.clearRankFn != nil {
+		return f.clearRankFn(ctx, podIdentifier, dataParallelRank)
 	}
 	return nil
 }
@@ -201,6 +210,54 @@ func TestProduce_UsesTokenizedRequest(t *testing.T) {
 	assert.Equal(t, 0, info2.MatchBlocks())
 	assert.Equal(t, 1, info2.TotalBlocks())
 	assert.Nil(t, info2.MM(), "text-only request must leave MM untracked")
+}
+
+func TestProduce_WritesRankSpecificMatchInfo(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	rank0, rank1 := 0, 1
+	endpoints := []scheduling.Endpoint{
+		scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
+			ID: k8stypes.NamespacedName{Name: "pod-a-rank-0"}, Address: "10.0.0.1", Port: "8080",
+			DataParallelRank: &rank0,
+		}, nil, nil),
+		scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
+			ID: k8stypes.NamespacedName{Name: "pod-a-rank-1"}, Address: "10.0.0.1", Port: "8080",
+			DataParallelRank: &rank1,
+		}, nil, nil),
+	}
+	rank0Key, err := routing.BuildDPScoringKey("10.0.0.1:8080", rank0)
+	require.NoError(t, err)
+	rank1Key, err := routing.BuildDPScoringKey("10.0.0.1:8080", rank1)
+	require.NoError(t, err)
+
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			return []kvblock.BlockHash{0xCAFE}, nil
+		},
+		matchBlockKeys: func(_ context.Context, _ []kvblock.BlockHash, filter sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+			assert.Equal(t, sets.New("10.0.0.1:8080"), filter)
+			return map[string]kvcache.PodMatch{
+				rank0Key: {WeightedScore: 1, MatchedBlocks: 1, BlocksByTier: map[string]int{"gpu": 1}},
+				rank1Key: {WeightedScore: 3, MatchedBlocks: 3, BlocksByTier: map[string]int{"gpu": 3}},
+			}, nil
+		},
+	}
+	p := newProducerWithIndexer(ctx, idx)
+	req := &scheduling.InferenceRequest{
+		RequestID: "req-dp", TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{TokenizedRequest: &fwkrh.TokenizedRequest{
+			Prompts: []fwkrh.PromptTokens{{TokenIDs: make([]uint32, testBlockSize)}},
+		}},
+	}
+
+	require.NoError(t, p.Produce(ctx, req, endpoints))
+	for i, want := range []int{1, 3} {
+		raw, ok := endpoints[i].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
+		require.True(t, ok)
+		info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
+		require.True(t, ok)
+		assert.Equal(t, want, info.MatchBlocks())
+	}
 }
 
 func TestProduce_CancellationPublishesNoEndpointResults(t *testing.T) {
@@ -815,19 +872,24 @@ func TestNewRejectsUnsupportedKVEventEngineType(t *testing.T) {
 }
 
 type fakeSubscriberManager struct {
-	ids             []string
-	sourceEndpoints []string
-	endpoints       []string
+	ids               []string
+	sourceEndpoints   []string
+	endpoints         []string
+	replayEndpoints   []string
+	dataParallelRanks []*int
 }
 
 func (f *fakeSubscriberManager) EnsureSubscriber(
 	_ context.Context,
-	id, sourceEndpoint, endpoint, _, _ string,
+	id, sourceEndpoint, endpoint, replayEndpoint, _ string,
+	dataParallelRank *int,
 	_ bool,
 ) error {
 	f.ids = append(f.ids, id)
 	f.sourceEndpoints = append(f.sourceEndpoints, sourceEndpoint)
 	f.endpoints = append(f.endpoints, endpoint)
+	f.replayEndpoints = append(f.replayEndpoints, replayEndpoint)
+	f.dataParallelRanks = append(f.dataParallelRanks, dataParallelRank)
 	return nil
 }
 func (f *fakeSubscriberManager) RemoveSubscriber(_ context.Context, _ string) {}

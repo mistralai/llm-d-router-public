@@ -240,3 +240,23 @@ func TestScoreTokens(t *testing.T) {
 		})
 	}
 }
+
+func TestScoreTokensCollapsesDataParallelRanksToPods(t *testing.T) {
+	rank0 := 0
+	rank1 := 1
+	tp := &mockTokenProcessor{blockKeys: u64ToBlockKeys([]uint64{10, 20})}
+	indexer := newTestIndexer(t, tp)
+	populateIndex(t, indexer.KVBlockIndex(), map[kvblock.BlockHash][]kvblock.PodEntry{
+		10: {
+			{PodIdentifier: testPodA, DeviceTier: "gpu", DataParallelRank: &rank0},
+			{PodIdentifier: testPodA, DeviceTier: "gpu", DataParallelRank: &rank1},
+		},
+		20: {
+			{PodIdentifier: testPodA, DeviceTier: "gpu", DataParallelRank: &rank1},
+		},
+	})
+
+	scores, err := indexer.ScoreTokens(t.Context(), []uint32{1, 2}, testModel, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]float64{testPodA: 2}, scores)
+}

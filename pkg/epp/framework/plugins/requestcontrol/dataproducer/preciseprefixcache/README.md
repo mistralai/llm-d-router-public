@@ -39,6 +39,34 @@ upstream. No-op otherwise.
 Set `kvEventsConfig.engineType` to `sglang` for SGLang KV-events. It defaults
 to `vllm` when omitted.
 
+For vLLM Internal or Hybrid load balancing, configure
+`dp-rank-header-handler`. Endpoint discovery creates one schedulable endpoint
+per local rank while retaining the pod's shared serving address. The handler
+sets `x-data-parallel-rank` to the selected endpoint's rank.
+
+With pod KV-event discovery enabled, each logical endpoint subscribes to
+`socketPort + rank` and `replaySocketPort + rank`. Cache entries, replay resets,
+and endpoint deletion remain scoped to that rank.
+
+```yaml
+plugins:
+  - type: precise-prefix-cache-producer
+    parameters:
+      kvEventsConfig:
+        discoverPods: true
+        podDiscoveryConfig:
+          socketPort: 5557
+  - type: dp-rank-header-handler
+```
+
+The handler discovers rank counts from `vllm:cache_config_info` metrics.
+`--endpoint-data-parallel-size` supplies a fallback count. The corresponding
+Helm value is `router.modelServers.dataParallelSize`.
+
+The handler is an Alpha plugin and requires
+`--allow-experimental-plugins`. Do not configure it for vLLM External load
+balancing, where each rank has a distinct network endpoint.
+
 Set `kvEventsConfig.tracing` to `true` to emit OpenTelemetry spans for the
 KV-event pipeline (`events_receive`, `events_process`, `events_decode`). It
 defaults to `false`: KV events arrive at many times the inference request rate,

@@ -306,7 +306,7 @@ func TestZMQSubscriber_ReceivesMessages(t *testing.T) {
 	// Start subscriber — remote=false means it binds (Listen).
 	endpoint := "tcp://127.0.0.1:15559"
 	subManager := kvevents.NewSubscriberManager(pool)
-	err = subManager.EnsureSubscriber(ctx, "test-pod", "", endpoint, "", "kv@", false)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", "", endpoint, "", "kv@", nil, false)
 	require.NoError(t, err)
 
 	// Give subscriber time to bind.
@@ -358,6 +358,7 @@ func TestZMQSubscribers_SameTopicUsesServingEndpointIdentity(t *testing.T) {
 			zmqEndpoints[i],
 			"",
 			"kv@",
+			nil,
 			false,
 		))
 	}
@@ -432,7 +433,7 @@ func TestZMQSubscriber_ShortSequenceFrameSkipped(t *testing.T) {
 	endpoint := fmt.Sprintf("tcp://%s", ln.Addr().String())
 	ln.Close()
 	subManager := kvevents.NewSubscriberManager(pool)
-	err = subManager.EnsureSubscriber(ctx, "test-pod", "", endpoint, "", "kv@", false)
+	err = subManager.EnsureSubscriber(ctx, "test-pod", "", endpoint, "", "kv@", nil, false)
 	require.NoError(t, err)
 	time.Sleep(100 * time.Millisecond)
 
@@ -506,7 +507,7 @@ func newReplayHarnessWithBehavior(
 
 	subManager := kvevents.NewSubscriberManager(pool)
 	require.NoError(t, subManager.EnsureSubscriber(
-		ctx, "test-pod", "10.0.0.1:8000", pubEndpoint, replayEndpoint, "kv@", false))
+		ctx, "test-pod", "10.0.0.1:8000", pubEndpoint, replayEndpoint, "kv@", nil, false))
 	require.Eventually(t, func() bool { return buffer.requests.Load() == 1 },
 		5*time.Second, 50*time.Millisecond, "proactive replay expected")
 
@@ -704,6 +705,76 @@ func TestZMQSubscriber_SequenceResetClearsAndRebuildsPod(t *testing.T) {
 		return lookupErr == nil && len(oldHits[oldRequestKey]) == 0 && newErr == nil
 	}, 5*time.Second, 50*time.Millisecond,
 		"restart must replace stale pod state with the replayed epoch")
+}
+
+func TestZMQSubscriber_EqualSequenceWithDifferentPayloadClearsAndRebuildsPod(t *testing.T) {
+	oldReplayPayload := buildDistinctBlockStoredPayload(t, 100)
+	h := newReplayHarness(t, []replayMessage{
+		{seq: 0, payload: oldReplayPayload},
+	}, false)
+	require.Eventually(t, func() bool {
+		_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(100))
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond)
+
+	oldLivePayload := buildDistinctBlockStoredPayload(t, 200)
+	require.Eventually(t, func() bool {
+		h.send(t, 1, oldLivePayload)
+		_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(200))
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond,
+		"live event must be observed before simulating publisher restart")
+	oldReplayRequestKey, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(100))
+	require.NoError(t, err)
+	oldLiveRequestKey, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(200))
+	require.NoError(t, err)
+
+	newReplayPayload := buildDistinctBlockStoredPayload(t, 300)
+	newLivePayload := buildDistinctBlockStoredPayload(t, 400)
+	h.buffer.set(
+		replayMessage{seq: 0, payload: newReplayPayload},
+		replayMessage{seq: 1, payload: newLivePayload},
+	)
+	h.send(t, 1, newLivePayload)
+	require.Eventually(t, func() bool { return h.buffer.requests.Load() == 2 },
+		5*time.Second, 50*time.Millisecond, "full replay after equal-sequence reset expected")
+
+	require.Eventually(t, func() bool {
+		oldHits, lookupErr := h.index.Lookup(h.ctx,
+			[]kvblock.BlockHash{oldReplayRequestKey, oldLiveRequestKey}, nil)
+		_, newReplayErr := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(300))
+		_, newLiveErr := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(400))
+		return lookupErr == nil && len(oldHits[oldReplayRequestKey]) == 0 &&
+			len(oldHits[oldLiveRequestKey]) == 0 && newReplayErr == nil && newLiveErr == nil
+	}, 5*time.Second, 50*time.Millisecond,
+		"restart must replace stale pod state when the first sequence is unchanged")
+}
+
+func TestZMQSubscriber_EqualSequenceAfterProactiveReplayClearsAndRebuildsPod(t *testing.T) {
+	oldPayload := buildDistinctBlockStoredPayload(t, 100)
+	h := newReplayHarness(t, []replayMessage{
+		{seq: 0, payload: oldPayload},
+	}, false)
+	require.Eventually(t, func() bool {
+		_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(100))
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond)
+	oldRequestKey, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(100))
+	require.NoError(t, err)
+
+	newPayload := buildDistinctBlockStoredPayload(t, 200)
+	h.buffer.set(replayMessage{seq: 0, payload: newPayload})
+	h.send(t, 0, newPayload)
+	require.Eventually(t, func() bool { return h.buffer.requests.Load() == 2 },
+		5*time.Second, 50*time.Millisecond,
+		"full replay after an equal-sequence publisher restart expected")
+
+	require.Eventually(t, func() bool {
+		oldHits, lookupErr := h.index.Lookup(h.ctx, []kvblock.BlockHash{oldRequestKey}, nil)
+		_, newErr := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(200))
+		return lookupErr == nil && len(oldHits[oldRequestKey]) == 0 && newErr == nil
+	}, 5*time.Second, 50*time.Millisecond,
+		"publisher restart must replace state restored by proactive replay")
 }
 
 func TestZMQSubscriber_ReplayedLiveEventsDoNotTriggerAnotherReplay(t *testing.T) {
