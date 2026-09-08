@@ -48,6 +48,15 @@ With pod KV-event discovery enabled, each logical endpoint subscribes to
 `socketPort + rank` and `replaySocketPort + rank`. Cache entries, replay resets,
 and endpoint deletion remain scoped to that rank.
 
+When the serving endpoint belongs to a leader pod but each data-parallel rank's
+KV-event socket belongs to a different pod, configure `rankPodMapping`. The
+group label joins the serving endpoint to its worker pods. The rank label is the
+worker index, and `ranksPerPod` maps each worker to a consecutive range of
+global data-parallel ranks. Requests still target the leader endpoint and use
+`x-data-parallel-rank`; only the KV-event transport uses the worker pod IP.
+Each worker uses `socketPort` and `replaySocketPort` for its first local rank,
+with a port offset only when `ranksPerPod` is greater than one.
+
 ```yaml
 plugins:
   - type: precise-prefix-cache-producer
@@ -56,6 +65,13 @@ plugins:
         discoverPods: true
         podDiscoveryConfig:
           socketPort: 5557
+          replaySocketPort: 5657
+          podLabelSelector: app.kubernetes.io/instance=model-server
+          podNamespace: default
+          rankPodMapping:
+            groupLabelKey: leaderworkerset.sigs.k8s.io/group-index
+            rankLabelKey: leaderworkerset.sigs.k8s.io/worker-index
+            ranksPerPod: 1
   - type: dp-rank-header-handler
 ```
 
