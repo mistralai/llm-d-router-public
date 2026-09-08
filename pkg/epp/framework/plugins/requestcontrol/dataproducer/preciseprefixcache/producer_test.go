@@ -907,6 +907,7 @@ type fakeSubscriberManager struct {
 	endpoints         []string
 	replayEndpoints   []string
 	dataParallelRanks []*int
+	removed           []string
 }
 
 func (f *fakeSubscriberManager) EnsureSubscriber(
@@ -922,7 +923,10 @@ func (f *fakeSubscriberManager) EnsureSubscriber(
 	f.dataParallelRanks = append(f.dataParallelRanks, dataParallelRank)
 	return nil
 }
-func (f *fakeSubscriberManager) RemoveSubscriber(_ context.Context, _ string) bool { return false }
+func (f *fakeSubscriberManager) RemoveSubscriber(_ context.Context, id string) bool {
+	f.removed = append(f.removed, id)
+	return true
+}
 func (f *fakeSubscriberManager) GetActiveSubscribers() ([]string, []string) {
 	return f.ids, f.endpoints
 }

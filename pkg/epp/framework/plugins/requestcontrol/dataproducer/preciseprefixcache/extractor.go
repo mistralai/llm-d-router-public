@@ -39,6 +39,9 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 	if !p.kvEventsConfig.DiscoverPods || p.kvEventsConfig.PodDiscoveryConfig == nil {
 		return nil
 	}
+	if p.rankPodResolver != nil {
+		return (&rankEndpointHandler{producer: p}).Extract(ctx, event)
+	}
 	meta := event.Endpoint.GetMetadata()
 	if meta == nil || meta.ID.Name == "" {
 		return nil

@@ -243,7 +243,7 @@ func TestSubscriberManager_Shutdown_ReleasesSocket(t *testing.T) {
 	sm := kvevents.NewSubscriberManager(pool)
 
 	endpoint := availableEndpoint(t, ctx)
-	err = sm.EnsureSubscriber(ctx, "test-pod-releases-socket", "", endpoint, "", "kv@", false)
+	err = sm.EnsureSubscriber(ctx, "test-pod-releases-socket", "", endpoint, "", "kv@", nil, false)
 	require.NoError(t, err)
 
 	shutdownCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -278,7 +278,7 @@ func TestSubscriberManager_Shutdown_HonorsContextCancellation(t *testing.T) {
 	sm := kvevents.NewSubscriberManager(pool)
 
 	endpoint := availableEndpoint(t, ctx)
-	err = sm.EnsureSubscriber(ctx, "test-pod-canceled", "", endpoint, "", "kv@", false)
+	err = sm.EnsureSubscriber(ctx, "test-pod-canceled", "", endpoint, "", "kv@", nil, false)
 	require.NoError(t, err)
 
 	canceledCtx, cancel := context.WithCancel(ctx)
@@ -318,7 +318,7 @@ func TestSubscriberManager_EndpointChange_WaitsForOldSubscriberExit(t *testing.T
 	endpoint2 := fmt.Sprintf("tcp://%s", addr2)
 
 	podID := "default/test-pod-0"
-	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "kv@", false)
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "kv@", nil, false)
 	require.NoError(t, err)
 
 	// Wait for subscriber to bind to addr1.
@@ -333,7 +333,7 @@ func TestSubscriberManager_EndpointChange_WaitsForOldSubscriberExit(t *testing.T
 
 	// Replace subscriber with endpoint2. EnsureSubscriber must wait until the old
 	// subscriber has exited and closed its socket before returning.
-	err = sm.EnsureSubscriber(ctx, podID, "", endpoint2, "", "kv@", false)
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint2, "", "kv@", nil, false)
 	require.NoError(t, err)
 
 	// addr1 should now be released and available to bind immediately.
@@ -363,13 +363,13 @@ func TestSubscriberManager_EndpointChange_HonorsContextCancellation(t *testing.T
 	endpoint1 := "tcp://10.0.0.1:5557"
 	endpoint2 := "tcp://10.0.0.2:5557"
 
-	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "kv@", true)
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "kv@", nil, true)
 	require.NoError(t, err)
 
 	canceledCtx, cancel := context.WithCancel(ctx)
 	cancel()
 
-	err = sm.EnsureSubscriber(canceledCtx, podID, "", endpoint2, "", "kv@", true)
+	err = sm.EnsureSubscriber(canceledCtx, podID, "", endpoint2, "", "kv@", nil, true)
 	assert.ErrorIs(t, err, context.Canceled)
 
 	identifiers, _ := sm.GetActiveSubscribers()
@@ -401,7 +401,7 @@ func TestSubscriberManager_EndpointChange_BothChannelsReady_HonorsContextCancell
 	podID := "default/test-pod-0"
 
 	subCtx, subCancel := context.WithCancel(ctx)
-	err = sm.EnsureSubscriber(subCtx, podID, "", endpoint1, "", "kv@", false)
+	err = sm.EnsureSubscriber(subCtx, podID, "", endpoint1, "", "kv@", nil, false)
 	require.NoError(t, err)
 
 	// Wait for subscriber to bind to addr1.
@@ -433,7 +433,7 @@ func TestSubscriberManager_EndpointChange_BothChannelsReady_HonorsContextCancell
 	// Both entry.done and canceledCtx.Done() are ready. EnsureSubscriber must
 	// honor the context cancellation, clean up, and return context.Canceled
 	// rather than creating a replacement subscriber and returning nil.
-	err = sm.EnsureSubscriber(canceledCtx, podID, "", endpoint2, "", "kv@", false)
+	err = sm.EnsureSubscriber(canceledCtx, podID, "", endpoint2, "", "kv@", nil, false)
 	assert.ErrorIs(t, err, context.Canceled)
 
 	identifiers, _ := sm.GetActiveSubscribers()
