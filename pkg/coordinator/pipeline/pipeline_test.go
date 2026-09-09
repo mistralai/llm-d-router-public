@@ -126,6 +126,22 @@ func TestPipeline_SelectsMostFrequentValueForEachForwardedHeader(t *testing.T) {
 	}
 }
 
+func TestCaptureResponseHeaders_IgnoresEmptyValues(t *testing.T) {
+	rc := &RequestContext{
+		forwardResponseHeaders: map[string]struct{}{"x-route": {}},
+	}
+
+	rc.CaptureResponseHeaders(
+		http.Header{"X-Route": {""}},
+		http.Header{"X-Route": {"route-a"}},
+		http.Header{"X-Route": {""}},
+	)
+
+	if got := rc.downstreamHeaders["x-route"]; got != "route-a" {
+		t.Fatalf("captured route = %q, want %q", got, "route-a")
+	}
+}
+
 func TestNewWithForwardResponseHeaders_RejectsInvalidNames(t *testing.T) {
 	for _, headers := range [][]string{
 		{""},
