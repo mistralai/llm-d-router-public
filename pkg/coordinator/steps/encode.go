@@ -121,6 +121,8 @@ func (s *EncodeStep) Execute(ctx context.Context, reqCtx *pipeline.RequestContex
 	}
 
 	if err := g.Wait(); err != nil {
+		// Headers from successful siblings are discarded so a failed encode
+		// step cannot publish a partial aggregate.
 		return err
 	}
 
