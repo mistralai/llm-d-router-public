@@ -72,7 +72,8 @@ func (rc *RequestContext) ForwardedHeaders() map[string]string {
 // CaptureResponseHeaders records configured response headers for subsequent
 // pipeline steps. When a step has multiple responses, each response contributes
 // its first value and the most frequent value is recorded. Ties are resolved by
-// the order of the responses. Unconfigured headers are ignored.
+// the order of the responses. Unconfigured headers are ignored. This method
+// must not be called concurrently.
 func (rc *RequestContext) CaptureResponseHeaders(responses ...http.Header) {
 	for name := range rc.forwardResponseHeaders {
 		counts := make(map[string]int)
@@ -83,6 +84,9 @@ func (rc *RequestContext) CaptureResponseHeaders(responses ...http.Header) {
 				continue
 			}
 			value := values[0]
+			if value == "" {
+				continue
+			}
 			if counts[value] == 0 {
 				order = append(order, value)
 			}
