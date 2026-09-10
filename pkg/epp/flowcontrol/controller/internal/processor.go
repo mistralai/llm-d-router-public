@@ -272,10 +272,10 @@ func (p *Processor) enqueue(item *FlowItem) {
 		return
 	}
 
-	// The active queue-wait budget includes time spent in the processor's enqueue buffer.
-	regime := p.regime.Load()
-	if isExpired(item, p.clock.Now(), regime, p.noEndpointRequestTTL) {
-		p.finalizeAndRecordDrop(item, expiryError(regime.empty))
+	// The queue-wait budget includes time spent in the processor's enqueue buffer.
+	if ttl := item.EffectiveTTL(); ttl > 0 && !p.clock.Now().Before(item.EnqueueTime().Add(ttl)) {
+		item.Finalize(types.ErrTTLExpired)
+		p.recordDrop(item.FinalState().Outcome)
 		return
 	}
 

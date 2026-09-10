@@ -440,7 +440,7 @@ func (r *Runtime) CheckReady() error {
 	}
 	for _, initialSync := range r.notificationSyncs {
 		if !initialSync.hasSynced() {
-			return fmt.Errorf("notification source %s has not processed its initial events", initialSync.tracker.Name())
+			return fmt.Errorf("notification source %s has not processed its initial events", initialSync.name)
 		}
 	}
 	return nil

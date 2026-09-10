@@ -110,7 +110,7 @@ func TestRuntimeNotificationReadiness(t *testing.T) {
 		t.Fatalf("CheckReady() error = %v, want pending source name", err)
 	}
 
-	initialSync.tracker.UpstreamHasSynced()
+	initialSync.upstreamSynced.Store(true)
 	if err := runtime.CheckReady(); err != nil {
 		t.Fatalf("CheckReady() after an empty initial list: %v", err)
 	}

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -119,13 +120,17 @@ type notificationReconciler struct {
 }
 
 type notificationInitialSync struct {
-	tracker *synctrack.AsyncTracker[types.NamespacedName]
+	name           string
+	upstreamSynced atomic.Bool
+	tracker        *synctrack.AsyncTracker[types.NamespacedName]
 }
 
 func newNotificationInitialSync(sourceName string) *notificationInitialSync {
-	return &notificationInitialSync{
-		tracker: synctrack.NewAsyncTracker[types.NamespacedName](sourceName),
+	initialSync := &notificationInitialSync{name: sourceName}
+	initialSync.tracker = &synctrack.AsyncTracker[types.NamespacedName]{
+		UpstreamHasSynced: initialSync.upstreamSynced.Load,
 	}
+	return initialSync
 }
 
 // hasSynced reports whether the Kind source delivered its complete initial list
@@ -149,7 +154,7 @@ func (s *notificationInitialSyncSource) WaitForSync(ctx context.Context) error {
 	if err := s.SyncingSource.WaitForSync(ctx); err != nil {
 		return err
 	}
-	s.initialSync.tracker.UpstreamHasSynced()
+	s.initialSync.upstreamSynced.Store(true)
 	return nil
 }
 
