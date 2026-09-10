@@ -16,5 +16,4 @@
 
 mistral-branches                  # this branch: the rebuild script, this list and the CI workflow
 lfm/rawbody-release               # release RawBody after forwarding the request body to Envoy
-nzt/scoped-ttl                    # scoped flow-control queue TTLs (upstream: https://github.com/llm-d/llm-d-router/issues/2316)
 eliot/objective-key-attribute     # resolve the inference objective after request header plugins (fork PR: https://github.com/mistralai/llm-d-router-public/pull/16)
