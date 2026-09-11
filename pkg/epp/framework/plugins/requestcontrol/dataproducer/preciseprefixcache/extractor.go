@@ -54,19 +54,6 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 		for _, subscriberID := range p.subscriberIDs(meta) {
 			p.subscribersManager.RemoveSubscriber(ctx, subscriberID)
 		}
-		if meta.Address != "" {
-			podIdentifier := fmt.Sprintf("%s:%s", meta.Address, meta.Port)
-			var err error
-			if meta.DataParallelRank != nil {
-				err = p.kvCacheIndexer.KVBlockIndex().ClearRank(ctx, podIdentifier, *meta.DataParallelRank)
-			} else {
-				err = p.kvCacheIndexer.KVBlockIndex().Clear(ctx, podIdentifier)
-			}
-			if err != nil {
-				logger.Error(err, "Failed to clear index entries for removed endpoint",
-					"endpoint", endpointKey, "address", meta.Address, "port", meta.Port)
-			}
-		}
 		logger.V(logging.DEBUG).Info("Removed KV-events subscriber", "endpoint", endpointKey)
 	}
 	return nil
