@@ -102,6 +102,74 @@ func TestProcessRawMessage_UsesSubscriberSourceEndpoint(t *testing.T) {
 	assert.ElementsMatch(t, []string{"10.0.0.1:8000", "10.0.0.1:8003"}, got)
 }
 
+func TestSubscriberManager_RemoveSubscriberResetsQueuedPodState(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tokenProcessor := newTestPool(t, 16)
+	pool.adapter = &sourceEndpointAdapter{}
+	pool.Start(ctx)
+	defer pool.Shutdown(ctx)
+
+	const (
+		podIdentifier  = "ns/pod-1"
+		sourceEndpoint = "10.0.0.1:8000"
+	)
+	subscriberCtx, cancel := context.WithCancel(ctx)
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-subscriberCtx.Done()
+		close(canceled)
+		<-release
+		pool.AddTask(&RawMessage{
+			Topic:          "kv@10.0.0.1:8000@test-model",
+			Payload:        []byte{1},
+			SourceEndpoint: sourceEndpoint,
+		})
+	}()
+
+	manager := NewSubscriberManager(pool)
+	manager.subscribers[podIdentifier] = &subscriberEntry{
+		subscriber:     newZMQSubscriber(pool, podIdentifier, sourceEndpoint, "", "kv@", false),
+		cancel:         cancel,
+		sourceEndpoint: sourceEndpoint,
+		done:           done,
+	}
+
+	removed := make(chan struct{})
+	go func() {
+		manager.RemoveSubscriber(ctx, podIdentifier)
+		close(removed)
+	}()
+
+	<-canceled
+	returnedBeforeDone := false
+	select {
+	case <-removed:
+		returnedBeforeDone = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	<-removed
+	assert.False(t, returnedBeforeDone, "removal must wait until the subscriber stops enqueueing events")
+
+	keys, err := tokenProcessor.TokensToKVBlockKeys(
+		kvblock.EmptyBlockHash, makeTokens(16), "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	require.Eventually(t, func() bool {
+		if pool.queueDepth.Load() != 0 {
+			return false
+		}
+		pool.dedup.mu.Lock()
+		_, tracked := pool.dedup.refs[sourceEndpoint]
+		pool.dedup.mu.Unlock()
+		result, lookupErr := idx.Lookup(ctx, keys, nil)
+		return lookupErr == nil && !tracked && len(result[keys[0]]) == 0
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
 func TestProcessRawMessage_FallsBackToTopicEndpoint(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 	pool, idx, tokenProcessor := newTestPool(t, 16)

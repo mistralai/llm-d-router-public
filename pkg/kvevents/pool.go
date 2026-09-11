@@ -220,6 +220,11 @@ func (p *Pool) AddTask(task *RawMessage) {
 	p.addQueueDepth(1)
 }
 
+// resetForSource queues a pod reset on the same shard as its event stream.
+func (p *Pool) resetForSource(topic, sourceEndpoint string) {
+	p.AddTask(&RawMessage{Topic: topic, SourceEndpoint: sourceEndpoint, reset: true})
+}
+
 // worker is the main processing loop for a single worker goroutine.
 // It processes messages from its dedicated queue using the workqueue pattern.
 func (p *Pool) worker(ctx context.Context, workerIndex int) {
@@ -252,6 +257,17 @@ func (p *Pool) worker(ctx context.Context, workerIndex int) {
 // processRawMessage decodes the raw message payload using the adapter and processes the resulting event batch.
 func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 	logger := log.FromContext(ctx)
+	if msg.reset {
+		podID := msg.SourceEndpoint
+		if podID == "" {
+			podID = p.adapter.ShardingKey(msg)
+		}
+		if err := p.index.Clear(ctx, podID); err != nil {
+			logger.Error(err, "Failed to clear pod from index", "podIdentifier", podID)
+		}
+		p.dedup.clear(podID)
+		return
+	}
 
 	podID, modelName, batch, err := p.adapter.ParseMessage(msg)
 	if err != nil {

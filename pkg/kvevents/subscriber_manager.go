@@ -78,7 +78,7 @@ func (sm *SubscriberManager) EnsureSubscriber(
 			"newEndpoint", endpoint,
 			"oldSourceEndpoint", entry.sourceEndpoint,
 			"newSourceEndpoint", sourceEndpoint)
-		entry.cancel()
+		sm.stopSubscriber(entry)
 		delete(sm.subscribers, podIdentifier)
 		// The replacement subscriber below reuses podIdentifier, so its series
 		// are kept rather than cleaned up.
@@ -124,10 +124,18 @@ func (sm *SubscriberManager) RemoveSubscriber(ctx context.Context, podIdentifier
 	}
 
 	debugLogger.Info("Removing subscriber", "podIdentifier", podIdentifier, "endpoint", entry.endpoint)
-	entry.cancel()
+	sm.stopSubscriber(entry)
 	delete(sm.subscribers, podIdentifier)
 	metrics.SubscriberActive.Set(float64(len(sm.subscribers)))
 	cleanupSubscriberMetrics(podIdentifier, entry.done)
+}
+
+func (sm *SubscriberManager) stopSubscriber(entry *subscriberEntry) {
+	entry.cancel()
+	<-entry.done
+	if entry.sourceEndpoint != "" {
+		sm.pool.resetForSource(entry.subscriber.topicFilter, entry.sourceEndpoint)
+	}
 }
 
 // cleanupSubscriberMetrics drops the per-pod series for a removed subscriber
