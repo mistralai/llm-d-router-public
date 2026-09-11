@@ -82,11 +82,7 @@ func (sm *SubscriberManager) EnsureSubscriber(
 			"newSourceEndpoint", sourceEndpoint,
 			"oldReplayEndpoint", entry.replayEndpoint,
 			"newReplayEndpoint", replayEndpoint)
-		entry.cancel()
-		select {
-		case <-entry.done:
-		case <-ctx.Done():
-		}
+		sm.stopSubscriber(entry)
 		delete(sm.subscribers, podIdentifier)
 		if err := ctx.Err(); err != nil {
 			metrics.SubscriberActive.Set(float64(len(sm.subscribers)))
@@ -139,11 +135,19 @@ func (sm *SubscriberManager) RemoveSubscriber(ctx context.Context, podIdentifier
 	}
 
 	debugLogger.Info("Removing subscriber", "podIdentifier", podIdentifier, "endpoint", entry.endpoint)
-	entry.cancel()
+	sm.stopSubscriber(entry)
 	delete(sm.subscribers, podIdentifier)
 	metrics.SubscriberActive.Set(float64(len(sm.subscribers)))
 	cleanupSubscriberMetrics(podIdentifier, entry.done)
 	return true
+}
+
+func (sm *SubscriberManager) stopSubscriber(entry *subscriberEntry) {
+	entry.cancel()
+	<-entry.done
+	if entry.sourceEndpoint != "" {
+		sm.pool.resetForSource(entry.subscriber.topicFilter, entry.sourceEndpoint)
+	}
 }
 
 // cleanupSubscriberMetrics drops the per-pod series for a removed subscriber
