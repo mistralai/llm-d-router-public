@@ -445,15 +445,15 @@ func TestProduce_ExternalLBDoesNotExposeWinningRank(t *testing.T) {
 		[][]kvblock.BlockHash{keys}, nil))
 
 	_, ok := scheduling.ReadRequestAttribute[map[string]int](
-		req, preciseprefixcacheconstants.WinningRanksDataKey)
+		req, routing.DataParallelWinningRanksAttribute)
 	assert.False(t, ok, "rank-specific endpoints must not expose a rank for header injection")
 
-	require.NoError(t, dprank.NewDPRankHeaderHandler().PreRequest(ctx, req, &scheduling.SchedulingResult{
+	dprank.NewDPRankHeaderHandler().PreRequest(ctx, req, &scheduling.SchedulingResult{
 		PrimaryProfileName: "default",
 		ProfileResults: map[string]*scheduling.ProfileRunResult{
 			"default": {TargetEndpoints: endpoints},
 		},
-	}))
+	})
 	assert.NotContains(t, req.Headers, routing.DataParallelRankHeader,
 		"External LB must route by endpoint without an x-data-parallel-rank header")
 }
@@ -493,11 +493,11 @@ func TestProduce_SharedPortRankEndpointsKeepIndependentScores(t *testing.T) {
 		[][]kvblock.BlockHash{keys}, nil))
 
 	for rank, want := range []int{1, 2} {
-		raw, ok := endpoints[rank].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test"))
+		raw, ok := endpoints[rank].Get(attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("test").String())
 		require.True(t, ok)
 		assert.Equal(t, want, raw.(*attrprefix.PrefixCacheMatchInfo).MatchBlocks())
 	}
-	_, ok := scheduling.ReadRequestAttribute[map[string]int](req, preciseprefixcacheconstants.WinningRanksDataKey)
+	_, ok := scheduling.ReadRequestAttribute[map[string]int](req, routing.DataParallelWinningRanksAttribute)
 	assert.False(t, ok, "rank endpoints carry their rank in endpoint metadata")
 }
 
