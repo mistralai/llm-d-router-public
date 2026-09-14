@@ -148,7 +148,7 @@ func TestPreRequest_SeedsSpeculativeForLogicalEndpointRank(t *testing.T) {
 	p.pluginState.Write(req.RequestID, blockKeysStateKey,
 		&blockKeysState{perPromptKeys: [][]kvblock.BlockHash{{0xAA}}})
 
-	require.NoError(t, p.PreRequest(ctx, req, primaryOnly(endpoint)))
+	p.PreRequest(ctx, req, primaryOnly("default", endpoint))
 
 	require.Len(t, calls, 1)
 	require.Len(t, calls[0].entries, 1)
