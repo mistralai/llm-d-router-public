@@ -1,20 +1,15 @@
-# Branches whose mistral-specific commits are replayed on top of upstream/main
-# to rebuild the `mistral-main` branch (see scripts/update-mistral-main.py).
+# Frozen v1.0.1-prod composition.
 #
-# Format:
-#   - one branch name per line, resolved against the `origin` remote
-#   - order matters: branches are applied top to bottom
-#   - `#` starts a comment, either on its own line or after a branch name
-#   - surrounding whitespace is ignored
-#
-# Each branch should be a small feature branch based directly on `upstream/main`. Ideally
-# its comment links the upstream PR that carries the same change, so once that PR
-# merges the branch can be dropped from this list. See MISTRAL_README.md.
-#
-# Commits already present upstream (by patch id) or already applied by an
-# earlier branch in this list are skipped automatically.
+# The base is origin/lfm/v1.0.1-prod-upstream-base at
+# e380424c8bf8463b6f0d066095bd5bc81e03a9a3, the upstream router commit used
+# by the current GLM production EPP image. Branches are replayed in this order.
 
-mistral-branches                  # this branch: the rebuild script, this list and the CI workflow
-lfm/rawbody-release               # release RawBody after forwarding the request body to Envoy
-eliot/objective-key-attribute     # resolve the inference objective after request header plugins (fork PR: https://github.com/mistralai/llm-d-router-public/pull/16)
-mathis/import-safe-disaggset      # safe DisaggregatedSet rollout support (fork PR: https://github.com/mistralai/llm-d-router-public/pull/19; upstream: https://github.com/llm-d/llm-d-router/pull/2570, https://github.com/llm-d/llm-d-router/pull/2733, https://github.com/llm-d/llm-d-router/pull/2576, https://github.com/llm-d/llm-d-router/pull/2571)
+lfm/v1.0.1-prod-epp-readiness             # plugin-provided EPP readiness
+lfm/v1.0.1-prod-safe-disaggset             # safe DisaggregatedSet coordination
+lfm/v1.0.1-prod-cross-replica-ticker       # independent cross-replica publish loop
+lfm/v1.0.1-prod-coordinator-revision-sync  # revision forwarding across coordinator phases
+lfm/v1.0.1-prod-rawbody-release            # release request RawBody after Envoy forwarding
+lfm/v1.0.1-prod-scoped-ttls                # per-priority and per-request queue TTLs
+lfm/v1.0.1-prod-objective-key              # Eliot's inference-objective attribute support
+lfm/v1.0.1-prod-multi-dp                   # shared-port multi-DP routing and KV events
+lfm/v1.0.1-prod-kvevents-memory-fix        # clear index and dedup state on subscriber retirement
