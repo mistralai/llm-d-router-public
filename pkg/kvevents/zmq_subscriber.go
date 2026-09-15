@@ -17,6 +17,7 @@ package kvevents
 import (
 	"context"
 	"encoding/binary"
+	"sync"
 	"time"
 
 	zmq4 "github.com/go-zeromq/zmq4"
@@ -39,6 +40,8 @@ type zmqSubscriber struct {
 	endpoint       string
 	remote         bool
 	topicFilter    string
+	queueMu        sync.Mutex
+	retired        bool
 }
 
 // newZMQSubscriber creates a new ZMQ subscriber.
@@ -149,11 +152,31 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			"seq", seq,
 			"payloadSize", len(payload))
 
-		z.pool.AddTask(&RawMessage{
+		z.enqueue(&RawMessage{
 			Topic:          topic,
 			Sequence:       seq,
 			Payload:        payload,
 			SourceEndpoint: z.sourceEndpoint,
 		})
+	}
+}
+
+func (z *zmqSubscriber) enqueue(msg *RawMessage) {
+	z.queueMu.Lock()
+	defer z.queueMu.Unlock()
+	if z.retired {
+		return
+	}
+	z.pool.AddTask(msg)
+}
+
+// retire prevents later messages from this subscriber from being queued.
+// A reset is queued after every message accepted before retirement.
+func (z *zmqSubscriber) retire(resetSource bool) {
+	z.queueMu.Lock()
+	defer z.queueMu.Unlock()
+	z.retired = true
+	if resetSource && z.sourceEndpoint != "" {
+		z.pool.resetForSource(z.topicFilter, z.sourceEndpoint)
 	}
 }
