@@ -5,11 +5,11 @@
 # by the current GLM production EPP image. Branches are replayed in this order.
 
 lfm/v1.0.1-prod-epp-readiness             # plugin-provided EPP readiness
-lfm/v1.0.1-prod-safe-disaggset             # safe DisaggregatedSet coordination
-lfm/v1.0.1-prod-cross-replica-ticker       # independent cross-replica publish loop
+lfm/v1.0.1-prod-safe-disaggset-after-readiness  # safe DisaggregatedSet coordination; stacked on readiness
+lfm/v1.0.1-prod-cross-replica-ticker-after-safe-disaggset  # independent publish loop; stacked on DisaggregatedSet
 lfm/v1.0.1-prod-coordinator-revision-sync  # revision forwarding across coordinator phases
 lfm/v1.0.1-prod-rawbody-release            # release request RawBody after Envoy forwarding
 lfm/v1.0.1-prod-scoped-ttls                # per-priority and per-request queue TTLs
 lfm/v1.0.1-prod-objective-key              # Eliot's inference-objective attribute support
 lfm/v1.0.1-prod-multi-dp                   # shared-port multi-DP routing and KV events
-lfm/v1.0.1-prod-kvevents-memory-fix        # clear index and dedup state on subscriber retirement
+lfm/v1.0.1-prod-kvevents-memory-fix-after-multi-dp  # retirement cleanup; stacked on multi-DP
