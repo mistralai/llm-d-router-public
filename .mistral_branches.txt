@@ -1,9 +1,10 @@
-# Frozen v1.0.1-prod composition.
+# Branches whose mistral-specific commits are replayed on top of upstream/main
+# to rebuild the `mistral-main` branch (see MISTRAL_README.md).
 #
-# The base is origin/lfm/v1.0.1-prod-upstream-base at
-# e380424c8bf8463b6f0d066095bd5bc81e03a9a3, the upstream router commit used
-# by the current GLM production EPP image. Branches are replayed in this order.
+# The v1.0.1-prod feature branches were prepared against
+# e380424c8bf8463b6f0d066095bd5bc81e03a9a3. Branches are replayed in this order.
 
+mistral-branches                         # this branch: the rebuild tool, branch list, and CI workflow
 lfm/v1.0.1-prod-epp-readiness             # plugin-provided EPP readiness
 lfm/v1.0.1-prod-safe-disaggset-after-readiness  # safe DisaggregatedSet coordination; stacked on readiness
 lfm/v1.0.1-prod-cross-replica-ticker-after-safe-disaggset  # independent publish loop; stacked on DisaggregatedSet
