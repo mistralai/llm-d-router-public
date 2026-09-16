@@ -349,6 +349,14 @@ func redisEngineKey(engineKey BlockHash) string {
 // off the Lookup/Add hot path. Because it deletes from the shared store, it is
 // correct for multi-replica deployments with no cross-process coordination.
 func (r *RedisIndex) Clear(ctx context.Context, podIdentifier string) error {
+	return r.clear(ctx, podIdentifier, nil)
+}
+
+func (r *RedisIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
+	return r.clear(ctx, podIdentifier, &dataParallelRank)
+}
+
+func (r *RedisIndex) clear(ctx context.Context, podIdentifier string, dataParallelRank *int) error {
 	logger := log.FromContext(ctx).WithName("kvblock.RedisIndex.Clear")
 
 	const scanBatch int64 = 1024
@@ -371,7 +379,8 @@ func (r *RedisIndex) Clear(ctx context.Context, podIdentifier string) error {
 
 			var stale []string
 			for _, field := range fields {
-				if entry, ok := decodeRedisPodField(field); ok && entry.PodIdentifier == podIdentifier {
+				if entry, ok := decodeRedisPodField(field); ok && entry.PodIdentifier == podIdentifier &&
+					matchesOptionalRank(entry.DataParallelRank, dataParallelRank) {
 					stale = append(stale, field)
 				}
 			}
@@ -395,6 +404,14 @@ func (r *RedisIndex) Clear(ctx context.Context, podIdentifier string) error {
 		}
 	}
 
-	logger.Info("cleared pod from index", "pod", podIdentifier, "removed", removed)
+	logger.Info("cleared pod from index", "pod", podIdentifier,
+		"dataParallelRank", dataParallelRank, "removed", removed)
 	return nil
+}
+
+func matchesOptionalRank(entryRank, wantedRank *int) bool {
+	if wantedRank == nil {
+		return true
+	}
+	return entryRank != nil && *entryRank == *wantedRank
 }

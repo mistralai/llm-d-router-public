@@ -124,6 +124,221 @@ func TestProcessRawMessage_UsesSubscriberSourceEndpoint(t *testing.T) {
 	assert.ElementsMatch(t, []string{"10.0.0.1:8000", "10.0.0.1:8003"}, got)
 }
 
+func TestProcessRawMessage_UsesSubscriberDataParallelRank(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tokenProcessor := newTestPool(t, 16)
+	pool.adapter = &sourceEndpointAdapter{}
+	rank := 2
+
+	pool.processRawMessage(ctx, &RawMessage{
+		Topic:                  "kv@10.0.0.1:8000@test-model",
+		Payload:                []byte{1},
+		SourceEndpoint:         "10.0.0.1:8000",
+		SourceDataParallelRank: &rank,
+	})
+
+	keys, err := tokenProcessor.TokensToKVBlockKeys(
+		kvblock.EmptyBlockHash, makeTokens(16), "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+
+	result, err := idx.Lookup(ctx, keys, nil)
+	require.NoError(t, err)
+	require.Len(t, result[keys[0]], 1)
+	require.NotNil(t, result[keys[0]][0].DataParallelRank)
+	assert.Equal(t, rank, *result[keys[0]][0].DataParallelRank)
+}
+
+func TestProcessRawMessage_RankResetPreservesSiblingRank(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, _ := newTestPool(t, 16)
+	rank0, rank1 := 0, 1
+	key := kvblock.BlockHash(42)
+	require.NoError(t, idx.Add(ctx, nil, []kvblock.BlockHash{key}, []kvblock.PodEntry{
+		{PodIdentifier: "10.0.0.1:8000", DeviceTier: "gpu", DataParallelRank: &rank0},
+		{PodIdentifier: "10.0.0.1:8000", DeviceTier: "gpu", DataParallelRank: &rank1},
+	}))
+
+	pool.processRawMessage(ctx, &RawMessage{
+		SourceEndpoint:        "10.0.0.1:8000",
+		ResetDataParallelRank: &rank0,
+		reset:                 true,
+	})
+
+	result, err := idx.Lookup(ctx, []kvblock.BlockHash{key}, nil)
+	require.NoError(t, err)
+	require.Len(t, result[key], 1)
+	require.NotNil(t, result[key][0].DataParallelRank)
+	assert.Equal(t, rank1, *result[key][0].DataParallelRank)
+}
+
+func TestSubscriberManager_RemoveSubscriberResetsQueuedPodState(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tokenProcessor := newTestPool(t, 16)
+	pool.adapter = &sourceEndpointAdapter{}
+	pool.concurrency = 1
+	defer pool.Shutdown(ctx)
+
+	const (
+		podIdentifier  = "ns/pod-1"
+		sourceEndpoint = "10.0.0.1:8000"
+	)
+	done := make(chan struct{})
+	subscriber := newZMQSubscriber(pool, podIdentifier, sourceEndpoint, "", "", "kv@", nil, false)
+
+	manager := NewSubscriberManager(pool)
+	manager.subscribers[podIdentifier] = &subscriberEntry{
+		subscriber:     subscriber,
+		cancel:         func() {},
+		sourceEndpoint: sourceEndpoint,
+		done:           done,
+	}
+	subscriber.addTask(ctx, "kv@10.0.0.1:8000@test-model", 1, []byte{1})
+
+	removed := make(chan struct{})
+	go func() {
+		manager.RemoveSubscriber(ctx, podIdentifier)
+		close(removed)
+	}()
+
+	select {
+	case <-removed:
+	case <-time.After(time.Second):
+		t.Fatal("endpoint reconciliation waited for the subscriber socket to close")
+	}
+	// A message arriving from the closing socket after retirement must be dropped.
+	subscriber.addTask(ctx, "kv@10.0.0.1:8000@test-model", 2, []byte{2})
+	close(done)
+
+	require.Equal(t, 2, pool.queues[0].Len())
+	for _, wantReset := range []bool{false, true} {
+		msg, shutdown := pool.queues[0].Get()
+		require.False(t, shutdown)
+		assert.Equal(t, wantReset, msg.reset)
+		if !wantReset {
+			assert.Equal(t, uint64(1), msg.Sequence)
+		}
+		pool.processRawMessage(ctx, msg)
+		pool.queues[0].Done(msg)
+	}
+
+	keys, err := tokenProcessor.TokensToKVBlockKeys(
+		kvblock.EmptyBlockHash, makeTokens(16), "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	pool.dedup.mu.Lock()
+	_, tracked := pool.dedup.refs[sourceEndpoint]
+	pool.dedup.mu.Unlock()
+	assert.False(t, tracked)
+	result, err := idx.Lookup(ctx, keys, nil)
+	require.NoError(t, err)
+	assert.Empty(t, result[keys[0]])
+}
+
+func TestSubscriberManager_RemoveSubscriberKeepsSharedSourceUntilLastSubscriber(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, _, _ := newTestPool(t, 16)
+	pool.adapter = &sourceEndpointAdapter{}
+	pool.concurrency = 1
+	defer pool.Shutdown(ctx)
+
+	const sourceEndpoint = "10.0.0.1:8000"
+	manager := NewSubscriberManager(pool)
+	dones := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	subscribers := []*zmqSubscriber{
+		newZMQSubscriber(pool, "ns/pod-copy-0", sourceEndpoint, "", "", "kv@", nil, false),
+		newZMQSubscriber(pool, "ns/pod-copy-1", sourceEndpoint, "", "", "kv@", nil, false),
+	}
+	for i, podIdentifier := range []string{"ns/pod-copy-0", "ns/pod-copy-1"} {
+		manager.subscribers[podIdentifier] = &subscriberEntry{
+			subscriber:     subscribers[i],
+			cancel:         func() {},
+			sourceEndpoint: sourceEndpoint,
+			done:           dones[i],
+		}
+	}
+
+	subscribers[0].addTask(ctx, "kv@", 1, []byte{1})
+	manager.RemoveSubscriber(ctx, "ns/pod-copy-0")
+	subscribers[0].addTask(ctx, "kv@", 2, []byte{2})
+	subscribers[1].addTask(ctx, "kv@", 3, []byte{3})
+	require.Equal(t, 2, pool.queues[0].Len(), "removing one subscriber must not reset a source still in use")
+
+	manager.RemoveSubscriber(ctx, "ns/pod-copy-1")
+	require.Equal(t, 3, pool.queues[0].Len(), "removing the last subscriber must queue one source reset")
+	for _, want := range []struct {
+		reset    bool
+		sequence uint64
+	}{{false, 1}, {false, 3}, {true, 0}} {
+		msg, shutdown := pool.queues[0].Get()
+		require.False(t, shutdown)
+		assert.Equal(t, want.reset, msg.reset)
+		assert.Equal(t, want.sequence, msg.Sequence)
+		pool.queues[0].Done(msg)
+	}
+	for _, done := range dones {
+		close(done)
+	}
+}
+
+func TestSubscriberManager_RemoveSubscriberResetsOnlyRetiredDataParallelRank(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, _, _ := newTestPool(t, 16)
+	pool.adapter = &sourceEndpointAdapter{}
+	pool.concurrency = 1
+	defer pool.Shutdown(ctx)
+
+	const sourceEndpoint = "10.0.0.1:8000"
+	rank0, rank1 := 0, 1
+	manager := NewSubscriberManager(pool)
+	dones := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	subscribers := []*zmqSubscriber{
+		newZMQSubscriber(pool, "ns/pod-rank-0", sourceEndpoint, "", "", "kv@", &rank0, false),
+		newZMQSubscriber(pool, "ns/pod-rank-1", sourceEndpoint, "", "", "kv@", &rank1, false),
+	}
+	for i, podIdentifier := range []string{"ns/pod-rank-0", "ns/pod-rank-1"} {
+		manager.subscribers[podIdentifier] = &subscriberEntry{
+			subscriber:       subscribers[i],
+			cancel:           func() {},
+			sourceEndpoint:   sourceEndpoint,
+			dataParallelRank: subscribers[i].dataParallelRank,
+			done:             dones[i],
+		}
+	}
+
+	manager.RemoveSubscriber(ctx, "ns/pod-rank-0")
+	require.Equal(t, 1, pool.queues[0].Len())
+	msg, shutdown := pool.queues[0].Get()
+	require.False(t, shutdown)
+	require.True(t, msg.reset)
+	require.NotNil(t, msg.ResetDataParallelRank)
+	assert.Equal(t, rank0, *msg.ResetDataParallelRank)
+	pool.queues[0].Done(msg)
+
+	for _, done := range dones {
+		close(done)
+	}
+}
+
+func TestZMQSubscriber_RetireDropsMessagesWithoutSourceEndpoint(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, _, _ := newTestPool(t, 16)
+	pool.adapter = &sourceEndpointAdapter{}
+	pool.concurrency = 1
+	defer pool.Shutdown(ctx)
+
+	subscriber := newZMQSubscriber(pool, "local-subscriber", "", "", "", "kv@", nil, false)
+	subscriber.addTask(ctx, "kv@10.0.0.1:8000@test-model", 1, []byte{1})
+	subscriber.retire(false)
+	subscriber.addTask(ctx, "kv@10.0.0.1:8000@test-model", 2, []byte{2})
+
+	require.Equal(t, 1, pool.queues[0].Len())
+	msg, shutdown := pool.queues[0].Get()
+	require.False(t, shutdown)
+	assert.Equal(t, uint64(1), msg.Sequence)
+	pool.queues[0].Done(msg)
+}
+
 func TestProcessRawMessage_FallsBackToTopicEndpoint(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 	pool, idx, tokenProcessor := newTestPool(t, 16)
