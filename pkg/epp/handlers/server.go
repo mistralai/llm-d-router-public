@@ -784,7 +784,15 @@ func (r *RequestContext) updateStateAndSendIfNeeded(srv extProcPb.ExternalProces
 		fairnessID, priority := extractFairnessAndPriority(r)
 		metrics.IncRunningRequests(r.IncomingModelName, r.TargetModelName, fairnessID, priority)
 		r.requestRunning = true
-		// Dump the response so a new stream message can begin
+		// The request bytes have been forwarded and are not needed while the
+		// upstream inference runs. Both fields may retain the same backing array.
+		if r.Request != nil {
+			r.Request.RawBody = nil
+		}
+		if r.SchedulingRequest != nil && r.SchedulingRequest.Body != nil {
+			r.SchedulingRequest.Body.RawBody = nil
+		}
+		// Dump the response so a new stream message can begin.
 		r.reqBodyResp = nil
 	}
 	if r.requestState == responseReceived && r.respHeaderResp != nil {
