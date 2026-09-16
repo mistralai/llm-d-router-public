@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -376,6 +377,54 @@ func TestGenerateRequestHeaderResponse_MergeMetadata(t *testing.T) {
 	assert.Equal(t, "1.2.3.4:8080", endpointKey.GetStringValue(), "Unexpected value for DestinationEndpointKey")
 }
 
+func TestGenerateRequestHeaderResponse_ReplacesDataParallelRank(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		headers  map[string]string
+		wantRank string
+	}{
+		{
+			name: "selected rank replaces client value",
+			headers: map[string]string{
+				routing.DataParallelRankHeader: "4",
+			},
+			wantRank: "4",
+		},
+		{
+			name:    "deleted rank is removed from upstream request",
+			headers: map[string]string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &StreamingServer{}
+			reqCtx := &RequestContext{
+				TargetEndpoint: "1.2.3.4:8080",
+				Request: &Request{
+					Headers: tc.headers,
+				},
+				Response: &Response{},
+			}
+
+			resp := server.generateRequestHeaderResponse(context.Background(), reqCtx)
+			mutation := resp.GetRequestHeaders().GetResponse().GetHeaderMutation()
+			require.NotNil(t, mutation)
+			assert.Contains(t, mutation.RemoveHeaders, routing.DataParallelRankHeader)
+
+			gotRank := ""
+			for _, header := range mutation.SetHeaders {
+				if header.GetHeader().GetKey() == routing.DataParallelRankHeader {
+					gotRank = string(header.GetHeader().GetRawValue())
+				}
+			}
+			assert.Equal(t, tc.wantRank, gotRank)
+		})
+	}
+}
+
 func TestGenerateRequestHeaderResponse_EndpointScores(t *testing.T) {
 	t.Parallel()
 
@@ -535,7 +584,10 @@ func TestGenerateRequestHeaderResponse_RemovesUnsetRoutingHeaders(t *testing.T) 
 			for k, v := range tc.wantSet {
 				assert.Equal(t, v, gotSet[k])
 			}
-			assert.ElementsMatch(t, tc.wantRemoved, mutation.GetRemoveHeaders())
+			// The data-parallel rank header is always removed; a selected rank is
+			// set again because Envoy applies removals before sets.
+			wantRemoved := slices.Concat(tc.wantRemoved, []string{routing.DataParallelRankHeader})
+			assert.ElementsMatch(t, wantRemoved, mutation.GetRemoveHeaders())
 		})
 	}
 }
@@ -544,11 +596,12 @@ func TestFallbackToRandomEndpoint(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name               string
-		endpoint           *datalayer.EndpointMetadata
-		requestSize        int
-		wantTargetEndpoint string
-		wantBodyRespLen    int
+		name                 string
+		endpoint             *datalayer.EndpointMetadata
+		requestSize          int
+		wantTargetEndpoint   string
+		wantBodyRespLen      int
+		wantDataParallelRank string
 	}{
 		{
 			name: "IPv4 endpoint without body",
@@ -580,6 +633,19 @@ func TestFallbackToRandomEndpoint(t *testing.T) {
 			wantTargetEndpoint: "1.2.3.4:80",
 			wantBodyRespLen:    1,
 		},
+		{
+			name: "shared-port data-parallel endpoint",
+			endpoint: func() *datalayer.EndpointMetadata {
+				rank := 3
+				return &datalayer.EndpointMetadata{
+					Address:          "1.2.3.4",
+					Port:             "80",
+					DataParallelRank: &rank,
+				}
+			}(),
+			wantTargetEndpoint:   "1.2.3.4:80",
+			wantDataParallelRank: "3",
+		},
 	}
 
 	for _, tc := range tests {
@@ -595,6 +661,7 @@ func TestFallbackToRandomEndpoint(t *testing.T) {
 			err := server.fallbackToRandomEndpoint(context.Background(), reqCtx, tc.requestSize)
 			assert.NoError(t, err)
 			assert.Equal(t, tc.wantTargetEndpoint, reqCtx.TargetEndpoint)
+			assert.Equal(t, tc.wantDataParallelRank, reqCtx.Request.Headers[routing.DataParallelRankHeader])
 
 			if tc.wantBodyRespLen > 0 {
 				assert.NotNil(t, reqCtx.reqBodyResp)
