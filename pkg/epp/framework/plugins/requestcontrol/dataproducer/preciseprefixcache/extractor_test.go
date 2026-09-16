@@ -444,6 +444,7 @@ func TestPluginFactory_PodLabelSelectorDefaults(t *testing.T) {
 		{name: "empty parameters", parameters: `{}`, wantSubscribed: true},
 		{name: "discovery enabled", parameters: `{"kvEventsConfig":{"discoverPods":true}}`, wantSubscribed: true},
 		{name: "socket configured", parameters: `{"kvEventsConfig":{"podDiscoveryConfig":{"socketPort":5557}}}`, wantSubscribed: true},
+		{name: "legacy data parallel size", parameters: `{"kvEventsConfig":{"podDiscoveryConfig":{"dataParallelSize":8}}}`, wantSubscribed: true},
 		{name: "empty selector", parameters: `{"kvEventsConfig":{"podDiscoveryConfig":{"podLabelSelector":""}}}`, wantSubscribed: true},
 		{name: "explicit selector", parameters: `{"kvEventsConfig":{"podDiscoveryConfig":{"podLabelSelector":"llm-d.ai/inference-serving=true"}}}`},
 	}

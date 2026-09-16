@@ -129,6 +129,9 @@ type PodDiscoveryConfig struct {
 	// ReplaySocketPort is the port where vLLM pods expose their ZMQ ROUTER
 	// socket for replay requests. Disabled when not set (0 or negative).
 	ReplaySocketPort int `json:"replaySocketPort,omitempty"`
+	// DataParallelSize is accepted for compatibility with configurations that
+	// predate rank metadata discovery. It is ignored.
+	DataParallelSize int `json:"dataParallelSize,omitempty"`
 	// RankPodMapping maps logical ranks behind one serving endpoint to separate
 	// Kubernetes pods that host their KV-event sockets.
 	RankPodMapping *RankPodMappingConfig `json:"rankPodMapping,omitempty"`
