@@ -194,8 +194,8 @@ func (k *Indexer) ScoreTokens(
 	traceLogger.Info("matched block keys", "block-keys", blockKeys, "matches", matches)
 
 	podScores := make(map[string]float64, len(matches))
-	for pod, m := range matches {
-		podScores[pod] = m.WeightedScore
+	for podIdentifier, match := range collapseDataParallelMatches(matches) {
+		podScores[podIdentifier] = match.WeightedScore
 	}
 	// Block-level hit telemetry: the longest contiguous prefix one candidate
 	// holds, which is as far as a walk reads.
