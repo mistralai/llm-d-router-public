@@ -35,14 +35,60 @@ type tracedWalker struct {
 	walker KeyWalker
 }
 
+type tracedCompactWalker struct {
+	*tracedWalker
+	compact CompactKeyWalker
+}
+
 // NewTracedIndex wraps an Index and emits OpenTelemetry traces for index
 // operations. The wrapper is a KeyWalker exactly when next is one.
 func NewTracedIndex(next Index) Index {
 	t := &tracedIndex{next: next}
+	if compact, ok := next.(CompactKeyWalker); ok {
+		return &tracedCompactWalker{
+			tracedWalker: &tracedWalker{tracedIndex: t, walker: compact},
+			compact:      compact,
+		}
+	}
 	if walker, ok := next.(KeyWalker); ok {
 		return &tracedWalker{tracedIndex: t, walker: walker}
 	}
 	return t
+}
+
+// WalkCompactKeys forwards the compact walk under a span reporting the keys
+// requested and present.
+func (t *tracedCompactWalker) WalkCompactKeys(ctx context.Context, requestKeys []BlockHash,
+	visit func(pos int, found bool, entries []CompactEntryRef) bool,
+) error {
+	tracer := tracing.Tracer(TracerScope)
+	ctx, span := tracer.Start(ctx, "index_walk",
+		trace.WithSpanKind(trace.SpanKindInternal),
+	)
+	defer span.End()
+	span.SetAttributes(semconv.LLMDKVCacheIndexWalkKeyCount(len(requestKeys)))
+
+	present := 0
+	err := t.compact.WalkCompactKeys(ctx, requestKeys, func(pos int, found bool, entries []CompactEntryRef) bool {
+		if found {
+			present++
+		}
+		return visit(pos, found, entries)
+	})
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+	span.SetAttributes(semconv.LLMDKVCacheIndexWalkKeysPresent(present))
+	return nil
+}
+
+func (t *tracedCompactWalker) PodName(ordinal uint32) string {
+	return t.compact.PodName(ordinal)
+}
+
+func (t *tracedCompactWalker) TierName(ordinal uint32) string {
+	return t.compact.TierName(ordinal)
 }
 
 // WalkKeys forwards the walk under a span reporting the keys requested and
