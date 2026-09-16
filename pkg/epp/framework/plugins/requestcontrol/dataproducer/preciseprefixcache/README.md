@@ -39,6 +39,50 @@ upstream. No-op otherwise.
 Set `kvEventsConfig.engineType` to `sglang` for SGLang KV-events. It defaults
 to `vllm` when omitted.
 
+For vLLM Internal or Hybrid load balancing, configure
+`dp-rank-header-handler`. Endpoint discovery creates one schedulable endpoint
+per local rank while retaining the pod's shared serving address. The handler
+sets `x-data-parallel-rank` to the selected endpoint's rank.
+
+With pod KV-event discovery enabled, each logical endpoint subscribes to
+`socketPort + rank` and `replaySocketPort + rank`. Cache entries, replay resets,
+and endpoint deletion remain scoped to that rank.
+
+When the serving endpoint belongs to a leader pod but each data-parallel rank's
+KV-event socket belongs to a different pod, configure `rankPodMapping`. The
+group label joins the serving endpoint to its worker pods. The rank label is the
+worker index, and `ranksPerPod` maps each worker to a consecutive range of
+global data-parallel ranks. Requests still target the leader endpoint and use
+`x-data-parallel-rank`; only the KV-event transport uses the worker pod IP.
+Each rank uses `socketPort + global rank` and
+`replaySocketPort + global rank` on its worker pod.
+
+```yaml
+plugins:
+  - type: precise-prefix-cache-producer
+    parameters:
+      kvEventsConfig:
+        discoverPods: true
+        podDiscoveryConfig:
+          socketPort: 5557
+          replaySocketPort: 5657
+          podLabelSelector: app.kubernetes.io/instance=model-server
+          podNamespace: default
+          rankPodMapping:
+            groupLabelKey: leaderworkerset.sigs.k8s.io/group-index
+            rankLabelKey: leaderworkerset.sigs.k8s.io/worker-index
+            ranksPerPod: 1
+  - type: dp-rank-header-handler
+```
+
+The handler discovers rank counts from `vllm:cache_config_info` metrics.
+`--endpoint-data-parallel-size` supplies a fallback count. The corresponding
+Helm value is `router.modelServers.dataParallelSize`.
+
+The handler is an Alpha plugin and requires
+`--allow-experimental-plugins`. Do not configure it for vLLM External load
+balancing, where each rank has a distinct network endpoint.
+
 Set `kvEventsConfig.tracing` to `true` to emit OpenTelemetry spans for the
 KV-event pipeline (`events_receive`, `events_process`, `events_decode`). It
 defaults to `false`: KV events arrive at many times the inference request rate,

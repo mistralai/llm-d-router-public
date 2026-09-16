@@ -27,6 +27,7 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 )
 
 var _ fwkdl.EndpointExtractor = &Producer{}
@@ -37,6 +38,9 @@ var _ fwkdl.EndpointExtractor = &Producer{}
 func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error {
 	if !p.kvEventsConfig.DiscoverPods || p.kvEventsConfig.PodDiscoveryConfig == nil {
 		return nil
+	}
+	if p.rankPodResolver != nil {
+		return (&rankEndpointHandler{producer: p}).Extract(ctx, event)
 	}
 	meta := event.Endpoint.GetMetadata()
 	if meta == nil || meta.ID.Name == "" {
@@ -52,12 +56,36 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 		return p.ensureSubscriber(ctx, meta)
 	case event.Type == fwkdl.EventAddOrUpdate || event.Type == fwkdl.EventDelete:
 		removed := p.subscribersManager.RemoveSubscriber(ctx, endpointKey)
-		if !removed && event.Type == fwkdl.EventAddOrUpdate {
-			return nil
+		if !removed {
+			if event.Type == fwkdl.EventAddOrUpdate {
+				return nil
+			}
+			// A deleted endpoint without a subscriber can still hold speculative
+			// entries; a removed subscriber clears the index when it retires.
+			p.clearEndpointIndex(ctx, meta)
 		}
 		logger.V(logging.DEBUG).Info("Removed KV-events subscriber", "endpoint", endpointKey)
 	}
 	return nil
+}
+
+// clearEndpointIndex drops the index entries of an endpoint, scoped to its
+// data-parallel rank when it has one.
+func (p *Producer) clearEndpointIndex(ctx context.Context, meta *fwkdl.EndpointMetadata) {
+	if meta.Address == "" {
+		return
+	}
+	podIdentifier := fmt.Sprintf("%s:%s", meta.Address, meta.Port)
+	var err error
+	if meta.DataParallelRank == nil {
+		err = p.kvCacheIndexer.KVBlockIndex().Clear(ctx, podIdentifier)
+	} else {
+		err = kvblock.ClearDataParallelRank(ctx, p.kvCacheIndexer.KVBlockIndex(), podIdentifier, *meta.DataParallelRank)
+	}
+	if err != nil {
+		log.FromContext(ctx).WithName(p.typedName.String()).Error(err, "Failed to clear index entries for removed endpoint",
+			"endpoint", meta.ID.String(), "address", meta.Address, "port", meta.Port)
+	}
 }
 
 // ensureSubscriber idempotently installs a KV-events subscriber for the given
@@ -68,15 +96,19 @@ func (p *Producer) ensureSubscriber(ctx context.Context, meta *fwkdl.EndpointMet
 		return nil
 	}
 	endpointKey := meta.ID.String()
-	port := p.kvEventsConfig.PodDiscoveryConfig.SocketPort + meta.GetRankIndex()
+	rank := meta.GetRankIndex()
+	if meta.DataParallelRank != nil {
+		rank = *meta.DataParallelRank
+	}
+	port := p.kvEventsConfig.PodDiscoveryConfig.SocketPort + rank
 	zmqEndpoint := "tcp://" + net.JoinHostPort(meta.Address, strconv.Itoa(port))
 	replayEndpoint := ""
 	if replayPort := p.kvEventsConfig.PodDiscoveryConfig.EffectiveReplayPort(); replayPort > 0 {
-		replayEndpoint = "tcp://" + net.JoinHostPort(meta.Address, strconv.Itoa(replayPort+meta.GetRankIndex()))
+		replayEndpoint = "tcp://" + net.JoinHostPort(meta.Address, strconv.Itoa(replayPort+rank))
 	}
 	snapshotEndpoint := ""
 	if snapshotPort := p.kvEventsConfig.PodDiscoveryConfig.SnapshotSocketPort; snapshotPort > 0 {
-		snapshotEndpoint = "tcp://" + net.JoinHostPort(meta.Address, strconv.Itoa(snapshotPort+meta.GetRankIndex()))
+		snapshotEndpoint = "tcp://" + net.JoinHostPort(meta.Address, strconv.Itoa(snapshotPort+rank))
 	}
 	sourceEndpoint := fmt.Sprintf("%s:%s", meta.Address, meta.Port)
 
@@ -84,7 +116,8 @@ func (p *Producer) ensureSubscriber(ctx context.Context, meta *fwkdl.EndpointMet
 	// subscriberCtx is plugin-lifetime; caller ctx would tear subscribers
 	// down on request completion.
 	if err := p.subscribersManager.EnsureSubscriber(p.subscriberCtx, endpointKey,
-		sourceEndpoint, zmqEndpoint, replayEndpoint, snapshotEndpoint, p.kvEventsConfig.TopicFilter, true); err != nil {
+		sourceEndpoint, zmqEndpoint, replayEndpoint, snapshotEndpoint, p.kvEventsConfig.TopicFilter,
+		meta.DataParallelRank, true); err != nil {
 		logger.Error(err, "Failed to ensure KV-events subscriber for endpoint",
 			"endpoint", endpointKey, "address", meta.Address)
 		return fmt.Errorf("ensure subscriber for %s: %w", endpointKey, err)
