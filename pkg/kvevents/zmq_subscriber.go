@@ -17,6 +17,7 @@ package kvevents
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -57,16 +58,20 @@ type zmqSubscriber struct {
 	// snapshotEndpoint serves the publisher's current cache state, used in
 	// place of a full replay.
 	snapshotEndpoint string
+	dataParallelRank *int
 	remote           bool
 	topicFilter      string
 	queueMu          sync.Mutex
 	retired          bool
 
 	// Replay state persists across reconnections within subscriber lifetime.
-	lastSeq           uint64
-	hasLastSeq        bool
-	lastLiveSeq       uint64
-	hasLastLiveSeq    bool
+	lastSeq        uint64
+	hasLastSeq     bool
+	lastLiveSeq    uint64
+	lastLiveDigest [sha256.Size]byte
+	hasLastLiveSeq bool
+	// replayDigests distinguishes delayed duplicate live frames from a publisher restart.
+	replayDigests     map[uint64][sha256.Size]byte
 	lastReplayFailure time.Time
 	// publisherID identifies the engine process behind the live stream; it
 	// changes only when the engine restarts.
@@ -77,6 +82,7 @@ type zmqSubscriber struct {
 func newZMQSubscriber(
 	pool *Pool,
 	podIdentifier, sourceEndpoint, endpoint, replayEndpoint, snapshotEndpoint, topicFilter string,
+	dataParallelRank *int,
 	remote bool,
 ) *zmqSubscriber {
 	return &zmqSubscriber{
@@ -86,6 +92,7 @@ func newZMQSubscriber(
 		endpoint:         endpoint,
 		replayEndpoint:   replayEndpoint,
 		snapshotEndpoint: snapshotEndpoint,
+		dataParallelRank: dataParallelRank,
 		remote:           remote,
 		topicFilter:      topicFilter,
 	}
@@ -225,7 +232,18 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			continue
 		}
 
-		restarted := z.hasLastLiveSeq && seq < z.lastLiveSeq
+		// A backwards sequence, or a repeated sequence with a different payload,
+		// means the publisher restarted. Before the first live frame, a frame
+		// already covered by a replay is a restart unless the replay delivered
+		// the same payload for that sequence. A snapshot records no payloads, so
+		// frames it already covers are skipped below.
+		payloadDigest := sha256.Sum256(payload)
+		replayedDigest, wasReplayed := z.replayDigests[seq]
+		restarted := z.hasLastLiveSeq && (seq < z.lastLiveSeq ||
+			(seq == z.lastLiveSeq && payloadDigest != z.lastLiveDigest))
+		if !z.hasLastLiveSeq && z.hasLastSeq && seq <= z.lastSeq && z.replayDigests != nil {
+			restarted = !wasReplayed || payloadDigest != replayedDigest
+		}
 		if z.snapshotEndpoint != "" {
 			if id := batchPublisherID(payload); id != nil && !bytes.Equal(id, z.publisherID) {
 				restarted = restarted || z.publisherID != nil
@@ -247,11 +265,13 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			z.rebuild(ctx, topic)
 		}
 
-		if z.hasLastLiveSeq && seq == z.lastLiveSeq {
+		if z.hasLastLiveSeq && seq == z.lastLiveSeq && payloadDigest == z.lastLiveDigest {
 			continue
 		}
 		z.lastLiveSeq = seq
+		z.lastLiveDigest = payloadDigest
 		z.hasLastLiveSeq = true
+		z.replayDigests = nil
 
 		if z.hasLastSeq && seq <= z.lastSeq {
 			continue
@@ -335,10 +355,11 @@ func (z *zmqSubscriber) addTask(ctx context.Context, topic string, seq uint64, p
 	}
 
 	msg := &RawMessage{
-		Topic:          topic,
-		Sequence:       seq,
-		Payload:        payload,
-		SourceEndpoint: z.sourceEndpoint,
+		Topic:                  topic,
+		Sequence:               seq,
+		Payload:                payload,
+		SourceEndpoint:         z.sourceEndpoint,
+		SourceDataParallelRank: z.dataParallelRank,
 	}
 	// carried is bound inside the branch on purpose. Taking &sc directly makes
 	// sc escape, so it heap-allocates on every message including the ones the
@@ -360,25 +381,42 @@ func (z *zmqSubscriber) enqueue(msg *RawMessage) {
 }
 
 func (z *zmqSubscriber) resetForSource(topic string) {
-	z.enqueue(&RawMessage{Topic: topic, SourceEndpoint: z.sourceEndpoint, reset: true})
+	z.enqueue(&RawMessage{
+		Topic:                 topic,
+		SourceEndpoint:        z.sourceEndpoint,
+		ResetDataParallelRank: z.dataParallelRank,
+		reset:                 true,
+	})
 }
 
 // retire prevents any later messages from this subscriber from being queued.
 // When resetSource is true, it queues a reset after all messages accepted before
 // retirement. The pool shards both messages and the reset by source endpoint,
-// so the worker processes them in that order.
-func (z *zmqSubscriber) retire(resetSource bool) {
+// so the worker processes them in that order. A subscriber of one
+// data-parallel rank resets only that rank unless retireSource is set; the
+// last subscriber of a serving endpoint retires the whole endpoint.
+func (z *zmqSubscriber) retire(resetSource, retireSource bool) {
 	z.queueMu.Lock()
 	defer z.queueMu.Unlock()
 	z.retired = true
-	if resetSource && z.sourceEndpoint != "" {
+	if !resetSource || z.sourceEndpoint == "" {
+		return
+	}
+	if retireSource {
 		z.pool.AddTask(&RawMessage{
 			Topic:          z.topicFilter,
 			SourceEndpoint: z.sourceEndpoint,
 			reset:          true,
 			retire:         true,
 		})
+		return
 	}
+	z.pool.AddTask(&RawMessage{
+		Topic:                 z.topicFilter,
+		SourceEndpoint:        z.sourceEndpoint,
+		ResetDataParallelRank: z.dataParallelRank,
+		reset:                 true,
+	})
 }
 
 func (z *zmqSubscriber) canAttemptReplay() bool {
@@ -389,6 +427,7 @@ func (z *zmqSubscriber) invalidateReplay(topic string) {
 	z.resetForSource(topic)
 	z.lastSeq = 0
 	z.hasLastSeq = false
+	z.replayDigests = nil
 	z.lastReplayFailure = time.Now()
 }
 
@@ -425,6 +464,7 @@ func (z *zmqSubscriber) requestSnapshot(ctx context.Context, topic string) bool 
 	}
 	// A cut of -1 is a publisher that has not published yet.
 	z.lastSeq, z.hasLastSeq = 0, false
+	z.replayDigests = nil
 	if cut >= 0 {
 		z.lastSeq, z.hasLastSeq = uint64(cut), true
 	}
@@ -569,6 +609,12 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 			}
 
 			z.addTask(ctx, topic, seq, payload)
+			if !z.hasLastLiveSeq {
+				if z.replayDigests == nil {
+					z.replayDigests = make(map[uint64][sha256.Size]byte)
+				}
+				z.replayDigests[seq] = sha256.Sum256(payload)
+			}
 			z.lastSeq = seq
 			z.hasLastSeq = true
 			replayed++

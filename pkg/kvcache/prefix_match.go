@@ -27,6 +27,7 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 )
@@ -48,8 +49,8 @@ const unknownTierWeight = 0.0
 // positions: positions where pos&mask == 0 poll ctx.Err().
 const matchCancellationMask = 255
 
-// PodMatch is one pod's prefix match for a key sequence. All values cover
-// the contiguous chain of keys the pod holds, counted from the first key.
+// PodMatch is one cache endpoint's prefix match for a key sequence. All values
+// cover the contiguous chain of keys the endpoint holds, counted from the first key.
 type PodMatch struct {
 	// WeightedScore sums, per block of the chain, the highest device-tier
 	// weight among the pod's entries for that block. Tiers without a
@@ -69,11 +70,27 @@ type PodMatch struct {
 }
 
 // MatchBlockKeys runs the prefix matcher over keys for the pods in podFilter
-// (every pod when empty) and returns one PodMatch per pod that holds the
-// first key. Empty keys match nothing. The matcher walks the index when the
-// backend is a kvblock.KeyWalker and otherwise materializes Lookup; both
-// feed the same accumulator.
+// (every pod when empty) and returns the highest-scoring match for each pod.
+// Empty keys match nothing. The matcher walks the index when the backend is a
+// kvblock.KeyWalker and otherwise materializes Lookup.
 func (k *Indexer) MatchBlockKeys(ctx context.Context, keys []kvblock.BlockHash,
+	podFilter sets.Set[string],
+) (map[string]PodMatch, error) {
+	matches, err := k.matchBlockKeys(ctx, keys, podFilter)
+	return collapseDataParallelMatches(matches), err
+}
+
+// MatchBlockKeysByEndpoint returns independent matches for logical data-parallel
+// endpoints. Rank-scoped entries are keyed by BuildDPScoringKey; other entries
+// are keyed by pod identifier.
+func (k *Indexer) MatchBlockKeysByEndpoint(ctx context.Context, keys []kvblock.BlockHash,
+	podFilter sets.Set[string],
+) (map[string]PodMatch, error) {
+	return k.matchBlockKeys(ctx, keys, podFilter)
+}
+
+// matchBlockKeys returns independent matches for each logical cache endpoint.
+func (k *Indexer) matchBlockKeys(ctx context.Context, keys []kvblock.BlockHash,
 	podFilter sets.Set[string],
 ) (map[string]PodMatch, error) {
 	if len(keys) == 0 {
@@ -134,11 +151,21 @@ func matchWalk(ctx context.Context, walker kvblock.KeyWalker, keys []kvblock.Blo
 	acc := acquireAccumulator(weights, filter)
 	defer releaseAccumulator(acc)
 
+	pods := ordinalTable{}
+	var refs []kvblock.EntryRef
+	var buildErr error
 	err := walker.WalkKeys(ctx, keys, func(_ int, found bool, entries []kvblock.EntryRef) bool {
-		return found && len(entries) > 0 && acc.key(entries)
+		if !found || len(entries) == 0 {
+			return false
+		}
+		refs, buildErr = endpointRefs(refs, entries, pods)
+		return buildErr == nil && acc.key(refs)
 	})
 	if err != nil {
 		return nil, err
+	}
+	if buildErr != nil {
+		return nil, buildErr
 	}
 	return acc.result(), nil
 }
@@ -153,6 +180,23 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 		return nil, err
 	}
 	return matchMaterialized(ctx, keys, keyToPods, weights, filter)
+}
+
+func collapseDataParallelMatches(matches map[string]PodMatch) map[string]PodMatch {
+	podMatches := make(map[string]PodMatch, len(matches))
+	selectedKeys := make(map[string]string, len(matches))
+	for scoringKey, match := range matches {
+		podIdentifier, _ := routing.ParseDPScoringKey(scoringKey)
+		current, exists := podMatches[podIdentifier]
+		if !exists || match.WeightedScore > current.WeightedScore ||
+			(match.WeightedScore == current.WeightedScore && match.MatchedBlocks > current.MatchedBlocks) ||
+			(match.WeightedScore == current.WeightedScore && match.MatchedBlocks == current.MatchedBlocks &&
+				scoringKey < selectedKeys[podIdentifier]) {
+			podMatches[podIdentifier] = match
+			selectedKeys[podIdentifier] = scoringKey
+		}
+	}
+	return podMatches
 }
 
 // matchMaterialized feeds the accumulator from a Lookup result, walking keys
@@ -177,11 +221,11 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		}
 		refs = refs[:0]
 		for _, e := range entries {
-			refs = append(refs, kvblock.EntryRef{
-				PodEntry:    e,
-				PodOrdinal:  pods.of(e.PodIdentifier),
-				TierOrdinal: tiers.of(e.DeviceTier),
-			})
+			refs = append(refs, kvblock.EntryRef{PodEntry: e, TierOrdinal: tiers.of(e.DeviceTier)})
+		}
+		var err error
+		if refs, err = endpointRefs(refs, refs, pods); err != nil {
+			return nil, err
 		}
 		if !acc.key(refs) {
 			break
@@ -193,6 +237,29 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		return nil, err
 	}
 	return acc.result(), nil
+}
+
+// endpointRefs copies entries into dst with the identity and ordinal of their
+// endpoint: the pod, or the pod's data-parallel rank when the entry carries
+// one. dst may alias entries; pods assigns endpoint ordinals for one
+// accumulation.
+func endpointRefs(dst, entries []kvblock.EntryRef, pods ordinalTable) ([]kvblock.EntryRef, error) {
+	dst = dst[:0]
+	for i := range entries {
+		ref := entries[i]
+		rank := routing.NoDataParallelRank
+		if ref.DataParallelRank != nil {
+			rank = *ref.DataParallelRank
+		}
+		endpoint, err := routing.BuildDPScoringKey(ref.PodIdentifier, rank)
+		if err != nil {
+			return dst, err
+		}
+		ref.PodIdentifier = endpoint
+		ref.PodOrdinal = pods.of(endpoint)
+		dst = append(dst, ref)
+	}
+	return dst, nil
 }
 
 // ordinalTable assigns dense ordinals to names in first-seen order.
@@ -309,11 +376,13 @@ type matchSlot struct {
 	confirmedAlive bool
 }
 
-// prefixAccumulator folds an ordered walk over request keys into per-pod
+// prefixAccumulator folds an ordered walk over request keys into per-endpoint
 // prefix matches. It is the single implementation of the matching rules:
-// candidates are the pods holding the first key, each chain ends at the
-// first key its pod does not hold, duplicate entries for a pod at one key
-// take the highest weight, and every tier tracks its own contiguous prefix.
+// candidates are the endpoints holding the first key, each chain ends at the
+// first key its endpoint does not hold, duplicate entries for an endpoint at
+// one key take the highest weight, and every tier tracks its own contiguous
+// prefix. An endpoint is a pod, or one data-parallel rank of a pod whose
+// entries carry a rank (see endpointRefs).
 //
 // Feeders present each key's entries through key, in key order, and stop at
 // the first key without entries or once key reports no live chain. Ordinals
@@ -395,7 +464,7 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 
 		s, ok := a.table.lookup(ref.PodOrdinal)
 		if !ok {
-			if !a.first || (a.filter.Len() > 0 && !a.filter.Has(ref.PodIdentifier)) {
+			if !a.first || !a.admits(ref.PodIdentifier) {
 				continue // the first key fixes the candidate set
 			}
 			s = a.newSlot(ref.PodIdentifier)
@@ -451,6 +520,15 @@ func (a *prefixAccumulator) samePrev(entries []kvblock.EntryRef) bool {
 		}
 	}
 	return true
+}
+
+// admits reports whether the pod behind an endpoint passes the pod filter.
+func (a *prefixAccumulator) admits(endpoint string) bool {
+	if a.filter.Len() == 0 {
+		return true
+	}
+	pod, _ := routing.ParseDPScoringKey(endpoint)
+	return a.filter.Has(pod)
 }
 
 // stampTier marks tier as held at the current key and reports whether the

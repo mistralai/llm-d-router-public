@@ -33,6 +33,7 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/common/envoy"
 	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 	"github.com/llm-d/llm-d-router/pkg/epp/util/request"
 )
@@ -68,6 +69,10 @@ func (s *StreamingServer) fallbackToRandomEndpoint(ctx context.Context, reqCtx *
 	if endpoint == nil {
 		return errcommon.Error{Code: errcommon.Internal, Msg: "no pods available in datastore"}
 	}
+	delete(reqCtx.Request.Headers, routing.DataParallelRankHeader)
+	if endpoint.DataParallelRank != nil && *endpoint.DataParallelRank >= 0 {
+		reqCtx.Request.Headers[routing.DataParallelRankHeader] = strconv.Itoa(*endpoint.DataParallelRank)
+	}
 	reqCtx.TargetEndpoint = net.JoinHostPort(endpoint.GetIPAddress(), endpoint.GetPort())
 	reqCtx.RequestSize = requestSize
 	reqCtx.reqHeaderResp = s.generateRequestHeaderResponse(ctx, reqCtx)
@@ -99,9 +104,11 @@ func (s *StreamingServer) generateRequestHeaderResponse(ctx context.Context, req
 			RequestHeaders: &extProcPb.HeadersResponse{
 				Response: &extProcPb.CommonResponse{
 					ClearRouteCache: true,
+					// Envoy applies removals before sets, so a selected rank is
+					// replaced while a rank omitted from the request map stays absent.
 					HeaderMutation: &extProcPb.HeaderMutation{
 						SetHeaders:    s.generateHeaders(ctx, reqCtx),
-						RemoveHeaders: unsetRoutingHeaders(reqCtx),
+						RemoveHeaders: append(unsetRoutingHeaders(reqCtx), routing.DataParallelRankHeader),
 					},
 				},
 			},
