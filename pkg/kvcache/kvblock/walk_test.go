@@ -78,6 +78,48 @@ func TestWalkKeysVisitsEveryPositionInOrder(t *testing.T) {
 	assert.Equal(t, []PodEntry{podA, podB}, podEntries(visits[2].entries))
 }
 
+func TestCompactWalkMatchesWalk(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+	index, err := NewInMemoryIndex(nil)
+	require.NoError(t, err)
+	entries := []PodEntry{
+		{PodIdentifier: "pod-a", DeviceTier: "gpu", HasGroup: true, GroupIdx: -1},
+		{PodIdentifier: "pod-b", DeviceTier: "cpu", Speculative: true},
+	}
+	keys := []BlockHash{10, 20}
+	require.NoError(t, index.Add(ctx, nil, keys[:1], entries))
+
+	compact := make([]visit, 0, len(keys))
+	err = index.WalkCompactKeys(ctx, keys, func(pos int, found bool, refs []CompactEntryRef) bool {
+		var decoded []EntryRef
+		if len(refs) > 0 {
+			decoded = make([]EntryRef, len(refs))
+		}
+		for i, ref := range refs {
+			decoded[i] = EntryRef{
+				PodEntry: PodEntry{
+					PodIdentifier: index.PodName(ref.PodOrdinal),
+					DeviceTier:    index.TierName(ref.TierOrdinal()),
+					Speculative:   ref.Speculative(),
+					HasGroup:      ref.HasGroup(),
+					GroupIdx:      ref.GroupIdx(),
+				},
+				PodOrdinal:  ref.PodOrdinal,
+				TierOrdinal: ref.TierOrdinal(),
+			}
+		}
+		compact = append(compact, visit{pos: pos, found: found, entries: decoded})
+		return true
+	})
+	require.NoError(t, err)
+	assert.Equal(t, walkAll(t, index, keys), compact)
+}
+
+func TestNewCompactEntryRefRejectsFlagBitsInTierOrdinal(t *testing.T) {
+	_, err := NewCompactEntryRef(1, 1<<12, false, false, 0)
+	require.ErrorContains(t, err, "tier ordinal must be at most")
+}
+
 // A key listed twice is visited at both positions.
 func TestWalkKeysVisitsDuplicatePositions(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
@@ -327,6 +369,8 @@ func TestWalkCapabilityThroughDecorators(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			walker, ok := wrapped.(KeyWalker)
 			require.True(t, ok, "decorators must keep the walk capability")
+			_, ok = wrapped.(CompactKeyWalker)
+			require.True(t, ok, "decorators must keep the compact walk capability")
 			assert.Equal(t, direct, walkAll(t, walker, keys))
 		})
 	}

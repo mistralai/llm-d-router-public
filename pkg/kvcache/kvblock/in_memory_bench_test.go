@@ -21,10 +21,15 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 )
+
+func benchmarkContext() context.Context {
+	return logr.NewContext(context.Background(), logr.Discard())
+}
 
 // populateIndex fills an in-memory index with numKeys request keys, each held
 // by numPods pods on the gpu tier. Returns the index and the ordered keys.
@@ -48,7 +53,7 @@ func populateIndex(b *testing.B, numKeys, numPods int) (*kvblock.InMemoryIndex, 
 			DeviceTier:    "gpu",
 		}
 	}
-	if err := idx.Add(context.Background(), nil, keys, entries); err != nil {
+	if err := idx.Add(benchmarkContext(), nil, keys, entries); err != nil {
 		b.Fatal(err)
 	}
 	return idx, keys
@@ -69,7 +74,7 @@ func BenchmarkInMemoryIndexLookup(b *testing.B) {
 						podSet.Insert(fmt.Sprintf("10.0.%d.%d:8000", p/256, p%256))
 					}
 				}
-				ctx := context.Background()
+				ctx := benchmarkContext()
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
@@ -93,7 +98,7 @@ func BenchmarkInMemoryIndexAdd(b *testing.B) {
 	entries := []kvblock.PodEntry{{PodIdentifier: "10.0.0.1:8000", DeviceTier: "gpu"}}
 	engineKeys := make([]kvblock.BlockHash, 64)
 	requestKeys := make([]kvblock.BlockHash, 64)
-	ctx := context.Background()
+	ctx := benchmarkContext()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -108,13 +113,76 @@ func BenchmarkInMemoryIndexAdd(b *testing.B) {
 	}
 }
 
+// BenchmarkInMemoryIndexEvict measures one BlockRemoved event against a warm
+// index. The removed entry is restored while timing is paused.
+func BenchmarkInMemoryIndexEvict(b *testing.B) {
+	const numKeys = 100_000
+	for _, numPods := range []int{1, 8} {
+		b.Run(fmt.Sprintf("keys=%d/pods=%d", numKeys, numPods), func(b *testing.B) {
+			idx, keys := populateIndex(b, numKeys, numPods)
+			ctx := benchmarkContext()
+			keys = keys[:1024]
+			entry := []kvblock.PodEntry{{PodIdentifier: "10.0.0.0:8000", DeviceTier: "gpu"}}
+			for _, key := range keys {
+				if err := idx.Add(ctx, []kvblock.BlockHash{key}, []kvblock.BlockHash{key}, entry); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for completed := 0; completed < b.N; {
+				batch := min(len(keys), b.N-completed)
+				for _, key := range keys[:batch] {
+					if err := idx.Evict(ctx, key, kvblock.EngineKey, entry); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StopTimer()
+				for _, key := range keys[:batch] {
+					if err := idx.Add(ctx, []kvblock.BlockHash{key}, []kvblock.BlockHash{key}, entry); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StartTimer()
+				completed += batch
+			}
+		})
+	}
+}
+
+// BenchmarkInMemoryIndexClear measures a pod reset over a populated shared
+// index. The cleared pod is restored while timing is paused so each iteration
+// traverses the same occupancy.
+func BenchmarkInMemoryIndexClear(b *testing.B) {
+	for _, numKeys := range []int{10_000, 100_000} {
+		b.Run(fmt.Sprintf("keys=%d/pods=8", numKeys), func(b *testing.B) {
+			idx, keys := populateIndex(b, numKeys, 8)
+			ctx := benchmarkContext()
+			entry := []kvblock.PodEntry{{PodIdentifier: "10.0.0.0:8000", DeviceTier: "gpu"}}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := idx.Clear(ctx, entry[0].PodIdentifier); err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+				if err := idx.Add(ctx, nil, keys, entry); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+			}
+		})
+	}
+}
+
 // BenchmarkInMemoryIndexMixed measures lookup latency while concurrent
 // writers ingest events, approximating the 96-rank firehose against
 // per-request scoring reads.
 func BenchmarkInMemoryIndexMixed(b *testing.B) {
 	const numKeys = 3750
 	idx, keys := populateIndex(b, numKeys, 16)
-	ctx := context.Background()
+	ctx := benchmarkContext()
 
 	stop := make(chan struct{})
 	defer close(stop)
@@ -156,12 +224,39 @@ func BenchmarkInMemoryIndexWalkKeys(b *testing.B) {
 	for _, numPods := range []int{8, 96} {
 		b.Run(fmt.Sprintf("keys=3750/pods=%d", numPods), func(b *testing.B) {
 			idx, keys := populateIndex(b, numKeys, numPods)
-			ctx := context.Background()
+			ctx := benchmarkContext()
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				seen := 0
 				err := idx.WalkKeys(ctx, keys, func(_ int, _ bool, entries []kvblock.EntryRef) bool {
+					seen += len(entries)
+					return true
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if seen != numKeys*numPods {
+					b.Fatalf("visited %d entries, want %d", seen, numKeys*numPods)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkInMemoryIndexWalkCompactKeys measures the production matcher walk
+// without reconstructing pod and tier strings.
+func BenchmarkInMemoryIndexWalkCompactKeys(b *testing.B) {
+	const numKeys = 3750
+	for _, numPods := range []int{8, 96} {
+		b.Run(fmt.Sprintf("keys=3750/pods=%d", numPods), func(b *testing.B) {
+			idx, keys := populateIndex(b, numKeys, numPods)
+			ctx := benchmarkContext()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				seen := 0
+				err := idx.WalkCompactKeys(ctx, keys, func(_ int, _ bool, entries []kvblock.CompactEntryRef) bool {
 					seen += len(entries)
 					return true
 				})
