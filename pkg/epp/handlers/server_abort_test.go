@@ -31,14 +31,20 @@ import (
 
 	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
+	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 )
 
 // mockProcessServer implements ExternalProcessor_ProcessServer for testing.
 type mockProcessServer struct {
 	sentResponses []*extProcPb.ProcessingResponse
+	sendErr       error
 }
 
 func (m *mockProcessServer) Send(resp *extProcPb.ProcessingResponse) error {
+	if m.sendErr != nil {
+		return m.sendErr
+	}
 	m.sentResponses = append(m.sentResponses, resp)
 	return nil
 }
@@ -122,6 +128,41 @@ func TestUpdateStateAndSendIfNeeded_NotEvicted(t *testing.T) {
 	err := reqCtx.updateStateAndSendIfNeeded(srv, logger)
 	require.NoError(t, err)
 	assert.Empty(t, srv.sentResponses, "Should not send any response for normal state without queued responses")
+}
+
+func TestUpdateStateAndSendIfNeededReleasesForwardedRawBody(t *testing.T) {
+	raw := []byte(`{"model":"test","prompt":"large body"}`)
+	reqCtx := &RequestContext{
+		Request:      &Request{RawBody: raw},
+		requestState: headerRequestResponseComplete,
+		reqBodyResp:  []*extProcPb.ProcessingResponse{{}},
+		SchedulingRequest: &scheduling.InferenceRequest{
+			Body: &fwkrh.InferenceRequestBody{RawBody: raw},
+		},
+	}
+
+	require.NoError(t, reqCtx.updateStateAndSendIfNeeded(&mockProcessServer{}, logr.Discard()))
+	assert.Nil(t, reqCtx.Request.RawBody)
+	assert.Nil(t, reqCtx.SchedulingRequest.Body.RawBody)
+	assert.Nil(t, reqCtx.reqBodyResp)
+}
+
+func TestUpdateStateAndSendIfNeededRetainsRawBodyWhenSendFails(t *testing.T) {
+	raw := []byte(`{"model":"test","prompt":"large body"}`)
+	reqCtx := &RequestContext{
+		Request:      &Request{RawBody: raw},
+		requestState: headerRequestResponseComplete,
+		reqBodyResp:  []*extProcPb.ProcessingResponse{{}},
+		SchedulingRequest: &scheduling.InferenceRequest{
+			Body: &fwkrh.InferenceRequestBody{RawBody: raw},
+		},
+	}
+
+	err := reqCtx.updateStateAndSendIfNeeded(&mockProcessServer{sendErr: errors.New("send failed")}, logr.Discard())
+	require.Error(t, err)
+	assert.Equal(t, raw, reqCtx.Request.RawBody)
+	assert.Equal(t, raw, reqCtx.SchedulingRequest.Body.RawBody)
+	assert.NotNil(t, reqCtx.reqBodyResp)
 }
 
 func TestTerminationCause(t *testing.T) {
