@@ -1,0 +1,24 @@
+# Branches whose mistral-specific commits are replayed on top of upstream/main
+# to rebuild the `mistral-main` branch (see MISTRAL_README.md).
+#
+# Format:
+#   - one branch name per line, resolved against the `origin` remote
+#   - order matters: branches are applied top to bottom
+#   - `#` starts a comment, either on its own line or after a branch name
+#   - surrounding whitespace is ignored
+#
+# Each branch should be a small feature branch based directly on `upstream/main`. Ideally
+# its comment links the upstream PR that carries the same change, so once that PR
+# merges the branch can be dropped from this list. See MISTRAL_README.md.
+#
+# Commits already present upstream (by patch id) or already applied by an
+# earlier branch in this list are skipped automatically.
+#
+# The v1.0.2-rebased-upstream feature branches were prepared against
+# de2e3e11fc038f53d9a1aa8cdc51a1aa07917501. Branches are replayed in this order.
+
+mistral-branches                                      # this branch: the rebuild tool, branch list, and CI workflow
+lfm/v1.0.2-rebased-upstream-dp-kvevents               # shared-port multi-DP routing with ordered KV-event cleanup
+lfm/v1.0.2-rebased-upstream-objective-key             # resolve inference objectives after request-header plugins
+lfm/v1.0.2-rebased-upstream-coordinator-revision      # revision forwarding across coordinator phases
+lfm/v1.0.2-rebased-upstream-rawbody-release           # release request RawBody after Envoy forwarding
