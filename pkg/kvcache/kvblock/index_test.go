@@ -139,6 +139,16 @@ func testCommonIndexBehavior(t *testing.T, indexFactory func(t *testing.T) Index
 		testLookupPreservesGroupIdentity(t, ctx, index)
 	})
 
+	t.Run("DataParallelRanksCoexist", func(t *testing.T) {
+		index := indexFactory(t)
+		testDataParallelRanksCoexist(t, ctx, index)
+	})
+
+	t.Run("DataParallelRankUsesValueIdentity", func(t *testing.T) {
+		index := indexFactory(t)
+		testDataParallelRankUsesValueIdentity(t, ctx, index)
+	})
+
 	t.Run("ClearBasic", func(t *testing.T) {
 		index := indexFactory(t)
 		testClearBasic(t, ctx, index)
@@ -158,6 +168,89 @@ func testCommonIndexBehavior(t *testing.T, indexFactory func(t *testing.T) Index
 		index := indexFactory(t)
 		testClearThenReAdd(t, ctx, index)
 	})
+
+	t.Run("ClearRankPreservesSiblingRanks", func(t *testing.T) {
+		index := indexFactory(t)
+		testClearRankPreservesSiblingRanks(t, ctx, index)
+	})
+}
+
+func testDataParallelRanksCoexist(t *testing.T, ctx context.Context, index Index) {
+	t.Helper()
+	rank0, rank1 := 0, 1
+	key := BlockHash(0xDADA0001)
+	entries := []PodEntry{
+		{PodIdentifier: "pod-dp", DeviceTier: "gpu", DataParallelRank: &rank0},
+		{PodIdentifier: "pod-dp", DeviceTier: "gpu", DataParallelRank: &rank1},
+	}
+
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{key}, entries))
+	hits, err := index.Lookup(ctx, []BlockHash{key}, sets.Set[string]{})
+	require.NoError(t, err)
+	require.Len(t, hits[key], 2)
+
+	ranks := make([]int, 0, len(hits[key]))
+	for _, entry := range hits[key] {
+		require.NotNil(t, entry.DataParallelRank)
+		ranks = append(ranks, *entry.DataParallelRank)
+	}
+	assert.ElementsMatch(t, []int{0, 1}, ranks)
+}
+
+func testDataParallelRankUsesValueIdentity(t *testing.T, ctx context.Context, index Index) {
+	t.Helper()
+	addRank, duplicateRank, evictRank := 2, 2, 2
+	key := BlockHash(0xDADA0002)
+	addEntry := PodEntry{PodIdentifier: "pod-dp", DeviceTier: "gpu", DataParallelRank: &addRank}
+	duplicateEntry := PodEntry{PodIdentifier: "pod-dp", DeviceTier: "gpu", DataParallelRank: &duplicateRank}
+	evictEntry := PodEntry{PodIdentifier: "pod-dp", DeviceTier: "gpu", DataParallelRank: &evictRank}
+
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{key}, []PodEntry{addEntry, duplicateEntry}))
+	hits, err := index.Lookup(ctx, []BlockHash{key}, sets.Set[string]{})
+	require.NoError(t, err)
+	require.Len(t, hits[key], 1, "equal rank values must deduplicate regardless of pointer identity")
+
+	require.NoError(t, index.Evict(ctx, key, RequestKey, []PodEntry{evictEntry}))
+	hits, err = index.Lookup(ctx, []BlockHash{key}, sets.Set[string]{})
+	require.NoError(t, err)
+	assert.Empty(t, hits[key], "eviction must compare rank values rather than pointer addresses")
+}
+
+func testClearRankPreservesSiblingRanks(t *testing.T, ctx context.Context, index Index) {
+	t.Helper()
+	require.Implements(t, (*DataParallelRankIndex)(nil), index)
+	rank0, rank1 := 0, 1
+	key := BlockHash(0xDADA0003)
+	entries := []PodEntry{
+		{PodIdentifier: "pod-dp", DeviceTier: "gpu", DataParallelRank: &rank0},
+		{PodIdentifier: "pod-dp", DeviceTier: "gpu", DataParallelRank: &rank1},
+	}
+
+	require.NoError(t, index.Add(ctx, nil, []BlockHash{key}, entries))
+	require.NoError(t, ClearDataParallelRank(ctx, index, "pod-dp", rank0))
+
+	hits, err := index.Lookup(ctx, []BlockHash{key}, sets.Set[string]{})
+	require.NoError(t, err)
+	require.Len(t, hits[key], 1)
+	require.NotNil(t, hits[key][0].DataParallelRank)
+	assert.Equal(t, rank1, *hits[key][0].DataParallelRank)
+}
+
+func TestClearDataParallelRankFallsBackToPodClear(t *testing.T) {
+	index := &clearOnlyIndex{}
+
+	require.NoError(t, ClearDataParallelRank(t.Context(), index, "pod-dp", 1))
+	assert.Equal(t, "pod-dp", index.clearedPod)
+}
+
+type clearOnlyIndex struct {
+	Index
+	clearedPod string
+}
+
+func (i *clearOnlyIndex) Clear(_ context.Context, podIdentifier string) error {
+	i.clearedPod = podIdentifier
+	return nil
 }
 
 // testClearBasic verifies Clear makes all of a pod's entries invisible to Lookup.

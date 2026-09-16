@@ -44,6 +44,9 @@ import (
 
 var (
 	errPoolNotSynced = errors.New("InferencePool is not initialized in data store")
+	// errDataParallelSizeDetectionPending causes pod reconciliation to retry
+	// while retaining the configured fallback or last detected ranks.
+	errDataParallelSizeDetectionPending = errors.New("data-parallel size detection pending")
 	// errRegistrationDropped reports an endpoint that could not be tracked: its collector is
 	// still registered from an earlier registration (an upsert overlapping an in-flight delete)
 	// or failed to start. Callers match it with errors.Is to decide whether to retry.
@@ -112,23 +115,53 @@ type Datastore interface {
 // compile-time type assertion
 var _ Datastore = &datastore{}
 
-// NewDatastore creates a new data store.
-func NewDatastore(parentCtx context.Context, epFactory datalayer.EndpointFactory) Datastore {
-	// Initialize with defaults
-	return &datastore{
-		parentCtx:     parentCtx,
-		pool:          nil,
-		mu:            sync.RWMutex{},
-		objectives:    make(map[string]*v1alpha2.InferenceObjective),
-		modelRewrites: newModelRewriteStore(),
-		pods:          &sync.Map{},
-		epf:           epFactory,
+// Option configures the datastore.
+type Option func(*datastore)
+
+// DataParallelSizeDetector discovers the number of logical ranks served by an endpoint.
+type DataParallelSizeDetector interface {
+	Detect(ctx context.Context, endpoint *fwkdl.EndpointMetadata) (size int, detected bool, err error)
+}
+
+// WithDataParallelSize expands each pod behind one shared target port into one
+// logical endpoint per data-parallel rank.
+func WithDataParallelSize(size int) Option {
+	return func(ds *datastore) {
+		ds.dataParallelSize = size
 	}
+}
+
+// WithDataParallelSizeDetector configures per-pod data-parallel rank discovery.
+func WithDataParallelSizeDetector(detector DataParallelSizeDetector) Option {
+	return func(ds *datastore) {
+		ds.dataParallelSizeDetector = detector
+	}
+}
+
+// NewDatastore creates a new data store.
+func NewDatastore(parentCtx context.Context, epFactory datalayer.EndpointFactory, opts ...Option) Datastore {
+	// Initialize with defaults
+	ds := &datastore{
+		parentCtx:        parentCtx,
+		pool:             nil,
+		mu:               sync.RWMutex{},
+		objectives:       make(map[string]*v1alpha2.InferenceObjective),
+		modelRewrites:    newModelRewriteStore(),
+		pods:             &sync.Map{},
+		epf:              epFactory,
+		dataParallelSize: 1,
+	}
+	for _, opt := range opts {
+		opt(ds)
+	}
+	return ds
 }
 
 type datastore struct {
 	// parentCtx controls the lifecycle of the background metrics goroutines that spawn up by the datastore.
 	parentCtx context.Context
+	// poolUpdateMu serializes pool replacement, endpoint resync, and clearing.
+	poolUpdateMu sync.Mutex
 	// mu is used to synchronize access to pool, objectives, and rewrites.
 	mu   sync.RWMutex
 	pool *datalayer.EndpointPool
@@ -139,6 +172,9 @@ type datastore struct {
 	// key: types.NamespacedName, value: fwkdl.Endpoint
 	pods *sync.Map
 	epf  datalayer.EndpointFactory
+	// dataParallelSize is the fallback rank count when discovery is unavailable.
+	dataParallelSize         int
+	dataParallelSizeDetector DataParallelSizeDetector
 	// needsResync forces the next PoolSet to run podResyncAll even when the pool is unchanged.
 	// PoolSet stores the pool before resyncing, so without this flag a PoolSet retried after a
 	// resync failure would compare the incoming pool against the already-stored identical pool
@@ -152,6 +188,12 @@ func (ds *datastore) WithEndpointPool(pool *datalayer.EndpointPool) Datastore {
 }
 
 func (ds *datastore) Clear() {
+	ds.poolUpdateMu.Lock()
+	defer ds.poolUpdateMu.Unlock()
+	ds.clear()
+}
+
+func (ds *datastore) clear() {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	ds.pool = nil
@@ -167,21 +209,28 @@ func (ds *datastore) Clear() {
 
 // /// Pool APIs ///
 func (ds *datastore) PoolSet(ctx context.Context, reader client.Reader, endpointPool *datalayer.EndpointPool) error {
+	ds.poolUpdateMu.Lock()
+	defer ds.poolUpdateMu.Unlock()
+
 	if endpointPool == nil {
-		ds.Clear()
+		ds.clear()
 		return nil
+	}
+	if err := ds.validateEndpointPool(endpointPool); err != nil {
+		return err
 	}
 	logger := log.FromContext(ctx)
 	ds.mu.Lock()
-	defer ds.mu.Unlock()
 
 	oldEndpointPool := ds.pool
 	ds.pool = endpointPool
 
 	selectorChanged := oldEndpointPool == nil || !selectorEqual(oldEndpointPool.Selector, endpointPool.Selector)
 	targetPortsChanged := oldEndpointPool != nil && !slices.Equal(oldEndpointPool.TargetPorts, endpointPool.TargetPorts)
+	needsResync := ds.needsResync
+	ds.mu.Unlock()
 
-	if selectorChanged || targetPortsChanged || ds.needsResync {
+	if selectorChanged || targetPortsChanged || needsResync {
 		logger.V(logutil.DEFAULT).Info("Updating endpoints", "selector", endpointPool.Selector, "targetPortsChanged", targetPortsChanged)
 		// A full resync is required to address the following cases:
 		// 1) At startup, the pod events may get processed before the pool is synced with the datastore,
@@ -191,11 +240,15 @@ func (ds *datastore) PoolSet(ctx context.Context, reader client.Reader, endpoint
 		//    the ones that may have existed already to the store.
 		// 3) If the targetPorts changed, we need to resync to remove orphaned rank endpoints that no longer
 		//    exist in the new targetPorts configuration.
-		if err := ds.podResyncAll(ctx, reader); err != nil {
+		if err := ds.podResyncAll(ctx, reader, endpointPool); err != nil {
+			ds.mu.Lock()
 			ds.needsResync = true
+			ds.mu.Unlock()
 			return fmt.Errorf("failed to update pods according to the pool selector - %w", err)
 		}
+		ds.mu.Lock()
 		ds.needsResync = false
+		ds.mu.Unlock()
 	}
 
 	return nil
@@ -299,6 +352,9 @@ func (ds *datastore) PodList(predicate func(fwkdl.Endpoint) bool) []fwkdl.Endpoi
 }
 
 func (ds *datastore) PodUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.Pod) error {
+	ds.poolUpdateMu.Lock()
+	defer ds.poolUpdateMu.Unlock()
+
 	// Take a reference to pool under read lock to avoid racing with PoolSet().
 	// This is safe because PoolSet() replaces the entire pool struct rather than
 	// updating it in-place.
@@ -315,13 +371,15 @@ func (ds *datastore) PodUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.P
 	return ds.podUpdateOrAddIfNotExist(ctx, pod, pool)
 }
 
-// podUpdateOrAddIfNotExist is the lock-free inner implementation.
-// Callers must ensure pool is a non-nil consistent snapshot (either read under lock
-// or already held, as in podResyncAll which runs under ds.mu.Lock via PoolSet).
+// podUpdateOrAddIfNotExist is the poolUpdateMu-held inner implementation.
+// Callers pass a non-nil consistent pool snapshot.
 // It returns a joined error covering every endpoint of the pod whose registration was dropped.
 func (ds *datastore) podUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.Pod, pool *datalayer.EndpointPool) error {
 	if pool == nil {
 		return nil
+	}
+	if err := ds.validateEndpointPool(pool); err != nil {
+		return err
 	}
 
 	labels := make(map[string]string, len(pod.GetLabels()))
@@ -329,21 +387,42 @@ func (ds *datastore) podUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.P
 
 	pods := []*fwkdl.EndpointMetadata{}
 	activePorts := extractActivePorts(pod, pool.TargetPorts)
-	for idx, port := range pool.TargetPorts {
-		if !activePorts.Has(port) {
-			continue
+	dataParallelSize, rankAware, detectionErr := ds.dataParallelSizeForPod(ctx, pod, pool, labels, activePorts)
+	if rankAware {
+		port := pool.TargetPorts[0]
+		if activePorts.Has(port) {
+			for rank := range dataParallelSize {
+				rankValue := rank
+				pods = append(pods, &fwkdl.EndpointMetadata{
+					ID:               createEndpointNamespacedName(pod, rank),
+					Name:             pod.Name,
+					Address:          pod.Status.PodIP,
+					NodeAddress:      pod.Status.HostIP,
+					Port:             strconv.Itoa(port),
+					MetricsHost:      net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(port)),
+					Labels:           labels,
+					RankIndex:        rank,
+					DataParallelRank: &rankValue,
+				})
+			}
 		}
-		pods = append(pods,
-			&fwkdl.EndpointMetadata{
-				ID:          createEndpointNamespacedName(pod, idx),
-				Name:        pod.Name,
-				Address:     pod.Status.PodIP,
-				NodeAddress: pod.Status.HostIP,
-				Port:        strconv.Itoa(port),
-				MetricsHost: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(port)),
-				Labels:      labels,
-				RankIndex:   idx,
-			})
+	} else {
+		for idx, port := range pool.TargetPorts {
+			if !activePorts.Has(port) {
+				continue
+			}
+			pods = append(pods,
+				&fwkdl.EndpointMetadata{
+					ID:          createEndpointNamespacedName(pod, idx),
+					Name:        pod.Name,
+					Address:     pod.Status.PodIP,
+					NodeAddress: pod.Status.HostIP,
+					Port:        strconv.Itoa(port),
+					MetricsHost: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(port)),
+					Labels:      labels,
+					RankIndex:   idx,
+				})
+		}
 	}
 
 	if len(pods) == 0 {
@@ -354,6 +433,9 @@ func (ds *datastore) podUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.P
 
 	added := false
 	var errs []error
+	if detectionErr != nil {
+		errs = append(errs, detectionErr)
+	}
 	existingEpSet := sets.Set[types.NamespacedName]{}
 	for _, endpointMetadata := range pods {
 		existingEpSet.Insert(endpointMetadata.ID)
@@ -375,23 +457,95 @@ func (ds *datastore) podUpdateOrAddIfNotExist(ctx context.Context, pod *corev1.P
 		}
 	}
 
-	// remove endpoints that are no longer active in the pool
-	for idx, port := range pool.TargetPorts {
-		if activePorts.Has(port) {
-			continue
+	// Remove endpoints that are no longer active or whose rank disappeared.
+	ds.pods.Range(func(key, value any) bool {
+		endpoint := value.(fwkdl.Endpoint)
+		metadata := endpoint.GetMetadata()
+		if metadata.Name == pod.Name && metadata.ID.Namespace == pod.Namespace && !existingEpSet.Has(metadata.ID) {
+			if removed, ok := ds.pods.LoadAndDelete(key); ok {
+				ds.epf.ReleaseEndpoint(removed.(fwkdl.Endpoint))
+			}
 		}
-
-		namespacedName := createEndpointNamespacedName(pod, idx)
-		if ep, ok := ds.pods.Load(namespacedName); ok {
-			ds.pods.Delete(namespacedName)
-			ds.epf.ReleaseEndpoint(ep.(fwkdl.Endpoint))
-		}
-	}
+		return true
+	})
 
 	return errors.Join(errs...)
 }
 
+func (ds *datastore) dataParallelSizeForPod(ctx context.Context, pod *corev1.Pod, pool *datalayer.EndpointPool,
+	labels map[string]string, activePorts sets.Set[int],
+) (int, bool, error) {
+	fallbackSize := ds.dataParallelSize
+	if ds.dataParallelSizeDetector == nil || len(pool.TargetPorts) != 1 || !activePorts.Has(pool.TargetPorts[0]) {
+		return fallbackSize, fallbackSize > 1, nil
+	}
+
+	port := pool.TargetPorts[0]
+	endpoint := &fwkdl.EndpointMetadata{
+		ID:          createEndpointNamespacedName(pod, 0),
+		Name:        pod.Name,
+		Address:     pod.Status.PodIP,
+		NodeAddress: pod.Status.HostIP,
+		Port:        strconv.Itoa(port),
+		MetricsHost: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(port)),
+		Labels:      labels,
+	}
+	size, detected, err := ds.dataParallelSizeDetector.Detect(ctx, endpoint)
+	if err != nil {
+		if currentSize, currentRankAware, found := ds.currentDataParallelSize(pod); found {
+			log.FromContext(ctx).Error(err, "Failed to detect data-parallel size, keeping existing endpoints",
+				"pod", pod.Name, "size", currentSize)
+			return currentSize, currentRankAware, fmt.Errorf("%w: %w", errDataParallelSizeDetectionPending, err)
+		}
+		log.FromContext(ctx).Error(err, "Failed to detect data-parallel size, using configured fallback",
+			"pod", pod.Name, "size", fallbackSize)
+		return fallbackSize, fallbackSize > 1, fmt.Errorf("%w: %w", errDataParallelSizeDetectionPending, err)
+	}
+	if !detected {
+		logger := log.FromContext(ctx).V(logutil.DEBUG)
+		if currentSize, currentRankAware, found := ds.currentDataParallelSize(pod); found {
+			logger.Info("Data-parallel size not detected, keeping existing endpoints",
+				"pod", pod.Name, "size", currentSize)
+			return currentSize, currentRankAware, errDataParallelSizeDetectionPending
+		}
+		logger.Info("Data-parallel size not detected, using configured fallback",
+			"pod", pod.Name, "size", fallbackSize)
+		return fallbackSize, fallbackSize > 1, errDataParallelSizeDetectionPending
+	}
+	if size < 1 {
+		err := fmt.Errorf("detected data-parallel size must be positive, got %d", size)
+		if currentSize, currentRankAware, found := ds.currentDataParallelSize(pod); found {
+			log.FromContext(ctx).Error(err, "Keeping existing data-parallel endpoints",
+				"pod", pod.Name, "size", currentSize)
+			return currentSize, currentRankAware, fmt.Errorf("%w: %w", errDataParallelSizeDetectionPending, err)
+		}
+		log.FromContext(ctx).Error(err, "Using configured data-parallel size fallback",
+			"pod", pod.Name, "size", fallbackSize)
+		return fallbackSize, fallbackSize > 1, fmt.Errorf("%w: %w", errDataParallelSizeDetectionPending, err)
+	}
+	return size, size > 1, nil
+}
+
+func (ds *datastore) currentDataParallelSize(pod *corev1.Pod) (size int, rankAware bool, found bool) {
+	ds.pods.Range(func(_, value any) bool {
+		metadata := value.(fwkdl.Endpoint).GetMetadata()
+		if metadata.Name != pod.Name || metadata.ID.Namespace != pod.Namespace {
+			return true
+		}
+		size++
+		found = true
+		if metadata.DataParallelRank != nil {
+			rankAware = true
+		}
+		return true
+	})
+	return size, rankAware, found
+}
+
 func (ds *datastore) PodDelete(podName string) {
+	ds.poolUpdateMu.Lock()
+	defer ds.poolUpdateMu.Unlock()
+
 	ds.pods.Range(func(k, v any) bool {
 		ep := v.(fwkdl.Endpoint)
 		if ep.GetMetadata().Name == podName {
@@ -449,12 +603,12 @@ func (ds *datastore) upsertEndpoint(ctx context.Context, meta *fwkdl.EndpointMet
 	}
 }
 
-func (ds *datastore) podResyncAll(ctx context.Context, reader client.Reader) error {
+func (ds *datastore) podResyncAll(ctx context.Context, reader client.Reader, pool *datalayer.EndpointPool) error {
 	logger := log.FromContext(ctx)
 	podList := &corev1.PodList{}
 	if err := reader.List(ctx, podList, &client.ListOptions{
-		LabelSelector: ds.pool.Selector,
-		Namespace:     ds.pool.Namespace,
+		LabelSelector: pool.Selector,
+		Namespace:     pool.Namespace,
 	}); err != nil {
 		return fmt.Errorf("failed to list pods - %w", err)
 	}
@@ -467,14 +621,17 @@ func (ds *datastore) podResyncAll(ctx context.Context, reader client.Reader) err
 		if !podutil.IsPodReady(&pod) {
 			continue
 		}
-		// Calculate expected endpoint names based on current targetPorts.
-		for idx := range ds.pool.TargetPorts {
-			activeEndpoints.Insert(createEndpointNamespacedName(&pod, idx))
-		}
-		if err := ds.podUpdateOrAddIfNotExist(ctx, &pod, ds.pool); err != nil {
+		if err := ds.podUpdateOrAddIfNotExist(ctx, &pod, pool); err != nil {
 			// Propagate so PoolSet fails; needsResync makes the retried PoolSet resync again.
 			errs = append(errs, err)
 		}
+		ds.pods.Range(func(_, value any) bool {
+			metadata := value.(fwkdl.Endpoint).GetMetadata()
+			if metadata.Name == pod.Name && metadata.ID.Namespace == pod.Namespace {
+				activeEndpoints.Insert(metadata.ID)
+			}
+			return true
+		})
 	}
 
 	// Remove endpoints that don't belong to the pool, are not ready, or are orphaned ranks.
@@ -490,6 +647,16 @@ func (ds *datastore) podResyncAll(ctx context.Context, reader client.Reader) err
 	})
 
 	return errors.Join(errs...)
+}
+
+func (ds *datastore) validateEndpointPool(pool *datalayer.EndpointPool) error {
+	if ds.dataParallelSize < 1 {
+		return fmt.Errorf("data-parallel size must be positive, got %d", ds.dataParallelSize)
+	}
+	if (ds.dataParallelSize > 1 || ds.dataParallelSizeDetector != nil) && len(pool.TargetPorts) != 1 {
+		return fmt.Errorf("shared-port data parallelism requires exactly one target port, got %d", len(pool.TargetPorts))
+	}
+	return nil
 }
 
 // extractActivePorts extracts the active ports from a pod's annotations.
