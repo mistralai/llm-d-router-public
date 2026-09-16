@@ -135,6 +135,11 @@ func TestInMemoryIndexDefaultPodCacheSize(t *testing.T) {
 	assert.ElementsMatch(t, entries[1:], found[keys[0]])
 }
 
+func TestInMemoryIndexRejectsUnsupportedPodCacheSize(t *testing.T) {
+	_, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1, PodCacheSize: 1 << 16})
+	require.ErrorContains(t, err, "pod cache size must be between 1 and 65535")
+}
+
 func TestInMemoryIndexClearIgnoresCancellation(t *testing.T) {
 	ctx := t.Context()
 	const numKeys = 600
