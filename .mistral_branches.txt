@@ -17,7 +17,7 @@
 # The v1.0.2-rebased-upstream feature branches were prepared against
 # de2e3e11fc038f53d9a1aa8cdc51a1aa07917501. Branches are replayed in this order.
 
-mistral-branches                                      # this branch: the rebuild tool, branch list, and CI workflow
+lfm/v1.0.2-rebased-upstream-build-tooling             # rebuild tool and CI workflow, squashed for DCO compliance
 lfm/v1.0.2-rebased-upstream-dp-kvevents               # shared-port multi-DP routing with ordered KV-event cleanup
 lfm/v1.0.2-rebased-upstream-objective-key             # resolve inference objectives after request-header plugins
 lfm/v1.0.2-rebased-upstream-coordinator-revision      # revision forwarding across coordinator phases
