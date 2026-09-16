@@ -38,6 +38,8 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -76,6 +78,7 @@ type subscriberManager interface {
 	EnsureSubscriber(
 		ctx context.Context,
 		podIdentifier, sourceEndpoint, endpoint, replayEndpoint, snapshotEndpoint, topicFilter string,
+		dataParallelRank *int,
 		remoteSocket bool,
 	) error
 	RemoveSubscriber(ctx context.Context, podIdentifier string) bool
@@ -98,6 +101,7 @@ type Producer struct {
 	subscribersManager subscriberManager
 	kvEventsConfig     *kvevents.Config
 	podSelector        labels.Selector // nil matches every endpoint.
+	rankPodResolver    *rankPodResolver
 
 	dk plugin.DataKey
 
@@ -182,6 +186,19 @@ func ValidateTokenProducer(handle plugin.Handle) error {
 // The kvcache indexer, KV-events pool, and any local ZMQ subscriber start
 // in background goroutines bound to ctx.
 func New(ctx context.Context, name string, config PluginConfig) (*Producer, error) {
+	var rankResolver *rankPodResolver
+	if config.KVEventsConfig != nil && config.KVEventsConfig.PodDiscoveryConfig != nil &&
+		config.KVEventsConfig.PodDiscoveryConfig.RankPodMapping != nil {
+		if !config.KVEventsConfig.DiscoverPods {
+			return nil, errors.New("kvEventsConfig.discoverPods must be true when rankPodMapping is configured")
+		}
+		var err error
+		rankResolver, err = newRankPodResolver(config.KVEventsConfig.PodDiscoveryConfig)
+		if err != nil {
+			return nil, fmt.Errorf("invalid rank-pod mapping: %w", err)
+		}
+	}
+
 	if config.TokenProcessorConfig == nil {
 		config.TokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
 	}
@@ -223,7 +240,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	subscribersManager := kvevents.NewSubscriberManager(pool)
 	if config.KVEventsConfig.ZMQEndpoint != "" {
 		if err := subscribersManager.EnsureSubscriber(ctx, "local-subscriber", "",
-			config.KVEventsConfig.ZMQEndpoint, "", "", config.KVEventsConfig.TopicFilter, false); err != nil {
+			config.KVEventsConfig.ZMQEndpoint, "", "", config.KVEventsConfig.TopicFilter, nil, false); err != nil {
 			return nil, fmt.Errorf("failed to create local subscriber for global socket mode: %w", err)
 		}
 	}
@@ -241,6 +258,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		subscribersManager: subscribersManager,
 		kvEventsConfig:     config.KVEventsConfig,
 		podSelector:        podSelector,
+		rankPodResolver:    rankResolver,
 		dk:                 attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name),
 		pluginState:        plugin.NewPluginState(ctx),
 		speculativeCache:   speculativeCache,
@@ -249,6 +267,12 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		blockSizeTokens:    tokenProcessor.BlockSize(),
 		subscriberCtx:      ctx,
 	}, nil
+}
+
+// RegisterDependencies adds the Pod notification source required by
+// rank-to-pod KV-event discovery.
+func (p *Producer) RegisterDependencies(registrar fwkdl.Registrar) error {
+	return p.registerRankPodDependency(registrar)
 }
 
 // TypedName returns the plugin's registered type and name.
@@ -392,7 +416,7 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 	mmTracked := false
 	totalBlocks := 0
 	for i, blockKeys := range perPromptKeys {
-		promptMatches, err := p.kvCacheIndexer.MatchBlockKeys(ctx, blockKeys, endpointSet)
+		promptMatches, err := p.kvCacheIndexer.MatchBlockKeysByEndpoint(ctx, blockKeys, endpointSet)
 		if err != nil {
 			span.SetStatus(codes.Error, err.Error())
 			return fmt.Errorf("failed to match block keys: %w", err)
@@ -429,7 +453,15 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		if md == nil {
 			continue
 		}
-		podKey := fmt.Sprintf("%s:%s", md.Address, md.Port)
+		podIdentifier := fmt.Sprintf("%s:%s", md.Address, md.Port)
+		rank := routing.NoDataParallelRank
+		if md.DataParallelRank != nil {
+			rank = *md.DataParallelRank
+		}
+		podKey, err := routing.BuildDPScoringKey(podIdentifier, rank)
+		if err != nil {
+			return fmt.Errorf("build score key for endpoint %q: %w", md.ID, err)
+		}
 		match := matches[podKey]
 		if mmTracked {
 			maxMMMatch = max(maxMMMatch, mmMatches[podKey])
