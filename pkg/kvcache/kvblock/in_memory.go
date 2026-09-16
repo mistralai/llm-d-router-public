@@ -149,9 +149,10 @@ func (pc *PodCache) addAll(recs []EntryRef) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	for _, rec := range recs {
+		recKey := newPodEntryKey(rec.PodEntry)
 		found := false
 		for i := range pc.entries {
-			if pc.entries[i].PodEntry == rec.PodEntry {
+			if newPodEntryKey(pc.entries[i].PodEntry) == recKey {
 				copy(pc.entries[i:], pc.entries[i+1:])
 				pc.entries[len(pc.entries)-1] = rec
 				found = true
@@ -176,8 +177,9 @@ func (pc *PodCache) removeAll(entries []PodEntry) (empty bool) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	for _, entry := range entries {
+		entryKey := newPodEntryKey(entry)
 		for i := range pc.entries {
-			if pc.entries[i].PodEntry == entry {
+			if newPodEntryKey(pc.entries[i].PodEntry) == entryKey {
 				pc.entries = append(pc.entries[:i], pc.entries[i+1:]...)
 				break
 			}
@@ -217,13 +219,15 @@ func (pc *PodCache) filteredEntries(allowed sets.Set[string]) (filtered []PodEnt
 	return filtered, total
 }
 
-// matching returns the entries belonging to podIdentifier.
-func (pc *PodCache) matching(podIdentifier string) []PodEntry {
+// matching returns the entries belonging to podIdentifier and, when non-nil,
+// the requested data-parallel rank.
+func (pc *PodCache) matching(podIdentifier string, dataParallelRank *int) []PodEntry {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	var matched []PodEntry
 	for i := range pc.entries {
-		if pc.entries[i].PodIdentifier == podIdentifier {
+		key := newPodEntryKey(pc.entries[i].PodEntry)
+		if key.podIdentifier == podIdentifier && key.matchesDataParallelRank(dataParallelRank) {
 			matched = append(matched, pc.entries[i].PodEntry)
 		}
 	}
@@ -394,7 +398,6 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 				podCache = newPodCache
 			}
 		}
-
 		podCache.addAll(records)
 
 		if traceLogger.Enabled() {
@@ -492,6 +495,14 @@ func (m *InMemoryIndex) evictPodsFromRequestKey(requestKey, engineKey BlockHash,
 // and any stale mapping resolves to an emptied request key that correctly breaks
 // the prefix chain in Lookup.
 func (m *InMemoryIndex) Clear(ctx context.Context, podIdentifier string) error {
+	return m.clear(ctx, podIdentifier, nil)
+}
+
+func (m *InMemoryIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
+	return m.clear(ctx, podIdentifier, &dataParallelRank)
+}
+
+func (m *InMemoryIndex) clear(ctx context.Context, podIdentifier string, dataParallelRank *int) error {
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Clear")
 
 	for _, requestKey := range m.data.Keys() {
@@ -501,14 +512,14 @@ func (m *InMemoryIndex) Clear(ctx context.Context, podIdentifier string) error {
 			continue
 		}
 
-		matched := podCache.matching(podIdentifier)
+		matched := podCache.matching(podIdentifier, dataParallelRank)
 
 		if len(matched) > 0 {
 			m.evictPodsFromRequestKey(requestKey, EmptyBlockHash, matched, traceLogger)
 		}
 	}
 
-	traceLogger.Info("cleared pod from index", "pod", podIdentifier)
+	traceLogger.Info("cleared pod from index", "pod", podIdentifier, "dataParallelRank", dataParallelRank)
 	return nil
 }
 

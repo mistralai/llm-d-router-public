@@ -59,8 +59,8 @@ type EventBatch struct {
 	DataParallelRank *int
 }
 
-// RawMessage holds the raw transport-level data from a received pub/sub message.
-// It contains no domain-specific fields — parsing is deferred to the EngineAdapter.
+// RawMessage holds transport data and subscriber source metadata for a received
+// pub/sub message. Payload parsing is deferred to the EngineAdapter.
 type RawMessage struct {
 	// Topic is the original transport topic string.
 	Topic string
@@ -70,6 +70,12 @@ type RawMessage struct {
 	Payload []byte
 	// SourceEndpoint is the serving endpoint associated with the subscriber.
 	SourceEndpoint string
+	// SourceDataParallelRank is the rank assigned to the subscriber. Nil means
+	// the serving endpoint is not configured for shared-port data parallelism.
+	SourceDataParallelRank *int
+	// ResetDataParallelRank scopes a replay reset to one rank. Nil resets the
+	// whole serving endpoint.
+	ResetDataParallelRank *int
 	// reset clears the message's pod before later messages on the same queue.
 	reset bool
 	// SpanContext links processing back to the span that received the message,

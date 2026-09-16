@@ -50,7 +50,7 @@ func TestSubscriberManager_EnsureSubscriber(t *testing.T) {
 	endpoint := "tcp://127.0.0.1:5557"
 	topicFilter := "kv@"
 
-	err = sm.EnsureSubscriber(ctx, podID, "", endpoint, "", topicFilter, true)
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint, "", topicFilter, nil, true)
 	assert.NoError(t, err)
 
 	identifiers, endpoints := sm.GetActiveSubscribers()
@@ -59,7 +59,7 @@ func TestSubscriberManager_EnsureSubscriber(t *testing.T) {
 	assert.Contains(t, endpoints, endpoint)
 
 	// Ensure with same endpoint should be no-op
-	err = sm.EnsureSubscriber(ctx, podID, "", endpoint, "", topicFilter, true)
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint, "", topicFilter, nil, true)
 	assert.NoError(t, err)
 	identifiers, _ = sm.GetActiveSubscribers()
 	assert.Len(t, identifiers, 1)
@@ -89,7 +89,7 @@ func TestSubscriberManager_RemoveSubscriber(t *testing.T) {
 	topicFilter := "kv@"
 	assert.False(t, sm.RemoveSubscriber(ctx, podID))
 
-	err = sm.EnsureSubscriber(ctx, podID, "", endpoint, "", topicFilter, true)
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint, "", topicFilter, nil, true)
 	require.NoError(t, err)
 
 	assert.True(t, sm.RemoveSubscriber(ctx, podID))
@@ -127,7 +127,7 @@ func TestSubscriberManager_MultipleSubscribers(t *testing.T) {
 	}
 
 	for _, pod := range pods {
-		err := sm.EnsureSubscriber(ctx, pod.id, "", pod.endpoint, "", "kv@", true)
+		err := sm.EnsureSubscriber(ctx, pod.id, "", pod.endpoint, "", "kv@", nil, true)
 		require.NoError(t, err)
 	}
 
@@ -170,12 +170,12 @@ func TestSubscriberManager_EndpointChange(t *testing.T) {
 	endpoint1 := "tcp://10.0.0.1:5557"
 	endpoint2 := "tcp://10.0.0.2:5557"
 
-	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "kv@", true)
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "kv@", nil, true)
 	require.NoError(t, err)
 	identifiers, _ := sm.GetActiveSubscribers()
 	assert.Len(t, identifiers, 1)
 
-	err = sm.EnsureSubscriber(ctx, podID, "", endpoint2, "", "kv@", true)
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint2, "", "kv@", nil, true)
 	require.NoError(t, err)
 
 	identifiers, endpoints := sm.GetActiveSubscribers()
@@ -210,7 +210,7 @@ func TestSubscriberManager_ConcurrentOperations(t *testing.T) {
 			defer func() { done <- true }()
 			podID := fmt.Sprintf("default/pod-%d", id)
 			endpoint := fmt.Sprintf("tcp://10.0.0.%d:5557", id)
-			if err := sm.EnsureSubscriber(ctx, podID, "", endpoint, "", "kv@", true); err != nil {
+			if err := sm.EnsureSubscriber(ctx, podID, "", endpoint, "", "kv@", nil, true); err != nil {
 				t.Errorf("failed to add subscriber %s: %v", podID, err)
 			}
 		}(i)
@@ -243,7 +243,7 @@ func TestSubscriberManager_Shutdown_ReleasesSocket(t *testing.T) {
 	sm := kvevents.NewSubscriberManager(pool)
 
 	endpoint := availableEndpoint(t, ctx)
-	err = sm.EnsureSubscriber(ctx, "test-pod-releases-socket", "", endpoint, "", "kv@", false)
+	err = sm.EnsureSubscriber(ctx, "test-pod-releases-socket", "", endpoint, "", "kv@", nil, false)
 	require.NoError(t, err)
 
 	shutdownCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -278,7 +278,7 @@ func TestSubscriberManager_Shutdown_HonorsContextCancellation(t *testing.T) {
 	sm := kvevents.NewSubscriberManager(pool)
 
 	endpoint := availableEndpoint(t, ctx)
-	err = sm.EnsureSubscriber(ctx, "test-pod-canceled", "", endpoint, "", "kv@", false)
+	err = sm.EnsureSubscriber(ctx, "test-pod-canceled", "", endpoint, "", "kv@", nil, false)
 	require.NoError(t, err)
 
 	canceledCtx, cancel := context.WithCancel(ctx)
@@ -289,7 +289,7 @@ func TestSubscriberManager_Shutdown_HonorsContextCancellation(t *testing.T) {
 	assert.Empty(t, identifiers)
 }
 
-func TestSubscriberManager_EndpointChange_WaitsForOldSubscriberExit(t *testing.T) {
+func TestSubscriberManager_EndpointChange_RetiresOldSubscriber(t *testing.T) {
 	ctx := context.Background()
 
 	indexConfig := kvblock.DefaultIndexConfig()
@@ -318,7 +318,7 @@ func TestSubscriberManager_EndpointChange_WaitsForOldSubscriberExit(t *testing.T
 	endpoint2 := fmt.Sprintf("tcp://%s", addr2)
 
 	podID := "default/test-pod-0"
-	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "kv@", false)
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "kv@", nil, false)
 	require.NoError(t, err)
 
 	// Wait for subscriber to bind to addr1.
@@ -331,15 +331,19 @@ func TestSubscriberManager_EndpointChange_WaitsForOldSubscriberExit(t *testing.T
 		return false
 	}, 2*time.Second, 10*time.Millisecond)
 
-	// Replace subscriber with endpoint2. EnsureSubscriber must wait until the old
-	// subscriber has exited and closed its socket before returning.
-	err = sm.EnsureSubscriber(ctx, podID, "", endpoint2, "", "kv@", false)
+	// Replacing the subscriber retires it without blocking endpoint reconciliation.
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint2, "", "kv@", nil, false)
 	require.NoError(t, err)
 
-	// addr1 should now be released and available to bind immediately.
-	newL, err := net.Listen("tcp", addr1)
-	require.NoError(t, err)
-	require.NoError(t, newL.Close())
+	// The retired subscriber still closes its socket asynchronously.
+	require.Eventually(t, func() bool {
+		newL, err := net.Listen("tcp", addr1)
+		if err != nil {
+			return false
+		}
+		_ = newL.Close()
+		return true
+	}, 2*time.Second, 10*time.Millisecond)
 
 	sm.Shutdown(ctx)
 }
@@ -363,13 +367,13 @@ func TestSubscriberManager_EndpointChange_HonorsContextCancellation(t *testing.T
 	endpoint1 := "tcp://10.0.0.1:5557"
 	endpoint2 := "tcp://10.0.0.2:5557"
 
-	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "kv@", true)
+	err = sm.EnsureSubscriber(ctx, podID, "", endpoint1, "", "kv@", nil, true)
 	require.NoError(t, err)
 
 	canceledCtx, cancel := context.WithCancel(ctx)
 	cancel()
 
-	err = sm.EnsureSubscriber(canceledCtx, podID, "", endpoint2, "", "kv@", true)
+	err = sm.EnsureSubscriber(canceledCtx, podID, "", endpoint2, "", "kv@", nil, true)
 	assert.ErrorIs(t, err, context.Canceled)
 
 	identifiers, _ := sm.GetActiveSubscribers()
@@ -401,7 +405,7 @@ func TestSubscriberManager_EndpointChange_BothChannelsReady_HonorsContextCancell
 	podID := "default/test-pod-0"
 
 	subCtx, subCancel := context.WithCancel(ctx)
-	err = sm.EnsureSubscriber(subCtx, podID, "", endpoint1, "", "kv@", false)
+	err = sm.EnsureSubscriber(subCtx, podID, "", endpoint1, "", "kv@", nil, false)
 	require.NoError(t, err)
 
 	// Wait for subscriber to bind to addr1.
@@ -433,7 +437,7 @@ func TestSubscriberManager_EndpointChange_BothChannelsReady_HonorsContextCancell
 	// Both entry.done and canceledCtx.Done() are ready. EnsureSubscriber must
 	// honor the context cancellation, clean up, and return context.Canceled
 	// rather than creating a replacement subscriber and returning nil.
-	err = sm.EnsureSubscriber(canceledCtx, podID, "", endpoint2, "", "kv@", false)
+	err = sm.EnsureSubscriber(canceledCtx, podID, "", endpoint2, "", "kv@", nil, false)
 	assert.ErrorIs(t, err, context.Canceled)
 
 	identifiers, _ := sm.GetActiveSubscribers()
