@@ -88,3 +88,7 @@ func (m *instrumentedIndex) GetRequestKey(ctx context.Context, engineKey BlockHa
 func (m *instrumentedIndex) Clear(ctx context.Context, podIdentifier string) error {
 	return m.next.Clear(ctx, podIdentifier)
 }
+
+func (m *instrumentedIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
+	return ClearDataParallelRank(ctx, m.next, podIdentifier, dataParallelRank)
+}

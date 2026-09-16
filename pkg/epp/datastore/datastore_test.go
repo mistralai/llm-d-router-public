@@ -19,6 +19,7 @@ package datastore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"reflect"
 	"strconv"
@@ -66,6 +67,36 @@ type mockEndpointFactory struct {
 	returnNil bool
 	mu        sync.Mutex
 	updates   []fwkdl.Endpoint
+}
+
+type fakeDataParallelSizeDetector struct {
+	mu       sync.Mutex
+	sizes    map[string]int
+	detected map[string]bool
+	errs     map[string]error
+}
+
+type dataParallelSizeDetectorFunc func(context.Context, *fwkdl.EndpointMetadata) (int, bool, error)
+
+func (f dataParallelSizeDetectorFunc) Detect(ctx context.Context, endpoint *fwkdl.EndpointMetadata) (int, bool, error) {
+	return f(ctx, endpoint)
+}
+
+func (f *fakeDataParallelSizeDetector) Detect(_ context.Context, endpoint *fwkdl.EndpointMetadata) (int, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.errs[endpoint.Name]; err != nil {
+		return 0, false, err
+	}
+	return f.sizes[endpoint.Name], f.detected[endpoint.Name], nil
+}
+
+func (f *fakeDataParallelSizeDetector) set(name string, size int, detected bool, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sizes[name] = size
+	f.detected[name] = detected
+	f.errs[name] = err
 }
 
 func (f *mockEndpointFactory) NewEndpoint(_ context.Context, meta *fwkdl.EndpointMetadata) fwkdl.Endpoint {
@@ -841,6 +872,259 @@ func TestEndpointMetadata(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestSharedPortDataParallelExpandsPodIntoRankEndpoints(t *testing.T) {
+	ctx := context.Background()
+	ds := NewDatastore(ctx, &mockEndpointFactory{}, WithDataParallelSize(3)).WithEndpointPool(&datalayer.EndpointPool{
+		Selector:    labels.Everything(),
+		TargetPorts: []int{8000},
+	})
+
+	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1))
+	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod2))
+
+	endpoints := ds.PodList(AllPodsPredicate)
+	require.Len(t, endpoints, 6)
+	byName := make(map[string]*fwkdl.EndpointMetadata, len(endpoints))
+	for _, endpoint := range endpoints {
+		byName[endpoint.GetMetadata().ID.Name] = endpoint.GetMetadata()
+	}
+
+	for _, pod := range []*corev1.Pod{pod1, pod2} {
+		for rank := range 3 {
+			meta := byName[fmt.Sprintf("%s-rank-%d", pod.Name, rank)]
+			require.NotNil(t, meta)
+			assert.Equal(t, pod.Status.PodIP, meta.Address)
+			assert.Equal(t, "8000", meta.Port)
+			require.NotNil(t, meta.DataParallelRank)
+			assert.Equal(t, rank, *meta.DataParallelRank)
+		}
+	}
+}
+
+func TestSharedPortDataParallelRejectsMultipleTargetPorts(t *testing.T) {
+	tests := []struct {
+		name    string
+		options []Option
+	}{
+		{
+			name:    "configured fallback",
+			options: []Option{WithDataParallelSize(3)},
+		},
+		{
+			name: "automatic detection",
+			options: []Option{WithDataParallelSizeDetector(&fakeDataParallelSizeDetector{
+				sizes:    map[string]int{},
+				detected: map[string]bool{},
+				errs:     map[string]error{},
+			})},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ds := NewDatastore(t.Context(), &mockEndpointFactory{}, tt.options...)
+			err := ds.PoolSet(t.Context(), fake.NewFakeClient(), &datalayer.EndpointPool{
+				Selector:    labels.Everything(),
+				TargetPorts: []int{8000, 8001},
+			})
+			require.ErrorContains(t, err, "requires exactly one target port")
+		})
+	}
+}
+
+func TestSharedPortDataParallelDetectsRanksPerPod(t *testing.T) {
+	ctx := context.Background()
+	detector := &fakeDataParallelSizeDetector{
+		sizes:    map[string]int{pod1.Name: 1, pod2.Name: 3},
+		detected: map[string]bool{pod1.Name: true, pod2.Name: true},
+		errs:     map[string]error{},
+	}
+	ds := NewDatastore(ctx, &mockEndpointFactory{},
+		WithDataParallelSize(8),
+		WithDataParallelSizeDetector(detector),
+	).WithEndpointPool(&datalayer.EndpointPool{
+		Selector:    labels.Everything(),
+		TargetPorts: []int{8000},
+	})
+
+	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1))
+	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod2))
+
+	endpoints := ds.PodList(AllPodsPredicate)
+	require.Len(t, endpoints, 4)
+	byName := make(map[string]*fwkdl.EndpointMetadata, len(endpoints))
+	for _, endpoint := range endpoints {
+		byName[endpoint.GetMetadata().ID.Name] = endpoint.GetMetadata()
+	}
+	assert.Nil(t, byName[pod1.Name+"-rank-0"].DataParallelRank)
+	for rank := range 3 {
+		meta := byName[fmt.Sprintf("%s-rank-%d", pod2.Name, rank)]
+		require.NotNil(t, meta)
+		require.NotNil(t, meta.DataParallelRank)
+		assert.Equal(t, rank, *meta.DataParallelRank)
+	}
+}
+
+func TestSharedPortDataParallelDetectsRanksPerPodDuringPoolResync(t *testing.T) {
+	const namespace = "default"
+
+	ctx := context.Background()
+	readyPod1 := pod1.DeepCopy()
+	readyPod1.Namespace = namespace
+	readyPod1.Labels = map[string]string{"app": "vllm"}
+	readyPod1.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	readyPod2 := pod2.DeepCopy()
+	readyPod2.Namespace = namespace
+	readyPod2.Labels = map[string]string{"app": "vllm"}
+	readyPod2.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+
+	detector := &fakeDataParallelSizeDetector{
+		sizes:    map[string]int{pod1.Name: 1, pod2.Name: 3},
+		detected: map[string]bool{pod1.Name: true, pod2.Name: true},
+		errs:     map[string]error{},
+	}
+	ds := NewDatastore(ctx, &mockEndpointFactory{},
+		WithDataParallelSize(8),
+		WithDataParallelSizeDetector(detector),
+	)
+	pool := &datalayer.EndpointPool{
+		Namespace:   namespace,
+		Selector:    labels.SelectorFromSet(labels.Set{"app": "vllm"}),
+		TargetPorts: []int{8000},
+	}
+	fakeClient := fake.NewClientBuilder().WithObjects(readyPod1, readyPod2).Build()
+
+	require.NoError(t, ds.PoolSet(ctx, fakeClient, pool))
+
+	endpoints := ds.PodList(AllPodsPredicate)
+	require.Len(t, endpoints, 4)
+	byName := make(map[string]*fwkdl.EndpointMetadata, len(endpoints))
+	for _, endpoint := range endpoints {
+		byName[endpoint.GetMetadata().ID.Name] = endpoint.GetMetadata()
+	}
+	pod1Endpoint := byName[pod1.Name+"-rank-0"]
+	require.NotNil(t, pod1Endpoint)
+	assert.Nil(t, pod1Endpoint.DataParallelRank)
+	for rank := range 3 {
+		meta := byName[fmt.Sprintf("%s-rank-%d", pod2.Name, rank)]
+		require.NotNil(t, meta)
+		require.NotNil(t, meta.DataParallelRank)
+		assert.Equal(t, rank, *meta.DataParallelRank)
+	}
+}
+
+func TestPoolSetDataParallelDetectionDoesNotBlockPoolReads(t *testing.T) {
+	ctx := context.Background()
+	readyPod := pod1.DeepCopy()
+	readyPod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	fakeClient := fake.NewClientBuilder().WithObjects(readyPod).Build()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	detector := dataParallelSizeDetectorFunc(func(context.Context, *fwkdl.EndpointMetadata) (int, bool, error) {
+		close(entered)
+		<-release
+		return 1, true, nil
+	})
+	ds := NewDatastore(ctx, &mockEndpointFactory{}, WithDataParallelSizeDetector(detector))
+	pool := &datalayer.EndpointPool{Selector: labels.Everything(), TargetPorts: []int{8000}}
+
+	poolSetDone := make(chan error, 1)
+	go func() {
+		poolSetDone <- ds.PoolSet(ctx, fakeClient, pool)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("data-parallel detection did not start")
+	}
+
+	poolGetDone := make(chan error, 1)
+	go func() {
+		_, err := ds.PoolGet()
+		poolGetDone <- err
+	}()
+	select {
+	case err := <-poolGetDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("PoolGet blocked on data-parallel detection")
+	}
+
+	close(release)
+	require.NoError(t, <-poolSetDone)
+}
+
+func TestSharedPortDataParallelRemovesRanksWhenDetectedSizeShrinks(t *testing.T) {
+	ctx := context.Background()
+	detector := &fakeDataParallelSizeDetector{
+		sizes:    map[string]int{pod1.Name: 3},
+		detected: map[string]bool{pod1.Name: true},
+		errs:     map[string]error{},
+	}
+	ds := NewDatastore(ctx, &mockEndpointFactory{}, WithDataParallelSizeDetector(detector)).WithEndpointPool(&datalayer.EndpointPool{
+		Selector:    labels.Everything(),
+		TargetPorts: []int{8000},
+	})
+
+	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1))
+	require.Len(t, ds.PodList(AllPodsPredicate), 3)
+	detector.set(pod1.Name, 2, true, nil)
+	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1))
+
+	endpoints := ds.PodList(AllPodsPredicate)
+	require.Len(t, endpoints, 2)
+	for _, endpoint := range endpoints {
+		assert.NotEqual(t, pod1.Name+"-rank-2", endpoint.GetMetadata().ID.Name)
+	}
+}
+
+func TestSharedPortDataParallelKeepsRanksWhenDetectionIsPending(t *testing.T) {
+	ctx := context.Background()
+	detector := &fakeDataParallelSizeDetector{
+		sizes:    map[string]int{pod1.Name: 3},
+		detected: map[string]bool{pod1.Name: true},
+		errs:     map[string]error{},
+	}
+	ds := NewDatastore(ctx, &mockEndpointFactory{}, WithDataParallelSizeDetector(detector)).WithEndpointPool(&datalayer.EndpointPool{
+		Selector:    labels.Everything(),
+		TargetPorts: []int{8000},
+	})
+
+	require.NoError(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1))
+	detector.set(pod1.Name, 0, false, nil)
+	require.ErrorIs(t, ds.PodUpdateOrAddIfNotExist(ctx, pod1), errDataParallelSizeDetectionPending)
+	require.Len(t, ds.PodList(AllPodsPredicate), 3)
+}
+
+func TestPoolSetDataParallelDetectionRetriedAfterMetricsBecomeAvailable(t *testing.T) {
+	ctx := context.Background()
+	readyPod := pod1.DeepCopy()
+	readyPod.Namespace = "default"
+	readyPod.Labels = map[string]string{"app": "vllm"}
+	readyPod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	detector := &fakeDataParallelSizeDetector{
+		sizes:    map[string]int{},
+		detected: map[string]bool{},
+		errs:     map[string]error{},
+	}
+	ds := NewDatastore(ctx, &mockEndpointFactory{}, WithDataParallelSizeDetector(detector))
+	pool := &datalayer.EndpointPool{
+		Namespace:   "default",
+		Selector:    labels.SelectorFromSet(labels.Set{"app": "vllm"}),
+		TargetPorts: []int{8000},
+	}
+	fakeClient := fake.NewClientBuilder().WithObjects(readyPod).Build()
+
+	require.ErrorIs(t, ds.PoolSet(ctx, fakeClient, pool), errDataParallelSizeDetectionPending)
+	require.Len(t, ds.PodList(AllPodsPredicate), 1)
+
+	detector.set(pod1.Name, 3, true, nil)
+	require.NoError(t, ds.PoolSet(ctx, fakeClient, pool))
+	require.Len(t, ds.PodList(AllPodsPredicate), 3)
 }
 
 func TestActivePortFiltering(t *testing.T) {

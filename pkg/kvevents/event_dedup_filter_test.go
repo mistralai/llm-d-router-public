@@ -36,12 +36,9 @@ func TestEventDedupFilter_DuplicateStoreSuppressesFirstRemove(t *testing.T) {
 		"second remove must forward every hash to the index")
 }
 
-// TestEventDedupFilter_AggregatesAcrossSources documents the pod-level intent:
-// because the index identity is rank-agnostic on current main, stores that
-// share a scope (e.g. different data-parallel ranks, both using the sentinel)
-// aggregate into one count, so the block is only evicted once every reference
-// is released.
-func TestEventDedupFilter_AggregatesAcrossSources(t *testing.T) {
+// TestEventDedupFilter_AggregatesWithinScope verifies that stores sharing an
+// eviction identity aggregate until every reference is released.
+func TestEventDedupFilter_AggregatesWithinScope(t *testing.T) {
 	f := newEventDedupFilter()
 	s := gpuScope("pod-a")
 
@@ -86,12 +83,8 @@ func TestEventDedupFilter_GroupIndependence(t *testing.T) {
 		"group 1 remove must be independent of the group 0 store")
 }
 
-// TestEventDedupFilter_DataParallelRankIndependence verifies the filter already
-// separates reference counts by data-parallel rank, so it is ready to become
-// DP-aware (see noDataParallelRank / PR #370) once the pool feeds a real rank
-// instead of the sentinel. On current main every scope uses the sentinel, so
-// this dimension is dormant in production but unit-tested here for forward
-// compatibility.
+// TestEventDedupFilter_DataParallelRankIndependence verifies that reference
+// counts for data-parallel ranks remain independent.
 func TestEventDedupFilter_DataParallelRankIndependence(t *testing.T) {
 	f := newEventDedupFilter()
 	dp0 := testScope("pod-a", "gpu", noGroupIdx, 0)

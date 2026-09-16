@@ -499,10 +499,12 @@ Helper to check if priorityRouting is enabled across chart contexts.
 {{- include "llm-d-router.validations.epp.inferenceObjectives" . }}
 {{- include "llm-d-router.validations.epp.tokenizer" . }}
 {{- include "llm-d-router.validations.epp.preferredBackends" . }}
+{{- include "llm-d-router.validations.epp.dataParallel" . }}
 {{- $isPriorityRouting := eq (include "llm-d-router.priorityRouting.enabled" .) "true" -}}
 {{- if and $isPriorityRouting (ne (include "llm-d-router.proxyMode" .) "service") -}}
 {{- fail "priorityRouting is only supported when proxy mode is set to 'service' (router.proxy.mode=service)" -}}
 {{- end -}}
+
 {{- $eppFlags := .Values.router.epp.flags | default dict -}}
 {{- if and $isPriorityRouting (hasKey $eppFlags "health-checking") -}}
 {{- $healthChecking := index $eppFlags "health-checking" -}}
@@ -512,6 +514,17 @@ Helper to check if priorityRouting is enabled across chart contexts.
 {{- if not $healthChecking -}}
 {{- fail "priorityRouting requires EPP's gRPC health service on port 9002 (router.epp.flags.health-checking cannot be false when priorityRouting.enabled=true)" -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "llm-d-router.validations.epp.dataParallel" -}}
+{{- $modelServers := .Values.router.modelServers | default dict -}}
+{{- $size := $modelServers.dataParallelSize | int -}}
+{{- if lt $size 1 -}}
+{{- fail ".Values.router.modelServers.dataParallelSize must be positive" -}}
+{{- end -}}
+{{- if and (gt $size 1) (ne (len $modelServers.targetPorts) 1) -}}
+{{- fail ".Values.router.modelServers.dataParallelSize greater than 1 requires exactly one target port" -}}
 {{- end -}}
 {{- end -}}
 
