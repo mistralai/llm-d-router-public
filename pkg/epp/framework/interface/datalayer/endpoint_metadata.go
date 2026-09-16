@@ -44,6 +44,9 @@ type EndpointMetadata struct {
 	// RankIndex is this endpoint's position in the pool's TargetPorts,
 	// identifying the pod-local rank in multi-port deployments.
 	RankIndex int
+	// DataParallelRank identifies a logical rank behind a shared serving port.
+	// Nil means the network endpoint is not split into logical ranks.
+	DataParallelRank *int
 }
 
 // String returns a string representation of the endpoint.
@@ -62,7 +65,7 @@ func (epm *EndpointMetadata) Clone() *EndpointMetadata {
 
 	clonedLabels := make(map[string]string, len(epm.Labels))
 	maps.Copy(clonedLabels, epm.Labels)
-	return &EndpointMetadata{
+	clone := &EndpointMetadata{
 		ID: types.NamespacedName{
 			Name:      epm.ID.Name,
 			Namespace: epm.ID.Namespace,
@@ -75,6 +78,11 @@ func (epm *EndpointMetadata) Clone() *EndpointMetadata {
 		Labels:      clonedLabels,
 		RankIndex:   epm.RankIndex,
 	}
+	if epm.DataParallelRank != nil {
+		rank := *epm.DataParallelRank
+		clone.DataParallelRank = &rank
+	}
+	return clone
 }
 
 // Equal reports whether two EndpointMetadata values describe the same endpoint
@@ -90,7 +98,15 @@ func (epm *EndpointMetadata) Equal(other *EndpointMetadata) bool {
 		epm.Port == other.Port &&
 		epm.MetricsHost == other.MetricsHost &&
 		epm.RankIndex == other.RankIndex &&
+		equalOptionalInt(epm.DataParallelRank, other.DataParallelRank) &&
 		maps.Equal(epm.Labels, other.Labels)
+}
+
+func equalOptionalInt(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // GetRankIndex returns the rank index of this endpoint within the pool's
