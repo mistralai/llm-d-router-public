@@ -69,6 +69,9 @@ func multiRankIndexer(tb testing.TB) (*kvcache.Indexer, []kvblock.BlockHash) {
 	if _, ok := wrapped.(kvblock.KeyWalker); !ok {
 		tb.Fatal("production decorator chain does not expose KeyWalker: benchmark would measure the fallback")
 	}
+	if _, ok := wrapped.(kvblock.CompactKeyWalker); !ok {
+		tb.Fatal("production decorator chain does not expose CompactKeyWalker")
+	}
 	return kvcache.NewIndexerForTest(&mockTokenProcessor{}, wrapped, multiRankBackends), keys
 }
 

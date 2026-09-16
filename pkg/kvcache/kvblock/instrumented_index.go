@@ -32,16 +32,44 @@ type instrumentedWalker struct {
 	walker KeyWalker
 }
 
+type instrumentedCompactWalker struct {
+	*instrumentedWalker
+	compact CompactKeyWalker
+}
+
 // NewInstrumentedIndex wraps an Index and emits metrics for Add, Evict,
 // Lookup, and WalkKeys. The wrapper is a KeyWalker exactly when next is one.
 // Read metrics count and time Lookup and WalkKeys calls; contiguous-chain
 // hit metrics are recorded by the kvcache matcher.
 func NewInstrumentedIndex(next Index) Index {
 	m := &instrumentedIndex{next: next}
+	if compact, ok := next.(CompactKeyWalker); ok {
+		return &instrumentedCompactWalker{
+			instrumentedWalker: &instrumentedWalker{instrumentedIndex: m, walker: compact},
+			compact:            compact,
+		}
+	}
 	if walker, ok := next.(KeyWalker); ok {
 		return &instrumentedWalker{instrumentedIndex: m, walker: walker}
 	}
 	return m
+}
+
+func (m *instrumentedCompactWalker) WalkCompactKeys(ctx context.Context, requestKeys []BlockHash,
+	visit func(pos int, found bool, entries []CompactEntryRef) bool,
+) error {
+	timer := prometheus.NewTimer(metrics.LookupLatency)
+	defer timer.ObserveDuration()
+	metrics.LookupRequests.Inc()
+	return m.compact.WalkCompactKeys(ctx, requestKeys, visit)
+}
+
+func (m *instrumentedCompactWalker) PodName(ordinal uint32) string {
+	return m.compact.PodName(ordinal)
+}
+
+func (m *instrumentedCompactWalker) TierName(ordinal uint32) string {
+	return m.compact.TierName(ordinal)
 }
 
 func (m *instrumentedIndex) Add(ctx context.Context, engineKeys, requestKeys []BlockHash, entries []PodEntry) error {

@@ -30,7 +30,7 @@ func TestWalkKeysUnlocksAfterPanic(t *testing.T) {
 	keys := []BlockHash{1}
 	first := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	require.NoError(t, index.Add(ctx, nil, keys, []PodEntry{first}))
-	pc, found := index.data.Peek(keys[0])
+	pc, found := index.data.peek(keys[0])
 	require.True(t, found)
 
 	require.PanicsWithValue(t, "visit failed", func() {

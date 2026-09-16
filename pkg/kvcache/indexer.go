@@ -53,10 +53,11 @@ func NewDefaultConfig() (*Config, error) {
 type Indexer struct {
 	config *Config
 
-	tokenProcessor kvblock.TokenProcessor // turns tokens to kv block keys
-	kvBlockIndex   kvblock.Index          // looks up pods for block keys
-	keyWalker      kvblock.KeyWalker      // kvBlockIndex's walk capability; nil without one
-	tierWeights    map[string]float64     // device tier -> weight for the prefix matcher
+	tokenProcessor kvblock.TokenProcessor   // turns tokens to kv block keys
+	kvBlockIndex   kvblock.Index            // looks up pods for block keys
+	keyWalker      kvblock.KeyWalker        // kvBlockIndex's walk capability; nil without one
+	compactWalker  kvblock.CompactKeyWalker // compact walk capability; nil without one
+	tierWeights    map[string]float64       // device tier -> weight for the prefix matcher
 	// recordHits enables the contiguous-chain hit metrics, under the same
 	// option that instruments the index.
 	recordHits bool
@@ -100,10 +101,12 @@ func newIndexer(tokenProcessor kvblock.TokenProcessor, kvBlockIndex kvblock.Inde
 	backends []*KVCacheBackendConfig, recordHits bool,
 ) *Indexer {
 	keyWalker, _ := kvBlockIndex.(kvblock.KeyWalker)
+	compactWalker, _ := kvBlockIndex.(kvblock.CompactKeyWalker)
 	return &Indexer{
 		tokenProcessor: tokenProcessor,
 		kvBlockIndex:   kvBlockIndex,
 		keyWalker:      keyWalker,
+		compactWalker:  compactWalker,
 		tierWeights:    tierWeightsFromBackends(backends),
 		recordHits:     recordHits,
 	}
