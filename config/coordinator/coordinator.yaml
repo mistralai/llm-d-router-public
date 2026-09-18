@@ -283,6 +283,7 @@ pipeline:
       #   use_openai_format: true   # see notes above
       #   ec_connector: ec-nixl     # overrides pipeline.ec_connector
       #   kv_connector: kv-nixl     # overrides pipeline.kv_connector
+      #   reuse_prompt_token_ids: false  # text chat; see pd-chat-token-reuse.yaml
 
     # -------------------------------------------------------------------
     # decode: streams the completion back to the client. Last step.
