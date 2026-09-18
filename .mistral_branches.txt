@@ -22,3 +22,4 @@ lfm/v1.0.2-rebased-upstream-dp-kvevents               # shared-port multi-DP rou
 lfm/v1.0.2-rebased-upstream-objective-key             # resolve inference objectives after request-header plugins
 lfm/v1.0.2-rebased-upstream-coordinator-revision      # revision forwarding across coordinator phases
 lfm/v1.0.2-rebased-upstream-rawbody-release           # release request RawBody after Envoy forwarding
+lfm/kda-ancestry-mapping                              # preserve hybrid-cache parent mappings without routing on Mamba residency
