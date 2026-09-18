@@ -1015,17 +1015,18 @@ func TestHMAGroupMetadataLearnedForRejectedKind(t *testing.T) {
 
 func TestHMAGroupKindFilter(t *testing.T) {
 	tests := []struct {
-		name    string
-		kind    KVCacheSpecKind
-		allowed bool
+		name            string
+		kind            KVCacheSpecKind
+		allowed         bool
+		ancestryAllowed bool
 	}{
-		{name: "full attention", kind: KVCacheSpecKindFullAttention, allowed: true},
-		{name: "MLA attention", kind: KVCacheSpecKindMlaAttention, allowed: true},
-		{name: "sink full attention", kind: KVCacheSpecKindSinkFull, allowed: true},
-		{name: "sliding window", kind: KVCacheSpecKindSlidingWindow},
-		{name: "sliding window MLA", kind: KVCacheSpecKindSlidingWindowMla},
-		{name: "mamba", kind: KVCacheSpecKindMamba},
-		{name: "chunked local attention", kind: KVCacheSpecKindChunkedLocal},
+		{name: "full attention", kind: KVCacheSpecKindFullAttention, allowed: true, ancestryAllowed: true},
+		{name: "MLA attention", kind: KVCacheSpecKindMlaAttention, allowed: true, ancestryAllowed: true},
+		{name: "sink full attention", kind: KVCacheSpecKindSinkFull, allowed: true, ancestryAllowed: true},
+		{name: "sliding window", kind: KVCacheSpecKindSlidingWindow, ancestryAllowed: true},
+		{name: "sliding window MLA", kind: KVCacheSpecKindSlidingWindowMla, ancestryAllowed: true},
+		{name: "mamba", kind: KVCacheSpecKindMamba, ancestryAllowed: true},
+		{name: "chunked local attention", kind: KVCacheSpecKindChunkedLocal, ancestryAllowed: true},
 		{name: "encoder only attention", kind: KVCacheSpecKindEncoder},
 		{name: "cross attention", kind: KVCacheSpecKindCross},
 		{name: "unknown", kind: KVCacheSpecKindUnknown},
@@ -1061,6 +1062,14 @@ func TestHMAGroupKindFilter(t *testing.T) {
 					assert.Equal(t, kvblock.GroupID(groupIdx), result[key][0].GroupIdx)
 				} else {
 					assert.Empty(t, result[key])
+				}
+			}
+			for _, engineKey := range engineKeys {
+				_, err := idx.GetRequestKey(ctx, kvblock.BlockHash(engineKey))
+				if tt.ancestryAllowed {
+					require.NoError(t, err)
+				} else {
+					assert.Error(t, err)
 				}
 			}
 		})
@@ -1177,7 +1186,7 @@ func TestHMAGroupFilterIgnoresRejectedGroupRemoval(t *testing.T) {
 			BlockHashes:     makeEngineKeys(1, 980),
 			Tokens:          makeTokens(64),
 			GroupIdx:        &groupIdx,
-			KVCacheSpecKind: KVCacheSpecKindSlidingWindowMla,
+			KVCacheSpecKind: KVCacheSpecKindCross,
 			BlockSize:       16,
 		},
 	}}, "pod-hma", "test-model")
