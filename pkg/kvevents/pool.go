@@ -60,6 +60,14 @@ func isPrefixIndexableSpecKind(kind KVCacheSpecKind) bool {
 	}
 }
 
+func isAncestryIndexableSpecKind(kind KVCacheSpecKind) bool {
+	return isPrefixIndexableSpecKind(kind) || kind == KVCacheSpecKindMamba
+}
+
+func blockStoredEventHasRoutableResidency(ev *BlockStoredEvent) bool {
+	return ev.GroupIdx == nil || isPrefixIndexableSpecKind(ev.KVCacheSpecKind)
+}
+
 func cacheKindLabel(kind KVCacheSpecKind) string {
 	if kind == "" {
 		return string(KVCacheSpecKindUnknown)
@@ -71,7 +79,7 @@ func blockStoredEventDigestible(ev *BlockStoredEvent) (bool, string) {
 	if ev.GroupIdx == nil {
 		return true, ""
 	}
-	if !isPrefixIndexableSpecKind(ev.KVCacheSpecKind) {
+	if !isAncestryIndexableSpecKind(ev.KVCacheSpecKind) {
 		return false, "unsupported_cache_kind"
 	}
 	if len(ev.Tokens) == 0 {
@@ -681,15 +689,23 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			}
 
 			if len(requestKeys) == 0 {
+				if !blockStoredEventHasRoutableResidency(ev) {
+					continue
+				}
 				if p.handleDeviceTierUpdate(ctx, ev.Tokens, engineKeys, podEntries, podIdentifier, deviceTier) {
 					p.dedup.trackStore(storeScope, ev.BlockHashes)
 				}
 				continue
 			}
 
-			// Index.Add infers the engine->request mapping from the ratio of
-			// len(engineKeys) to len(requestKeys) (1:1, many:1, or 1:many).
-			if err := p.index.Add(ctx, engineKeys, requestKeys, podEntries); err != nil {
+			// Index.Add and AddMapping infer the engine->request mapping from the
+			// ratio of len(engineKeys) to len(requestKeys) (1:1, many:1, or 1:many).
+			if blockStoredEventHasRoutableResidency(ev) {
+				err = p.index.Add(ctx, engineKeys, requestKeys, podEntries)
+			} else {
+				err = p.index.AddMapping(ctx, engineKeys, requestKeys)
+			}
+			if err != nil {
 				debugLogger.Error(err, "Failed to add event to index",
 					"podIdentifier", podIdentifier, "event", ev)
 				continue
@@ -701,7 +717,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			if ev.GroupIdx != nil {
 				groupIdx := kvblock.GroupID(*ev.GroupIdx)
 				meta, found := p.groupCatalog.Get(podIdentifier, groupIdx)
-				if !found || !isPrefixIndexableSpecKind(KVCacheSpecKind(meta.Kind)) {
+				if !found || !isAncestryIndexableSpecKind(KVCacheSpecKind(meta.Kind)) {
 					reason := "unsupported_cache_kind"
 					if !found {
 						reason = "unknown_group"

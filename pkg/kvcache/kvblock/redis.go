@@ -188,12 +188,7 @@ func (r *RedisIndex) Add(ctx context.Context, engineKeys, requestKeys []BlockHas
 	//   many:1 (4 eng, 1 req) -> E0->R0, E1->R0, E2->R0, E3->R0
 	//   1:many (1 eng, 4 req) -> E0->[R0, R1, R2, R3]
 	if engineKeys != nil {
-		mappings := engineToRequestMapping(engineKeys, requestKeys)
-		for ek, rks := range mappings {
-			for j, rk := range rks {
-				pipe.ZAdd(ctx, redisEngineKey(ek), redis.Z{Score: float64(j), Member: rk.String()})
-			}
-		}
+		r.queueMappings(ctx, pipe, engineKeys, requestKeys)
 	}
 
 	// Store requestKey -> PodEntry mappings for all request keys.
@@ -213,6 +208,35 @@ func (r *RedisIndex) Add(ctx context.Context, engineKeys, requestKeys []BlockHas
 	}
 
 	return nil
+}
+
+// AddMapping stores engine-to-request key mappings without adding pod residency.
+func (r *RedisIndex) AddMapping(ctx context.Context, engineKeys, requestKeys []BlockHash) error {
+	if err := validateMappingKeys(engineKeys, requestKeys); err != nil {
+		return err
+	}
+
+	pipe := r.RedisClient.Pipeline()
+	r.queueMappings(ctx, pipe, engineKeys, requestKeys)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to add mappings to Redis: %w", err)
+	}
+	return nil
+}
+
+func (r *RedisIndex) queueMappings(
+	ctx context.Context,
+	pipe redis.Pipeliner,
+	engineKeys, requestKeys []BlockHash,
+) {
+	for engineKey, mappedRequestKeys := range engineToRequestMapping(engineKeys, requestKeys) {
+		for index, requestKey := range mappedRequestKeys {
+			pipe.ZAdd(ctx, redisEngineKey(engineKey), redis.Z{
+				Score:  float64(index),
+				Member: requestKey.String(),
+			})
+		}
+	}
 }
 
 // Evict removes a key and its associated pod entries from the index backend.

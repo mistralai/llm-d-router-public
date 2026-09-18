@@ -362,10 +362,7 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	//   many:1 (4 eng, 1 req) -> E0->R0, E1->R0, E2->R0, E3->R0
 	//   1:many (1 eng, 4 req) -> E0->[R0, R1, R2, R3]
 	if engineKeys != nil {
-		mappings := engineToRequestMapping(engineKeys, requestKeys)
-		for ek, rks := range mappings {
-			m.engineToRequestKeys.Add(ek, rks)
-		}
+		m.addMappings(engineKeys, requestKeys)
 	}
 
 	// Store requestKey -> PodCache mappings for all request keys.
@@ -403,6 +400,21 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	}
 
 	return nil
+}
+
+// AddMapping stores engine-to-request key mappings without adding pod residency.
+func (m *InMemoryIndex) AddMapping(_ context.Context, engineKeys, requestKeys []BlockHash) error {
+	if err := validateMappingKeys(engineKeys, requestKeys); err != nil {
+		return err
+	}
+	m.addMappings(engineKeys, requestKeys)
+	return nil
+}
+
+func (m *InMemoryIndex) addMappings(engineKeys, requestKeys []BlockHash) {
+	for engineKey, mappedRequestKeys := range engineToRequestMapping(engineKeys, requestKeys) {
+		m.engineToRequestKeys.Add(engineKey, mappedRequestKeys)
+	}
 }
 
 // Evict removes a key and its associated pod entries from the index backend.
