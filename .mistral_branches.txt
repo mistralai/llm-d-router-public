@@ -22,3 +22,4 @@ lfm/v1.0.2-rebased-upstream-dp-kvevents               # shared-port multi-DP rou
 lfm/v1.0.2-rebased-upstream-objective-key             # resolve inference objectives after request-header plugins
 lfm/v1.0.2-rebased-upstream-coordinator-revision      # revision forwarding across coordinator phases
 lfm/v1.0.2-rebased-upstream-rawbody-release           # release request RawBody after Envoy forwarding
+benjamin/v1.0.2-prospective-concurrency-admission      # account for incoming token load in concurrency filtering (upstream: https://github.com/llm-d/llm-d-router/pull/2910)
