@@ -61,7 +61,18 @@ func isPrefixIndexableSpecKind(kind KVCacheSpecKind) bool {
 }
 
 func isAncestryIndexableSpecKind(kind KVCacheSpecKind) bool {
-	return isPrefixIndexableSpecKind(kind) || kind == KVCacheSpecKindMamba
+	switch kind {
+	case KVCacheSpecKindFullAttention,
+		KVCacheSpecKindMlaAttention,
+		KVCacheSpecKindSinkFull,
+		KVCacheSpecKindSlidingWindow,
+		KVCacheSpecKindSlidingWindowMla,
+		KVCacheSpecKindMamba,
+		KVCacheSpecKindChunkedLocal:
+		return true
+	default:
+		return false
+	}
 }
 
 func blockStoredEventHasRoutableResidency(ev *BlockStoredEvent) bool {
