@@ -132,6 +132,10 @@ type Index interface {
 	//   many:1 (engine=16, canonical=64) -> 16 eng, 4 req -> E0..E3->R0, E4..E7->R1, ...
 	//   1:many (engine=128, canonical=64) -> 2 eng, 4 req -> E0->[R0,R1], E1->[R2,R3]
 	Add(ctx context.Context, engineKeys, requestKeys []BlockHash, entries []PodEntry) error
+	// AddMapping stores engineKey -> requestKey mappings without adding pod
+	// residency. It is used for cache groups that participate in the engine's
+	// parent hash chain but cannot be used for prefix-cache routing.
+	AddMapping(ctx context.Context, engineKeys, requestKeys []BlockHash) error
 	// Evict removes a key and its associated pod entries from the index backend.
 	// keyType indicates whether the key is an EngineKey (requires engine→request lookup)
 	// or a RequestKey (used directly).
@@ -281,4 +285,14 @@ func engineToRequestMapping(engineKeys, requestKeys []BlockHash) map[BlockHash][
 		mappings[ek] = append(mappings[ek], rk)
 	}
 	return mappings
+}
+
+func validateMappingKeys(engineKeys, requestKeys []BlockHash) error {
+	if len(engineKeys) == 0 {
+		return fmt.Errorf("no engine keys provided for adding mapping")
+	}
+	if len(requestKeys) == 0 {
+		return fmt.Errorf("no request keys provided for adding mapping")
+	}
+	return nil
 }

@@ -79,6 +79,10 @@ func (f *fakeKVBlockIndex) Add(ctx context.Context, prevKeys, keys []kvblock.Blo
 	return nil
 }
 
+func (f *fakeKVBlockIndex) AddMapping(_ context.Context, _, _ []kvblock.BlockHash) error {
+	return nil
+}
+
 func (f *fakeKVBlockIndex) Evict(_ context.Context, _ kvblock.BlockHash, _ kvblock.KeyType, _ []kvblock.PodEntry) error {
 	return nil
 }

@@ -95,6 +95,25 @@ func (t *tracedIndex) Add(ctx context.Context, engineKeys, requestKeys []BlockHa
 	return nil
 }
 
+func (t *tracedIndex) AddMapping(ctx context.Context, engineKeys, requestKeys []BlockHash) error {
+	tracer := tracing.Tracer(TracerScope)
+	ctx, span := tracer.Start(ctx, "index_add_mapping",
+		trace.WithSpanKind(trace.SpanKindInternal),
+	)
+	defer span.End()
+
+	span.SetAttributes(
+		semconv.LLMDKVCacheIndexAddEngineKeyCount(len(engineKeys)),
+		semconv.LLMDKVCacheIndexAddRequestKeyCount(len(requestKeys)),
+	)
+
+	if err := t.next.AddMapping(ctx, engineKeys, requestKeys); err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+	return nil
+}
+
 func (t *tracedIndex) Evict(ctx context.Context, key BlockHash, keyType KeyType, entries []PodEntry) error {
 	tracer := tracing.Tracer(TracerScope)
 	ctx, span := tracer.Start(ctx, "index_evict",

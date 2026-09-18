@@ -293,6 +293,10 @@ func (f *failingIndex) Add(context.Context, []kvblock.BlockHash, []kvblock.Block
 	return f.err
 }
 
+func (f *failingIndex) AddMapping(context.Context, []kvblock.BlockHash, []kvblock.BlockHash) error {
+	return f.err
+}
+
 func (f *failingIndex) Evict(context.Context, kvblock.BlockHash, kvblock.KeyType, []kvblock.PodEntry) error {
 	return f.err
 }

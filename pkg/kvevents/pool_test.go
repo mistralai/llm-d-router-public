@@ -1067,6 +1067,81 @@ func TestHMAGroupKindFilter(t *testing.T) {
 	}
 }
 
+func TestMambaEventProvidesAncestryWithoutResidency(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tokenProcessor := newTestPool(t, 16)
+	mambaGroupIdx := 2
+	mlaGroupIdx := 3
+	tokens := makeTokens(32)
+
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+		&BlockStoredEvent{
+			BlockHashes:     []uint64{100},
+			Tokens:          tokens[:16],
+			ParentHash:      0,
+			BlockSize:       16,
+			GroupIdx:        &mambaGroupIdx,
+			KVCacheSpecKind: KVCacheSpecKindMamba,
+		},
+		&BlockStoredEvent{
+			BlockHashes:     []uint64{200},
+			Tokens:          tokens[16:],
+			ParentHash:      100,
+			BlockSize:       16,
+			GroupIdx:        &mlaGroupIdx,
+			KVCacheSpecKind: KVCacheSpecKindMlaAttention,
+		},
+	}}, "pod-hma", "test-model")
+
+	mambaKeys, err := tokenProcessor.TokensToKVBlockKeys(
+		kvblock.EmptyBlockHash, tokens[:16], "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, mambaKeys, 1)
+
+	mlaKeys, err := tokenProcessor.TokensToKVBlockKeys(
+		mambaKeys[0], tokens[16:], "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, mlaKeys, 1)
+
+	mambaRequestKey, err := idx.GetRequestKey(ctx, kvblock.BlockHash(100))
+	require.NoError(t, err)
+	assert.Equal(t, mambaKeys[0], mambaRequestKey)
+
+	mlaRequestKey, err := idx.GetRequestKey(ctx, kvblock.BlockHash(200))
+	require.NoError(t, err)
+	assert.Equal(t, mlaKeys[0], mlaRequestKey)
+
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+		&BlockStoredEvent{
+			BlockHashes:     []uint64{100},
+			BlockSize:       16,
+			DeviceTier:      "CPU",
+			GroupIdx:        &mambaGroupIdx,
+			KVCacheSpecKind: KVCacheSpecKindMamba,
+		},
+	}}, "pod-hma", "test-model")
+
+	result, err := idx.Lookup(ctx, []kvblock.BlockHash{mambaKeys[0], mlaKeys[0]}, nil)
+	require.NoError(t, err)
+	assert.Empty(t, result[mambaKeys[0]], "Mamba ancestry must not advertise pod residency")
+	require.Len(t, result[mlaKeys[0]], 1)
+	assert.Equal(t, kvblock.GroupID(mlaGroupIdx), result[mlaKeys[0]][0].GroupIdx)
+
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+		&BlockRemovedEvent{
+			BlockHashes: []uint64{100},
+			DeviceTier:  "GPU",
+			GroupIdx:    &mambaGroupIdx,
+		},
+	}}, "pod-hma", "test-model")
+
+	_, err = idx.GetRequestKey(ctx, kvblock.BlockHash(100))
+	assert.Error(t, err, "Mamba mapping should be removed after its block is removed")
+	mlaRequestKey, err = idx.GetRequestKey(ctx, kvblock.BlockHash(200))
+	require.NoError(t, err)
+	assert.Equal(t, mlaKeys[0], mlaRequestKey)
+}
+
 func TestHMAGroupFilterRejectsSparseFullAttentionBeforeParentLookup(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 	pool, idx, _ := newTestPool(t, 16)

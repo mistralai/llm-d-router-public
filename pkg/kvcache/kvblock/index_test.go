@@ -109,6 +109,11 @@ func testCommonIndexBehavior(t *testing.T, indexFactory func(t *testing.T) Index
 		testAddMappingOneToMany(t, ctx, index)
 	})
 
+	t.Run("AddMappingWithoutResidency", func(t *testing.T) {
+		index := indexFactory(t)
+		testAddMappingWithoutResidency(t, ctx, index)
+	})
+
 	t.Run("EvictOneToOne", func(t *testing.T) {
 		index := indexFactory(t)
 		testEvictOneToOne(t, ctx, index)
@@ -893,6 +898,33 @@ func testAddMappingOneToMany(t *testing.T, ctx context.Context, index Index) {
 	for _, rk := range requestKeys {
 		assert.Empty(t, result[rk], "request key %d should be empty after eviction", rk)
 	}
+}
+
+func testAddMappingWithoutResidency(t *testing.T, ctx context.Context, index Index) {
+	t.Helper()
+	engineKeys := []BlockHash{600}
+	requestKeys := []BlockHash{6000, 6001}
+
+	err := index.AddMapping(ctx, engineKeys, requestKeys)
+	require.NoError(t, err)
+
+	requestKey, err := index.GetRequestKey(ctx, engineKeys[0])
+	require.NoError(t, err)
+	assert.Equal(t, requestKeys[len(requestKeys)-1], requestKey)
+
+	result, err := index.Lookup(ctx, requestKeys, nil)
+	require.NoError(t, err)
+	for _, key := range requestKeys {
+		assert.Empty(t, result[key], "mapping-only keys must not advertise pod residency")
+	}
+
+	err = index.Evict(ctx, engineKeys[0], EngineKey, []PodEntry{{
+		PodIdentifier: "pod-mapping-only",
+		DeviceTier:    "gpu",
+	}})
+	require.NoError(t, err)
+	_, err = index.GetRequestKey(ctx, engineKeys[0])
+	assert.Error(t, err, "mapping should be removed when it has no pod residency")
 }
 
 // testEvictOneToOne verifies that evicting an engine key in 1:1 mode removes

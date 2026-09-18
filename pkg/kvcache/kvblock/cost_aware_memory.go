@@ -106,8 +106,9 @@ func NewCostAwareMemoryIndex(cfg *CostAwareMemoryIndexConfig) (*CostAwareMemoryI
 //   - data: requestKey -> pod cache (cost-bound by Ristretto MaxCost)
 //   - requestKeys: engineKey -> requestKey (LRU to cap mapping size)
 //
-// Add always writes both maps; Evict removes pods and, when empty, removes
-// both the requestKey entry and its engineKey mapping to avoid dangling keys.
+// Add writes both maps when engine keys are present; AddMapping writes only the
+// engine-to-request map. Evict removes pods and, when empty, removes both the
+// requestKey entry and its engineKey mapping to avoid dangling keys.
 type CostAwareMemoryIndex struct {
 	// data holds the mapping of request keys to sets of pod identifiers.
 	data *ristretto.Cache[string, *CostPodCache]
@@ -252,10 +253,7 @@ func (m *CostAwareMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys 
 	//   many:1 (4 eng, 1 req) -> E0->R0, E1->R0, E2->R0, E3->R0
 	//   1:many (1 eng, 4 req) -> E0->[R0, R1, R2, R3]
 	if engineKeys != nil {
-		mappings := engineToRequestMapping(engineKeys, requestKeys)
-		for ek, rks := range mappings {
-			m.requestKeys.Add(ek, rks)
-		}
+		m.addMappings(engineKeys, requestKeys)
 	}
 
 	// Store requestKey -> PodCache mappings for all request keys.
@@ -278,6 +276,24 @@ func (m *CostAwareMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys 
 	}
 	m.data.Wait()
 	return nil
+}
+
+// AddMapping stores engine-to-request key mappings without adding pod residency.
+func (m *CostAwareMemoryIndex) AddMapping(_ context.Context, engineKeys, requestKeys []BlockHash) error {
+	if err := validateMappingKeys(engineKeys, requestKeys); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.addMappings(engineKeys, requestKeys)
+	return nil
+}
+
+func (m *CostAwareMemoryIndex) addMappings(engineKeys, requestKeys []BlockHash) {
+	for engineKey, mappedRequestKeys := range engineToRequestMapping(engineKeys, requestKeys) {
+		m.requestKeys.Add(engineKey, mappedRequestKeys)
+	}
 }
 
 func (m *CostAwareMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHash,
