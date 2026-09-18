@@ -1,0 +1,19 @@
+# Requires the chat prompt reuse extension described in
+# docs/coordinator_architecture.md#prefill-owned-tokenization-for-text-chat.
+log_level: 2
+
+server:
+  listen_addr: ":8080"
+
+gateway:
+  address: "http://inference-gateway:80"
+  timeout: 120s
+
+pipeline:
+  use_openai_format: true
+  kv_connector: kv-nixl
+  steps:
+    - type: prefill
+      params:
+        reuse_prompt_token_ids: true
+    - type: decode
