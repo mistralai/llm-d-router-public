@@ -649,6 +649,74 @@ func TestZMQSubscriber_ProactiveReplayRebuildsServingEndpoint(t *testing.T) {
 	}, 5*time.Second, 50*time.Millisecond)
 }
 
+func TestZMQSubscriber_RestoredCheckpointResumesReplay(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const (
+		podIdentifier  = "test-pod"
+		sourceEndpoint = "10.0.0.1:8000"
+		fingerprint    = "test-config"
+	)
+	pubEndpoint := availableEndpoint(t, ctx)
+	streamID := podIdentifier + "\n" + sourceEndpoint + "\n" + pubEndpoint
+
+	sourceIndex, err := kvblock.NewIndex(ctx, kvblock.DefaultIndexConfig())
+	require.NoError(t, err)
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(kvblock.DefaultTokenProcessorConfig())
+	require.NoError(t, err)
+	sourcePool, err := kvevents.NewPool(
+		kvevents.DefaultConfig(), sourceIndex, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+	require.NoError(t, sourcePool.EnableCheckpointing())
+	sourcePool.Start(ctx)
+	sourcePool.AddTask(&kvevents.RawMessage{
+		Topic:          "kv@10.0.0.1:8000@TestModel",
+		Sequence:       23,
+		Payload:        buildDistinctBlockStoredPayload(t, 100),
+		SourceEndpoint: sourceEndpoint,
+		StreamID:       streamID,
+	})
+	require.Eventually(t, func() bool {
+		_, lookupErr := sourceIndex.GetRequestKey(ctx, kvblock.BlockHash(100))
+		return lookupErr == nil
+	}, 5*time.Second, 50*time.Millisecond)
+	checkpoint, _, err := sourcePool.MarshalCheckpoint(fingerprint)
+	require.NoError(t, err)
+	sourcePool.Shutdown(ctx)
+
+	restoredIndex, err := kvblock.NewIndex(ctx, kvblock.DefaultIndexConfig())
+	require.NoError(t, err)
+	restoredPool, err := kvevents.NewPool(
+		kvevents.DefaultConfig(), restoredIndex, tokenProcessor, engineadapter.NewVLLMAdapter())
+	require.NoError(t, err)
+	require.NoError(t, restoredPool.RestoreCheckpoint(checkpoint, fingerprint))
+	restoredPool.Start(ctx)
+
+	replayEndpoint := availableEndpoint(t, ctx)
+	buffer := startReplayBuffer(t, ctx, replayEndpoint)
+	buffer.set(replayMessage{seq: 24, payload: buildDistinctBlockStoredPayload(t, 200)})
+	manager := kvevents.NewSubscriberManager(restoredPool)
+	t.Cleanup(func() {
+		manager.Shutdown(ctx)
+		restoredPool.Shutdown(ctx)
+	})
+	require.NoError(t, manager.EnsureSubscriber(
+		ctx, podIdentifier, sourceEndpoint, pubEndpoint, replayEndpoint, "kv@", false))
+
+	require.Eventually(t, func() bool {
+		return buffer.lastStartSeq.Load() == 24
+	}, 5*time.Second, 50*time.Millisecond)
+	require.Eventually(t, func() bool {
+		_, lookupErr := restoredIndex.GetRequestKey(ctx, kvblock.BlockHash(200))
+		return lookupErr == nil
+	}, 5*time.Second, 50*time.Millisecond)
+	require.Eventually(t, func() bool {
+		_, _, checkpointErr := restoredPool.MarshalCheckpoint(fingerprint)
+		return checkpointErr == nil
+	}, 5*time.Second, 50*time.Millisecond)
+}
+
 func TestZMQSubscriber_GapReplayDoesNotDuplicateTriggeringEvent(t *testing.T) {
 	h := newReplayHarness(t, nil, false)
 	h.send(t, 0, buildDistinctBlockStoredPayload(t, 100))

@@ -52,6 +52,7 @@ type zmqSubscriber struct {
 	replayEndpoint string
 	remote         bool
 	topicFilter    string
+	streamID       string
 	queueMu        sync.Mutex
 	retired        bool
 
@@ -69,7 +70,8 @@ func newZMQSubscriber(
 	podIdentifier, sourceEndpoint, endpoint, replayEndpoint, topicFilter string,
 	remote bool,
 ) *zmqSubscriber {
-	return &zmqSubscriber{
+	streamID := podIdentifier + "\n" + sourceEndpoint + "\n" + endpoint
+	subscriber := &zmqSubscriber{
 		pool:           pool,
 		podIdentifier:  podIdentifier,
 		sourceEndpoint: sourceEndpoint,
@@ -77,7 +79,18 @@ func newZMQSubscriber(
 		replayEndpoint: replayEndpoint,
 		remote:         remote,
 		topicFilter:    topicFilter,
+		streamID:       streamID,
 	}
+	if seq, ok := pool.lastConsumedSequence(streamID); ok {
+		subscriber.lastSeq = seq
+		subscriber.hasLastSeq = true
+		subscriber.lastLiveSeq = seq
+		subscriber.hasLastLiveSeq = true
+	}
+	if replayEndpoint != "" {
+		pool.markReplayInProgress(streamID)
+	}
+	return subscriber
 }
 
 // parseEventFrame validates and extracts a live or replayed event frame.
@@ -154,10 +167,15 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 	}
 
 	// Rebuild the index from buffered events without waiting for live traffic.
-	if z.replayEndpoint != "" && !z.hasLastSeq && z.canAttemptReplay() {
+	if z.replayEndpoint != "" && z.hasLastSeq && z.canAttemptReplay() {
+		logger.Info("Catching up restored KV-event stream",
+			"endpoint", z.endpoint, "replayEndpoint", z.replayEndpoint,
+			"lastAppliedSeq", z.lastSeq)
+		z.requestReplay(ctx, z.lastSeq+1, true)
+	} else if z.replayEndpoint != "" && !z.hasLastSeq && z.canAttemptReplay() {
 		logger.Info("Requesting proactive replay on connect",
 			"endpoint", z.endpoint, "replayEndpoint", z.replayEndpoint)
-		z.requestReplay(ctx, 0)
+		z.requestReplay(ctx, 0, true)
 	}
 
 	debugLogger := logger.V(logging.DEBUG)
@@ -194,7 +212,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			z.hasLastSeq = false
 			z.lastReplayFailure = time.Time{}
 			replayAttempted = true
-			z.requestReplay(ctx, 0)
+			z.requestReplay(ctx, 0, true)
 		}
 
 		if z.hasLastLiveSeq && seq == z.lastLiveSeq {
@@ -219,7 +237,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 				"lastSeq", z.lastSeq, "currentSeq", seq, "missed", missed,
 				"endpoint", z.endpoint)
 			replayAttempted = true
-			if !z.requestReplay(ctx, z.lastSeq+1) {
+			if !z.requestReplay(ctx, z.lastSeq+1, false) {
 				continue
 			}
 		}
@@ -230,7 +248,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			}
 			logger.Info("Joining mid-stream, requesting full replay",
 				"currentSeq", seq, "endpoint", z.endpoint)
-			if !z.requestReplay(ctx, 0) {
+			if !z.requestReplay(ctx, 0, true) {
 				continue
 			}
 		}
@@ -276,6 +294,7 @@ func (z *zmqSubscriber) addTask(ctx context.Context, topic string, seq uint64, p
 		Sequence:       seq,
 		Payload:        payload,
 		SourceEndpoint: z.sourceEndpoint,
+		StreamID:       z.streamID,
 	}
 	// carried is bound inside the branch on purpose. Taking &sc directly makes
 	// sc escape, so it heap-allocates on every message including the ones the
@@ -297,7 +316,7 @@ func (z *zmqSubscriber) enqueue(msg *RawMessage) {
 }
 
 func (z *zmqSubscriber) resetForSource(topic string) {
-	z.enqueue(&RawMessage{Topic: topic, SourceEndpoint: z.sourceEndpoint, reset: true})
+	z.enqueue(&RawMessage{Topic: topic, SourceEndpoint: z.sourceEndpoint, StreamID: z.streamID, reset: true})
 }
 
 // retire prevents any later messages from this subscriber from being queued.
@@ -308,8 +327,8 @@ func (z *zmqSubscriber) retire(resetSource bool) {
 	z.queueMu.Lock()
 	defer z.queueMu.Unlock()
 	z.retired = true
-	if resetSource && z.sourceEndpoint != "" {
-		z.pool.resetForSource(z.topicFilter, z.sourceEndpoint)
+	if resetSource || (z.endpoint != "" && z.pool.checkpointingEnabled()) {
+		z.pool.retireStream(z.topicFilter, z.sourceEndpoint, z.streamID, resetSource)
 	}
 }
 
@@ -325,9 +344,10 @@ func (z *zmqSubscriber) invalidateReplay(topic string) {
 }
 
 // requestReplay requests buffered events starting from startSeq.
-func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool {
+func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64, emptyOK bool) bool {
 	logger := log.FromContext(ctx).WithName("zmq-replay")
 	debugLogger := logger.V(logging.DEBUG)
+	z.pool.markReplayInProgress(z.streamID)
 
 	replayCtx, cancel := context.WithTimeout(ctx, replayTimeout)
 	defer cancel()
@@ -444,7 +464,7 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 			return false
 		}
 		if complete {
-			if replayed == 0 && startSeq > 0 {
+			if replayed == 0 && startSeq > 0 && !emptyOK {
 				err := fmt.Errorf("incomplete replay: sequence %d was not available", startSeq)
 				z.invalidateReplay(z.topicFilter)
 				metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-incomplete").Inc()
@@ -457,6 +477,11 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 			logger.Info("Replay complete", "replayed", replayed,
 				"attempts", attempt, "startSeq", startSeq,
 				"replayEndpoint", z.replayEndpoint)
+			z.enqueue(&RawMessage{
+				SourceEndpoint: z.sourceEndpoint,
+				StreamID:       z.streamID,
+				replayComplete: true,
+			})
 			return true
 		}
 		if replayCtx.Err() != nil {
