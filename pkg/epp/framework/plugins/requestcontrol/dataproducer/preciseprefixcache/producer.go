@@ -18,6 +18,8 @@ package preciseprefixcache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,6 +52,24 @@ import (
 // PluginType is the registered type name of the precise-prefix-cache-producer.
 const PluginType = "precise-prefix-cache-producer"
 
+const (
+	defaultCheckpointInterval = 5 * time.Second
+	defaultCheckpointTTL      = 24 * time.Hour
+)
+
+// CheckpointConfig configures periodic durable snapshots of the precise index.
+type CheckpointConfig struct {
+	// StorePluginRef names the plugin that persists checkpoint bytes.
+	StorePluginRef string `json:"storePluginRef" pluginRef:""`
+	// Key namespaces this producer's checkpoint. The producer name is used
+	// when Key is empty.
+	Key string `json:"key"`
+	// Interval is the checkpoint cadence. The default is 5 seconds.
+	Interval string `json:"interval"`
+	// TTL is the checkpoint lifetime in the store. The default is 24 hours.
+	TTL string `json:"ttl"`
+}
+
 // PluginConfig configures the precise-prefix-cache-producer.
 type PluginConfig struct {
 	TokenProcessorConfig *kvblock.TokenProcessorConfig `json:"tokenProcessorConfig"`
@@ -63,6 +83,20 @@ type PluginConfig struct {
 	// eviction. Go duration string; defaults to defaultSpeculativeTTL when
 	// empty.
 	SpeculativeTTL string `json:"speculativeTTL"`
+	// Checkpoint persists confirmed index and KV-event stream state. The store
+	// plugin must implement the checkpointStore methods.
+	Checkpoint *CheckpointConfig `json:"checkpoint,omitempty"`
+}
+
+type checkpointStore interface {
+	SaveCheckpoint(context.Context, string, []byte, time.Duration) error
+	LoadCheckpoint(context.Context, string) ([]byte, bool, error)
+}
+
+type resolvedCheckpointConfig struct {
+	key      string
+	interval time.Duration
+	ttl      time.Duration
 }
 
 var (
@@ -111,14 +145,21 @@ type Producer struct {
 
 	blockSizeTokens int
 
+	kvEventsPool          *kvevents.Pool
+	checkpointStore       checkpointStore
+	checkpointKey         string
+	checkpointInterval    time.Duration
+	checkpointTTL         time.Duration
+	checkpointFingerprint string
+
 	// Plugin-lifetime, not request-scoped: SubscriberManager binds each
 	// subscriber's goroutine to the ctx passed at registration.
 	subscriberCtx context.Context
 }
 
-// PluginFactory parses the raw plugin configuration and returns a configured
-// Producer.
-func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
+// PluginConfigParser parses and validates the producer configuration. The
+// registry also uses the returned plugin references to order construction.
+func PluginConfigParser(rawParameters *json.Decoder, _ plugin.Handle) (any, error) {
 	indexerConfig, err := kvcache.NewDefaultConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize indexer config: %w", err)
@@ -138,7 +179,41 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 	if parameters.IndexerConfig == nil {
 		return nil, errors.New("indexerConfig is required")
 	}
-	p, err := New(handle.Context(), name, parameters)
+	if parameters.Checkpoint != nil {
+		if parameters.Checkpoint.StorePluginRef == "" {
+			return nil, errors.New("checkpoint.storePluginRef is required")
+		}
+		if _, err := resolveCheckpointConfig("checkpoint", parameters.Checkpoint); err != nil {
+			return nil, err
+		}
+	}
+
+	return parameters, nil
+}
+
+// PluginFactory parses the raw plugin configuration and returns a configured
+// Producer.
+func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
+	rawConfig, err := PluginConfigParser(rawParameters, handle)
+	if err != nil {
+		return nil, err
+	}
+	parameters := rawConfig.(PluginConfig)
+
+	var store checkpointStore
+	if parameters.Checkpoint != nil {
+		storePlugin := handle.Plugin(parameters.Checkpoint.StorePluginRef)
+		if storePlugin == nil {
+			return nil, fmt.Errorf("checkpoint store plugin not found: %s", parameters.Checkpoint.StorePluginRef)
+		}
+		var ok bool
+		store, ok = storePlugin.(checkpointStore)
+		if !ok {
+			return nil, fmt.Errorf("plugin %s does not implement precise checkpoint storage", parameters.Checkpoint.StorePluginRef)
+		}
+	}
+
+	p, err := newProducer(handle.Context(), name, parameters, store)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create %s plugin: %w", PluginType, err)
 	}
@@ -152,6 +227,10 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 // The kvcache indexer, KV-events pool, and any local ZMQ subscriber start
 // in background goroutines bound to ctx.
 func New(ctx context.Context, name string, config PluginConfig) (*Producer, error) {
+	return newProducer(ctx, name, config, nil)
+}
+
+func newProducer(ctx context.Context, name string, config PluginConfig, store checkpointStore) (*Producer, error) {
 	var rankResolver *rankPodResolver
 	if config.KVEventsConfig != nil && config.KVEventsConfig.PodDiscoveryConfig != nil &&
 		config.KVEventsConfig.PodDiscoveryConfig.RankPodMapping != nil {
@@ -164,7 +243,6 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 			return nil, fmt.Errorf("invalid rank-pod mapping: %w", err)
 		}
 	}
-
 	if config.TokenProcessorConfig == nil {
 		config.TokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
 	}
@@ -182,6 +260,11 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		podSelector = sel
 	}
 
+	checkpointConfig, checkpointEnabled, err := validateCheckpointConfig(name, config, store)
+	if err != nil {
+		return nil, err
+	}
+
 	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(config.TokenProcessorConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token processor: %w", err)
@@ -191,7 +274,6 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	if err != nil {
 		return nil, fmt.Errorf("failed to create kvcache.Indexer: %w", err)
 	}
-	go indexer.Run(ctx)
 
 	adapter, err := engineadapter.NewAdapter(config.KVEventsConfig.EngineType)
 	if err != nil {
@@ -201,6 +283,33 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	if err != nil {
 		return nil, fmt.Errorf("failed to create KV-events pool: %w", err)
 	}
+
+	fingerprint := ""
+	if checkpointEnabled {
+		if err := pool.EnableCheckpointing(); err != nil {
+			return nil, fmt.Errorf("enable precise index checkpointing: %w", err)
+		}
+		fingerprint = checkpointFingerprint(
+			config.TokenProcessorConfig,
+			tokenProcessor.BlockSize(),
+			config.IndexerConfig.KVBlockIndexConfig.InMemoryConfig,
+		)
+		checkpointConfig.key += ":" + fingerprint
+		started := time.Now()
+		data, found, err := store.LoadCheckpoint(ctx, checkpointConfig.key)
+		if err != nil {
+			return nil, fmt.Errorf("load precise index checkpoint: %w", err)
+		}
+		if found {
+			if err := pool.RestoreCheckpoint(data, fingerprint); err != nil {
+				return nil, fmt.Errorf("restore precise index checkpoint: %w", err)
+			}
+			log.FromContext(ctx).WithName(PluginType).Info("Restored precise index checkpoint",
+				"key", checkpointConfig.key, "bytes", len(data), "duration", time.Since(started))
+		}
+	}
+
+	go indexer.Run(ctx)
 	pool.Start(ctx)
 
 	subscribersManager := kvevents.NewSubscriberManager(pool)
@@ -216,7 +325,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		return nil, err
 	}
 
-	return &Producer{
+	producer := &Producer{
 		typedName:          plugin.TypedName{Type: PluginType, Name: name},
 		kvCacheIndexer:     indexer,
 		subscribersManager: subscribersManager,
@@ -229,8 +338,148 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		speculativeTTL:     speculativeTTL,
 		speculativeEnabled: config.SpeculativeIndexing,
 		blockSizeTokens:    tokenProcessor.BlockSize(),
+		kvEventsPool:       pool,
 		subscriberCtx:      ctx,
-	}, nil
+	}
+	if checkpointEnabled {
+		producer.checkpointStore = store
+		producer.checkpointKey = checkpointConfig.key
+		producer.checkpointInterval = checkpointConfig.interval
+		producer.checkpointTTL = checkpointConfig.ttl
+		producer.checkpointFingerprint = fingerprint
+		go producer.runCheckpointLoop(ctx)
+	}
+	return producer, nil
+}
+
+func validateCheckpointConfig(
+	name string,
+	config PluginConfig,
+	store checkpointStore,
+) (resolvedCheckpointConfig, bool, error) {
+	if config.Checkpoint == nil {
+		return resolvedCheckpointConfig{}, false, nil
+	}
+	if store == nil {
+		return resolvedCheckpointConfig{}, false, errors.New("checkpoint store is required")
+	}
+	if !config.KVEventsConfig.DiscoverPods || config.KVEventsConfig.PodDiscoveryConfig == nil {
+		return resolvedCheckpointConfig{}, false, errors.New("checkpointing requires per-pod KV-event discovery")
+	}
+	if config.KVEventsConfig.ZMQEndpoint != "" {
+		return resolvedCheckpointConfig{}, false, errors.New("checkpointing does not support a global KV-event socket")
+	}
+	if config.KVEventsConfig.PodDiscoveryConfig.EffectiveReplayPort() <= 0 {
+		return resolvedCheckpointConfig{}, false, errors.New("checkpointing requires kvEventsConfig.podDiscoveryConfig.replaySocketPort")
+	}
+	if config.IndexerConfig == nil || config.IndexerConfig.KVBlockIndexConfig == nil {
+		return resolvedCheckpointConfig{}, false, errors.New("checkpointing requires an in-memory index")
+	}
+	indexConfig := config.IndexerConfig.KVBlockIndexConfig
+	if indexConfig.InMemoryConfig == nil || indexConfig.RedisConfig != nil || indexConfig.CostAwareMemoryConfig != nil {
+		return resolvedCheckpointConfig{}, false, errors.New("checkpointing requires an in-memory index")
+	}
+	resolved, err := resolveCheckpointConfig(name, config.Checkpoint)
+	if err != nil {
+		return resolvedCheckpointConfig{}, false, err
+	}
+	return resolved, true, nil
+}
+
+func resolveCheckpointConfig(name string, config *CheckpointConfig) (resolvedCheckpointConfig, error) {
+	interval, err := parsePositiveDuration("checkpoint.interval", config.Interval, defaultCheckpointInterval)
+	if err != nil {
+		return resolvedCheckpointConfig{}, err
+	}
+	ttl, err := parsePositiveDuration("checkpoint.ttl", config.TTL, defaultCheckpointTTL)
+	if err != nil {
+		return resolvedCheckpointConfig{}, err
+	}
+	key := config.Key
+	if key == "" {
+		key = name
+	}
+	return resolvedCheckpointConfig{key: key, interval: interval, ttl: ttl}, nil
+}
+
+func parsePositiveDuration(field, value string, defaultValue time.Duration) (time.Duration, error) {
+	if value == "" {
+		return defaultValue, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", field, value, err)
+	}
+	if parsed <= 0 {
+		return 0, fmt.Errorf("%s must be positive, got %s", field, parsed)
+	}
+	return parsed, nil
+}
+
+func checkpointFingerprint(
+	tokenConfig *kvblock.TokenProcessorConfig,
+	blockSizeTokens int,
+	indexConfig *kvblock.InMemoryIndexConfig,
+) string {
+	hashAlgorithm := tokenConfig.HashAlgorithm
+	if hashAlgorithm == "" {
+		hashAlgorithm = kvblock.HashAlgorithmCBORFNV
+	}
+	podCacheSize := indexConfig.PodCacheSize
+	if podCacheSize <= 0 {
+		podCacheSize = kvblock.DefaultInMemoryIndexConfig().PodCacheSize
+	}
+	material, _ := json.Marshal(struct {
+		SchemaVersion   int    `json:"schemaVersion"`
+		BlockSizeTokens int    `json:"blockSizeTokens"`
+		HashSeed        string `json:"hashSeed"`
+		HashAlgorithm   string `json:"hashAlgorithm"`
+		IndexSize       int    `json:"indexSize"`
+		PodCacheSize    int    `json:"podCacheSize"`
+	}{
+		SchemaVersion:   1,
+		BlockSizeTokens: blockSizeTokens,
+		HashSeed:        tokenConfig.HashSeed,
+		HashAlgorithm:   hashAlgorithm,
+		IndexSize:       indexConfig.Size,
+		PodCacheSize:    podCacheSize,
+	})
+	digest := sha256.Sum256(material)
+	return hex.EncodeToString(digest[:])
+}
+
+func (p *Producer) runCheckpointLoop(ctx context.Context) {
+	ticker := time.NewTicker(p.checkpointInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := p.writeCheckpoint(ctx); err != nil {
+				if errors.Is(err, kvevents.ErrCheckpointReplayInProgress) {
+					log.FromContext(ctx).V(logging.DEBUG).Info("Skipping precise index checkpoint while replay is in progress")
+					continue
+				}
+				log.FromContext(ctx).Error(err, "Failed to save precise index checkpoint")
+			}
+		}
+	}
+}
+
+func (p *Producer) writeCheckpoint(ctx context.Context) error {
+	started := time.Now()
+	data, result, err := p.kvEventsPool.MarshalCheckpoint(p.checkpointFingerprint)
+	if err != nil {
+		return err
+	}
+	if err := p.checkpointStore.SaveCheckpoint(ctx, p.checkpointKey, data, p.checkpointTTL); err != nil {
+		return fmt.Errorf("save checkpoint: %w", err)
+	}
+	log.FromContext(ctx).V(logging.DEBUG).Info("Saved precise index checkpoint",
+		"key", p.checkpointKey, "bytes", result.Bytes, "sources", result.Sources,
+		"createdAt", result.CreatedAt, "duration", time.Since(started))
+	return nil
 }
 
 // RegisterDependencies adds the Pod notification source required by

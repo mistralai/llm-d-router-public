@@ -16,6 +16,7 @@ package kvevents
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"strings"
@@ -210,6 +211,14 @@ type Pool struct {
 	// tier, KV-cache group, DP rank) and a store must be counted only after
 	// Index.Add succeeds — both of which only the Pool observes.
 	dedup *eventDedupFilter
+	// checkpointMu makes index, dedup, group metadata, and consumed sequences
+	// one consistent checkpoint boundary.
+	checkpointMu      sync.RWMutex
+	checkpointWriteMu sync.Mutex
+	lastConsumedMu    sync.RWMutex
+	lastConsumedSeq   map[string]uint64
+	replaysInProgress map[string]struct{}
+	checkpointEnabled atomic.Bool
 	// tracer is resolved once: tracing.Tracer rebuilds its instrumentation
 	// options on every call, which is not free on the per-message event path.
 	// Nil when Config.Tracing is unset, which is what startSpan tests to skip
@@ -220,6 +229,7 @@ type Pool struct {
 	// tracked incrementally rather than by summing queue.Len() so that the
 	// depth gauge stays O(1) on the enqueue/dequeue hot path.
 	queueDepth atomic.Int64
+	started    atomic.Bool
 }
 
 // NewPool creates a Pool with a sharded worker setup.
@@ -257,6 +267,25 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 	metrics.Register()
 
 	return p, nil
+}
+
+// EnableCheckpointing enables stream tracking and consistent checkpoint
+// boundaries. It must be called before event workers start.
+func (p *Pool) EnableCheckpointing() error {
+	if p.started.Load() {
+		return errors.New("checkpointing must be enabled before the event pool starts")
+	}
+	if p.checkpointEnabled.Load() {
+		return nil
+	}
+	p.lastConsumedSeq = make(map[string]uint64)
+	p.replaysInProgress = make(map[string]struct{})
+	p.checkpointEnabled.Store(true)
+	return nil
+}
+
+func (p *Pool) checkpointingEnabled() bool {
+	return p.checkpointEnabled.Load()
 }
 
 // Span start options are built once. Passing them variadically at each call
@@ -310,6 +339,7 @@ func (p *Pool) Start(ctx context.Context) {
 	logger.Info("Starting sharded event processing pool", "workers", p.concurrency)
 
 	metrics.PoolCapacity.Set(float64(p.concurrency))
+	p.started.Store(true)
 
 	p.wg.Add(p.concurrency)
 	for i := 0; i < p.concurrency; i++ {
@@ -343,6 +373,9 @@ func (p *Pool) Shutdown(ctx context.Context) {
 func (p *Pool) AddTask(task *RawMessage) {
 	key := task.SourceEndpoint
 	if key == "" {
+		key = task.StreamID
+	}
+	if key == "" {
 		key = p.adapter.ShardingKey(task)
 	}
 	// Use an FNV-1a hash to deterministically select a queue.
@@ -358,13 +391,20 @@ func (p *Pool) AddTask(task *RawMessage) {
 	p.addQueueDepth(1)
 }
 
-// resetForSource queues an engine reset on the same shard as its event stream.
-func (p *Pool) resetForSource(topic, sourceEndpoint string, dataParallelRank *int) {
+// retireStream queues stream removal and an optional pod reset after earlier
+// messages from the same serving endpoint.
+func (p *Pool) retireStream(
+	topic, sourceEndpoint, streamID string,
+	dataParallelRank *int,
+	resetSource bool,
+) {
 	p.AddTask(&RawMessage{
 		Topic:                 topic,
 		SourceEndpoint:        sourceEndpoint,
 		ResetDataParallelRank: dataParallelRank,
-		reset:                 true,
+		StreamID:              streamID,
+		reset:                 resetSource,
+		forgetStream:          true,
 	})
 }
 
@@ -399,16 +439,39 @@ func (p *Pool) worker(ctx context.Context, workerIndex int) {
 
 // processRawMessage decodes the raw message payload using the adapter and processes the resulting event batch.
 func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
+	if p.checkpointEnabled.Load() {
+		p.checkpointMu.RLock()
+		defer p.checkpointMu.RUnlock()
+	}
+
 	logger := log.FromContext(ctx)
-	if msg.reset {
+	if msg.replayComplete {
+		p.markReplayComplete(msg.StreamID)
+		return
+	}
+	if msg.reset || msg.forgetStream {
 		podID := msg.SourceEndpoint
-		if podID == "" {
+		if podID == "" && msg.reset {
 			podID = p.adapter.ShardingKey(msg)
 		}
-		if msg.ResetDataParallelRank == nil {
-			p.clearPod(ctx, podID)
-		} else {
-			p.clearRank(ctx, podID, *msg.ResetDataParallelRank)
+		if msg.reset {
+			if msg.ResetDataParallelRank == nil {
+				p.clearPod(ctx, podID)
+			} else {
+				p.clearRank(ctx, podID, *msg.ResetDataParallelRank)
+			}
+		}
+		if p.checkpointEnabled.Load() {
+			p.lastConsumedMu.Lock()
+			streamID := msg.StreamID
+			if streamID == "" {
+				streamID = podID
+			}
+			delete(p.lastConsumedSeq, streamID)
+			if msg.forgetStream {
+				delete(p.replaysInProgress, streamID)
+			}
+			p.lastConsumedMu.Unlock()
 		}
 		return
 	}
@@ -455,6 +518,48 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 	}
 
 	p.processEventBatch(ctx, &batch, podID, modelName)
+	if p.checkpointEnabled.Load() {
+		source := msg.StreamID
+		if source == "" {
+			source = msg.SourceEndpoint
+		}
+		if source == "" {
+			source = p.adapter.ShardingKey(msg)
+		}
+		p.lastConsumedMu.Lock()
+		p.lastConsumedSeq[source] = msg.Sequence
+		p.lastConsumedMu.Unlock()
+	}
+}
+
+func (p *Pool) markReplayInProgress(streamID string) {
+	if !p.checkpointEnabled.Load() || streamID == "" {
+		return
+	}
+	p.checkpointMu.RLock()
+	defer p.checkpointMu.RUnlock()
+	p.lastConsumedMu.Lock()
+	defer p.lastConsumedMu.Unlock()
+	p.replaysInProgress[streamID] = struct{}{}
+}
+
+func (p *Pool) markReplayComplete(streamID string) {
+	if !p.checkpointEnabled.Load() || streamID == "" {
+		return
+	}
+	p.lastConsumedMu.Lock()
+	defer p.lastConsumedMu.Unlock()
+	delete(p.replaysInProgress, streamID)
+}
+
+func (p *Pool) lastConsumedSequence(streamID string) (uint64, bool) {
+	if !p.checkpointEnabled.Load() {
+		return 0, false
+	}
+	p.lastConsumedMu.RLock()
+	defer p.lastConsumedMu.RUnlock()
+	seq, ok := p.lastConsumedSeq[streamID]
+	return seq, ok
 }
 
 // decode spans the adapter's payload decode. It wraps the call rather than the
@@ -488,6 +593,7 @@ func (p *Pool) clearPod(ctx context.Context, podIdentifier string) {
 			"podIdentifier", podIdentifier)
 	}
 	p.dedup.clear(podIdentifier)
+	p.groupCatalog.Clear(podIdentifier)
 }
 
 func (p *Pool) clearRank(ctx context.Context, podIdentifier string, dataParallelRank int) {

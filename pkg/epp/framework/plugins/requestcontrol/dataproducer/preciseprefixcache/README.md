@@ -35,6 +35,26 @@ upstream. No-op otherwise.
 | `kvEventsConfig` | object | `kvevents.DefaultConfig()` | KV-events pool config. |
 | `speculativeIndexing` | bool | `false` | Seed predicted entries on routing decisions. |
 | `speculativeTTL` | duration | `2s` | TTL for speculative entries. |
+| `checkpoint` | object | disabled | Persist the confirmed index and KV-event replay state through a referenced store plugin. |
+
+Checkpointing requires per-pod KV-event discovery, a configured replay socket,
+no global `zmqEndpoint`, and the in-memory index backend. The store plugin must
+implement `SaveCheckpoint(context.Context, string, []byte, time.Duration)` and
+`LoadCheckpoint(context.Context, string) ([]byte, bool, error)`.
+
+```yaml
+checkpoint:
+  storePluginRef: redis
+  key: deployment-name
+  interval: 5s
+  ttl: 24h
+```
+
+`key` defaults to the producer instance name. `interval` defaults to `5s`, and
+`ttl` defaults to `24h`. Startup reads and validates the checkpoint before the
+event pool starts. A missing checkpoint starts with an empty index. Checkpoints
+use a versioned binary encoding with a shared string table. Restore also accepts
+the legacy JSON encoding.
 
 Set `kvEventsConfig.engineType` to `sglang` for SGLang KV-events. It defaults
 to `vllm` when omitted.

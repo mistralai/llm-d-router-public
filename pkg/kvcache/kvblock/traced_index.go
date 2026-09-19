@@ -16,6 +16,7 @@ package kvblock
 
 import (
 	"context"
+	"fmt"
 
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -185,6 +186,30 @@ func (t *tracedIndex) Clear(ctx context.Context, podIdentifier string) error {
 
 func (t *tracedIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
 	return ClearDataParallelRank(ctx, t.next, podIdentifier, dataParallelRank)
+}
+
+func (t *tracedIndex) Snapshot() (IndexSnapshot, error) {
+	next, ok := t.next.(Snapshotter)
+	if !ok {
+		return IndexSnapshot{}, fmt.Errorf("index backend does not support snapshots")
+	}
+	return next.Snapshot()
+}
+
+func (t *tracedIndex) Restore(snapshot IndexSnapshot) error {
+	next, ok := t.next.(Snapshotter)
+	if !ok {
+		return fmt.Errorf("index backend does not support snapshots")
+	}
+	return next.Restore(snapshot)
+}
+
+func (t *tracedIndex) ValidateSnapshot(snapshot IndexSnapshot) error {
+	next, ok := t.next.(Snapshotter)
+	if !ok {
+		return fmt.Errorf("index backend does not support snapshots")
+	}
+	return next.ValidateSnapshot(snapshot)
 }
 
 func keyTypeLabel(keyType KeyType) string {

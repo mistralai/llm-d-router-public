@@ -16,6 +16,7 @@ package kvblock
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 	"github.com/prometheus/client_golang/prometheus"
@@ -95,4 +96,28 @@ func (m *instrumentedIndex) Clear(ctx context.Context, podIdentifier string) err
 
 func (m *instrumentedIndex) ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
 	return ClearDataParallelRank(ctx, m.next, podIdentifier, dataParallelRank)
+}
+
+func (m *instrumentedIndex) Snapshot() (IndexSnapshot, error) {
+	next, ok := m.next.(Snapshotter)
+	if !ok {
+		return IndexSnapshot{}, fmt.Errorf("index backend does not support snapshots")
+	}
+	return next.Snapshot()
+}
+
+func (m *instrumentedIndex) Restore(snapshot IndexSnapshot) error {
+	next, ok := m.next.(Snapshotter)
+	if !ok {
+		return fmt.Errorf("index backend does not support snapshots")
+	}
+	return next.Restore(snapshot)
+}
+
+func (m *instrumentedIndex) ValidateSnapshot(snapshot IndexSnapshot) error {
+	next, ok := m.next.(Snapshotter)
+	if !ok {
+		return fmt.Errorf("index backend does not support snapshots")
+	}
+	return next.ValidateSnapshot(snapshot)
 }

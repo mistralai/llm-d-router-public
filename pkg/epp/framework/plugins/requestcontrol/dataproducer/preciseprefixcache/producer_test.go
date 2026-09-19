@@ -20,7 +20,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
@@ -39,6 +41,184 @@ import (
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	"github.com/llm-d/llm-d-router/test/utils"
 )
+
+type fakeCheckpointStore struct {
+	mu      sync.Mutex
+	typed   plugin.TypedName
+	loaded  []byte
+	found   bool
+	saved   []byte
+	saveKey string
+	saveTTL time.Duration
+	saves   int
+}
+
+func (s *fakeCheckpointStore) TypedName() plugin.TypedName { return s.typed }
+
+func (s *fakeCheckpointStore) SaveCheckpoint(_ context.Context, key string, data []byte, ttl time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saveKey = key
+	s.saved = append([]byte(nil), data...)
+	s.saveTTL = ttl
+	s.saves++
+	return nil
+}
+
+func (s *fakeCheckpointStore) LoadCheckpoint(context.Context, string) ([]byte, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.loaded...), s.found, nil
+}
+
+func TestNewRestoresCheckpointBeforeStarting(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	tokenConfig := &kvblock.TokenProcessorConfig{BlockSizeTokens: 16, HashSeed: "checkpoint-test"}
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(tokenConfig)
+	require.NoError(t, err)
+	sourceIndex, err := kvblock.NewInMemoryIndex(kvblock.DefaultInMemoryIndexConfig())
+	require.NoError(t, err)
+	entry := kvblock.PodEntry{PodIdentifier: "10.0.0.1:8000", DeviceTier: "gpu"}
+	require.NoError(t, sourceIndex.Add(ctx, []kvblock.BlockHash{11}, []kvblock.BlockHash{101}, []kvblock.PodEntry{entry}))
+	sourcePool, err := kvevents.NewPool(kvevents.DefaultConfig(), sourceIndex, tokenProcessor, nil)
+	require.NoError(t, err)
+	require.NoError(t, sourcePool.EnableCheckpointing())
+	indexerConfig, err := kvcache.NewDefaultConfig()
+	require.NoError(t, err)
+	fingerprint := checkpointFingerprint(tokenConfig, 16, indexerConfig.KVBlockIndexConfig.InMemoryConfig)
+	data, _, err := sourcePool.MarshalCheckpoint(fingerprint)
+	require.NoError(t, err)
+	store := &fakeCheckpointStore{loaded: data, found: true}
+	eventsConfig := kvevents.DefaultConfig()
+	eventsConfig.PodDiscoveryConfig.ReplaySocketPort = 5558
+
+	producer, err := newProducer(ctx, "precise", PluginConfig{
+		TokenProcessorConfig: tokenConfig,
+		IndexerConfig:        indexerConfig,
+		KVEventsConfig:       eventsConfig,
+		Checkpoint: &CheckpointConfig{
+			Key:      "test",
+			Interval: "1h",
+			TTL:      "2h",
+		},
+	}, store)
+	require.NoError(t, err)
+
+	entries, err := producer.kvCacheIndexer.KVBlockIndex().Lookup(ctx, []kvblock.BlockHash{101}, nil)
+	require.NoError(t, err)
+	require.Equal(t, []kvblock.PodEntry{entry}, entries[101])
+}
+
+func TestWriteCheckpointUsesConfiguredStore(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	store := &fakeCheckpointStore{}
+	eventsConfig := kvevents.DefaultConfig()
+	eventsConfig.PodDiscoveryConfig.ReplaySocketPort = 5558
+	indexerConfig, err := kvcache.NewDefaultConfig()
+	require.NoError(t, err)
+	producer, err := newProducer(ctx, "precise", PluginConfig{
+		IndexerConfig:  indexerConfig,
+		KVEventsConfig: eventsConfig,
+		Checkpoint: &CheckpointConfig{
+			Key:      "test",
+			Interval: "1h",
+			TTL:      "2h",
+		},
+	}, store)
+	require.NoError(t, err)
+	require.NoError(t, producer.writeCheckpoint(ctx))
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	require.NotEmpty(t, store.saved)
+	require.Contains(t, store.saveKey, "test:")
+	require.Equal(t, 2*time.Hour, store.saveTTL)
+}
+
+func TestCheckpointLoopWritesAtConfiguredInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	store := &fakeCheckpointStore{}
+	eventsConfig := kvevents.DefaultConfig()
+	eventsConfig.PodDiscoveryConfig.ReplaySocketPort = 5558
+	indexerConfig, err := kvcache.NewDefaultConfig()
+	require.NoError(t, err)
+
+	_, err = newProducer(ctx, "precise", PluginConfig{
+		IndexerConfig:  indexerConfig,
+		KVEventsConfig: eventsConfig,
+		Checkpoint: &CheckpointConfig{
+			Interval: "10ms",
+		},
+	}, store)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.saves > 0
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestPluginFactoryResolvesCheckpointStore(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	handle := plugin.NewEppHandle(ctx, nil)
+	store := &fakeCheckpointStore{typed: plugin.TypedName{Type: "redis-state-store", Name: "redis"}}
+	handle.AddPlugin("redis", store)
+	raw := json.RawMessage(`{
+		"kvEventsConfig":{"podDiscoveryConfig":{"replaySocketPort":5558}},
+		"checkpoint":{"storePluginRef":"redis","interval":"1h"}
+	}`)
+
+	result, err := PluginFactory("precise", plugin.StrictDecoder(raw), handle)
+	require.NoError(t, err)
+	require.Same(t, store, result.(*Producer).checkpointStore)
+}
+
+func TestPluginConfigParserRejectsInvalidCheckpoint(t *testing.T) {
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"checkpoint":{"interval":"1s"}}`),
+		json.RawMessage(`{"checkpoint":{"storePluginRef":"redis","interval":"0s"}}`),
+		json.RawMessage(`{"checkpoint":{"storePluginRef":"redis","ttl":"invalid"}}`),
+	} {
+		_, err := PluginConfigParser(plugin.StrictDecoder(raw), nil)
+		require.Error(t, err)
+	}
+}
+
+func TestNewRejectsCorruptCheckpointBeforeStarting(t *testing.T) {
+	store := &fakeCheckpointStore{loaded: []byte("not-json"), found: true}
+	eventsConfig := kvevents.DefaultConfig()
+	eventsConfig.PodDiscoveryConfig.ReplaySocketPort = 5558
+	indexerConfig, err := kvcache.NewDefaultConfig()
+	require.NoError(t, err)
+
+	_, err = newProducer(t.Context(), "precise", PluginConfig{
+		IndexerConfig:  indexerConfig,
+		KVEventsConfig: eventsConfig,
+		Checkpoint:     &CheckpointConfig{},
+	}, store)
+	require.ErrorContains(t, err, "restore precise index checkpoint")
+}
+
+func TestNewRejectsCheckpointWithGlobalEventSocket(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	eventsConfig := kvevents.DefaultConfig()
+	eventsConfig.ZMQEndpoint = "tcp://127.0.0.1:5557"
+	eventsConfig.PodDiscoveryConfig.ReplaySocketPort = 5558
+	indexerConfig, err := kvcache.NewDefaultConfig()
+	require.NoError(t, err)
+
+	_, err = newProducer(ctx, "precise", PluginConfig{
+		IndexerConfig:  indexerConfig,
+		KVEventsConfig: eventsConfig,
+		Checkpoint:     &CheckpointConfig{},
+	}, &fakeCheckpointStore{})
+	require.ErrorContains(t, err, "global KV-event socket")
+}
 
 type fakeKVCacheIndexer struct {
 	computeFromTokens func(ctx context.Context, tokens []uint32, model string, extra []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error)

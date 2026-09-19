@@ -76,8 +76,15 @@ type RawMessage struct {
 	// ResetDataParallelRank scopes a replay reset to one rank. Nil resets the
 	// whole serving endpoint.
 	ResetDataParallelRank *int
+	// StreamID identifies the publisher sequence space.
+	StreamID string
 	// reset clears the message's pod before later messages on the same queue.
 	reset bool
+	// forgetStream removes replay state after a retired stream is reset.
+	forgetStream bool
+	// replayComplete clears the replay guard after earlier replayed messages
+	// have been applied by the same queue shard.
+	replayComplete bool
 	// SpanContext links processing back to the span that received the message,
 	// bridging the worker-queue boundary. Only the span identity crosses, never
 	// the subscriber's context: a subscriber reconnect cancels that context, and

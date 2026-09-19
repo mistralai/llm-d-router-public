@@ -87,6 +87,7 @@ func NewInMemoryIndex(cfg *InMemoryIndexConfig) (*InMemoryIndex, error) {
 	return &InMemoryIndex{
 		data:                cache,
 		engineToRequestKeys: engineToRequestKeys,
+		size:                cfg.Size,
 		podCacheSize:        podCacheSize,
 		pods:                newInterner(maxInternedPods),
 		tiers:               newInterner(maxInternedTiers),
@@ -109,6 +110,8 @@ var errIndexCardinality = errors.New("index cardinality limit reached")
 
 // InMemoryIndex is an in-memory implementation of the Index interface.
 type InMemoryIndex struct {
+	// snapshotMu provides a stable view across index mutations.
+	snapshotMu sync.RWMutex
 	// mu protects engine-key-level check-and-act operations (Evict's allEmpty
 	// check + mapping removal vs Add's pod entry insertion) to prevent TOCTOU races.
 	mu sync.Mutex
@@ -116,6 +119,8 @@ type InMemoryIndex struct {
 	data *lruStore
 	// engineToRequestKeys holds the mapping of engineKeys to requestKeys.
 	engineToRequestKeys *lru.Cache[BlockHash, []BlockHash]
+	// size is the maximum number of request keys and engine mappings.
+	size int
 	// podCacheSize is the maximum number of pod entries per key.
 	podCacheSize int
 	// pods and tiers assign the ordinals EntryRef carries. Neither is
@@ -351,6 +356,8 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	}
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Add")
+	m.snapshotMu.RLock()
+	defer m.snapshotMu.RUnlock()
 
 	// Intern once per call, before anything is written: a rejected batch
 	// leaves no mapping and no ordinal behind. The same records apply to
@@ -429,6 +436,8 @@ func (m *InMemoryIndex) Evict(ctx context.Context, key BlockHash, keyType KeyTyp
 	}
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Evict")
+	m.snapshotMu.RLock()
+	defer m.snapshotMu.RUnlock()
 
 	switch keyType {
 	case EngineKey:
@@ -515,6 +524,8 @@ func (m *InMemoryIndex) ClearRank(ctx context.Context, podIdentifier string, dat
 }
 
 func (m *InMemoryIndex) clear(ctx context.Context, podIdentifier string, dataParallelRank *int) error {
+	m.snapshotMu.RLock()
+	defer m.snapshotMu.RUnlock()
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Clear")
 
 	for _, requestKey := range m.data.Keys() {
@@ -544,6 +555,136 @@ func (m *InMemoryIndex) GetRequestKey(ctx context.Context, engineKey BlockHash) 
 		return EmptyBlockHash, fmt.Errorf("engine key not found: %s", engineKey.String())
 	}
 	return rks[len(rks)-1], nil
+}
+
+// ValidateSnapshot checks that restoring a snapshot preserves every entry and
+// engine-to-request reference.
+func (m *InMemoryIndex) ValidateSnapshot(snapshot IndexSnapshot) error {
+	if len(snapshot.Entries) > m.size {
+		return fmt.Errorf("snapshot has %d entries, capacity is %d", len(snapshot.Entries), m.size)
+	}
+	if len(snapshot.EngineMappings) > m.size {
+		return fmt.Errorf("snapshot has %d engine mappings, capacity is %d", len(snapshot.EngineMappings), m.size)
+	}
+	requestKeys := make(map[BlockHash]struct{}, len(snapshot.Entries))
+	for _, item := range snapshot.Entries {
+		if item.RequestKey == EmptyBlockHash || len(item.Pods) == 0 || len(item.Pods) > m.podCacheSize {
+			return fmt.Errorf("invalid entry for request key %s", item.RequestKey.String())
+		}
+		if _, exists := requestKeys[item.RequestKey]; exists {
+			return fmt.Errorf("duplicate request key %s", item.RequestKey.String())
+		}
+		requestKeys[item.RequestKey] = struct{}{}
+		pods := make(map[PodEntry]struct{}, len(item.Pods))
+		for _, pod := range item.Pods {
+			if pod.PodIdentifier == "" || pod.Speculative {
+				return fmt.Errorf("invalid pod entry for request key %s", item.RequestKey.String())
+			}
+			if _, exists := pods[pod]; exists {
+				return fmt.Errorf("duplicate pod entry for request key %s", item.RequestKey.String())
+			}
+			pods[pod] = struct{}{}
+		}
+	}
+	engineKeys := make(map[BlockHash]struct{}, len(snapshot.EngineMappings))
+	for _, mapping := range snapshot.EngineMappings {
+		if mapping.EngineKey == EmptyBlockHash || len(mapping.RequestKeys) == 0 {
+			return fmt.Errorf("invalid engine mapping for key %s", mapping.EngineKey.String())
+		}
+		if _, exists := engineKeys[mapping.EngineKey]; exists {
+			return fmt.Errorf("duplicate engine key %s", mapping.EngineKey.String())
+		}
+		engineKeys[mapping.EngineKey] = struct{}{}
+		mappedRequestKeys := make(map[BlockHash]struct{}, len(mapping.RequestKeys))
+		for _, requestKey := range mapping.RequestKeys {
+			if _, exists := requestKeys[requestKey]; !exists {
+				return fmt.Errorf("engine key %s references missing request key %s", mapping.EngineKey.String(), requestKey.String())
+			}
+			if _, exists := mappedRequestKeys[requestKey]; exists {
+				return fmt.Errorf("engine key %s contains duplicate request key %s", mapping.EngineKey.String(), requestKey.String())
+			}
+			mappedRequestKeys[requestKey] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// Snapshot returns confirmed entries and the engine mappings that reference
+// them.
+func (m *InMemoryIndex) Snapshot() (IndexSnapshot, error) {
+	m.snapshotMu.Lock()
+	defer m.snapshotMu.Unlock()
+
+	snapshot := IndexSnapshot{}
+	retainedKeys := make(map[BlockHash]struct{})
+	for _, requestKey := range m.data.Keys() {
+		podCache, ok := m.data.Peek(requestKey)
+		if !ok || podCache == nil {
+			continue
+		}
+		podCache.mu.Lock()
+		pods := make([]PodEntry, 0, len(podCache.entries))
+		for _, entry := range podCache.entries {
+			if !entry.Speculative {
+				pods = append(pods, entry.PodEntry)
+			}
+		}
+		podCache.mu.Unlock()
+		if len(pods) == 0 {
+			continue
+		}
+		snapshot.Entries = append(snapshot.Entries, IndexSnapshotEntry{RequestKey: requestKey, Pods: pods})
+		retainedKeys[requestKey] = struct{}{}
+	}
+	for _, engineKey := range m.engineToRequestKeys.Keys() {
+		requestKeys, ok := m.engineToRequestKeys.Peek(engineKey)
+		if !ok {
+			continue
+		}
+		filtered := make([]BlockHash, 0, len(requestKeys))
+		for _, requestKey := range requestKeys {
+			if _, ok := retainedKeys[requestKey]; ok {
+				filtered = append(filtered, requestKey)
+			}
+		}
+		if len(filtered) > 0 {
+			snapshot.EngineMappings = append(snapshot.EngineMappings, EngineMappingSnapshot{
+				EngineKey: engineKey, RequestKeys: filtered,
+			})
+		}
+	}
+	return snapshot, nil
+}
+
+// Restore replaces the index contents from a snapshot.
+// Callers must restore before the index starts serving requests.
+func (m *InMemoryIndex) Restore(snapshot IndexSnapshot) error {
+	if err := m.ValidateSnapshot(snapshot); err != nil {
+		return err
+	}
+	replacement, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: m.size, PodCacheSize: m.podCacheSize})
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	for _, item := range snapshot.Entries {
+		if err := replacement.Add(ctx, nil, []BlockHash{item.RequestKey}, item.Pods); err != nil {
+			return fmt.Errorf("restore request key %s: %w", item.RequestKey.String(), err)
+		}
+	}
+	for _, mapping := range snapshot.EngineMappings {
+		replacement.engineToRequestKeys.Add(mapping.EngineKey, append([]BlockHash(nil), mapping.RequestKeys...))
+	}
+
+	m.snapshotMu.Lock()
+	defer m.snapshotMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data = replacement.data
+	m.engineToRequestKeys = replacement.engineToRequestKeys
+	m.pods = replacement.pods
+	m.tiers = replacement.tiers
+	return nil
 }
 
 // podsPerKeyPrintHelper formats a map of keys to pod names for printing.
