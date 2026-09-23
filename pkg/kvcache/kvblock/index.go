@@ -138,12 +138,24 @@ type Index interface {
 	Evict(ctx context.Context, key BlockHash, keyType KeyType, entries []PodEntry) error
 	// GetRequestKey returns the requestKey associated with the given engineKey.
 	GetRequestKey(ctx context.Context, engineKey BlockHash) (BlockHash, error)
-	// Clear removes all index entries for the given pod, across every device tier.
-	// It backs the AllBlocksCleared KV-event (a vLLM prefix-cache reset, e.g. after
-	// an RLHF weight update), which is pod-wide — vLLM emits it with no tier. Clear is
-	// O(N) over the index but runs off the Lookup/Add hot path, at a coarse cadence
-	// (typically once per weight sync).
+	// Clear removes all index entries for the given pod, across every device tier
+	// and data-parallel rank.
 	Clear(ctx context.Context, podIdentifier string) error
+}
+
+// DataParallelRankIndex supports clearing one data-parallel rank without
+// removing entries for sibling ranks on the same pod.
+type DataParallelRankIndex interface {
+	ClearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error
+}
+
+// ClearDataParallelRank clears one data-parallel rank when the index supports
+// rank-scoped clearing. Other indexes fall back to clearing the whole pod.
+func ClearDataParallelRank(ctx context.Context, index Index, podIdentifier string, dataParallelRank int) error {
+	if rankIndex, ok := index.(DataParallelRankIndex); ok {
+		return rankIndex.ClearRank(ctx, podIdentifier, dataParallelRank)
+	}
+	return index.Clear(ctx, podIdentifier)
 }
 
 // KeyType indicates whether a key passed to Evict is an engine key or a request key.
@@ -182,6 +194,59 @@ type PodEntry struct {
 	HasGroup bool
 	// GroupIdx identifies the vLLM KV cache group for HMA events.
 	GroupIdx GroupID
+	// DataParallelRank identifies the engine rank that holds the block. Nil
+	// means the entry belongs to an endpoint without shared-port data parallelism.
+	DataParallelRank *int `json:",omitempty"`
+}
+
+// podEntryKey stores optional rank identity by value. PodEntry cannot be used
+// directly as an in-memory map key because pointer equality would distinguish
+// separately decoded copies of the same rank.
+type podEntryKey struct {
+	podIdentifier       string
+	deviceTier          string
+	speculative         bool
+	hasGroup            bool
+	groupIdx            GroupID
+	dataParallelRank    int
+	hasDataParallelRank bool
+}
+
+func newPodEntryKey(entry PodEntry) podEntryKey {
+	key := podEntryKey{
+		podIdentifier: entry.PodIdentifier,
+		deviceTier:    entry.DeviceTier,
+		speculative:   entry.Speculative,
+		hasGroup:      entry.HasGroup,
+		groupIdx:      entry.GroupIdx,
+	}
+	if entry.DataParallelRank != nil {
+		key.dataParallelRank = *entry.DataParallelRank
+		key.hasDataParallelRank = true
+	}
+	return key
+}
+
+func (k podEntryKey) podEntry() PodEntry {
+	entry := PodEntry{
+		PodIdentifier: k.podIdentifier,
+		DeviceTier:    k.deviceTier,
+		Speculative:   k.speculative,
+		HasGroup:      k.hasGroup,
+		GroupIdx:      k.groupIdx,
+	}
+	if k.hasDataParallelRank {
+		rank := k.dataParallelRank
+		entry.DataParallelRank = &rank
+	}
+	return entry
+}
+
+func (k podEntryKey) matchesDataParallelRank(rank *int) bool {
+	if rank == nil {
+		return true
+	}
+	return k.hasDataParallelRank && k.dataParallelRank == *rank
 }
 
 // String returns a string representation of the PodEntry.
@@ -192,6 +257,9 @@ func (e *PodEntry) String() string {
 	}
 	if e.HasGroup {
 		suffix += fmt.Sprintf("[group=%d]", e.GroupIdx)
+	}
+	if e.DataParallelRank != nil {
+		suffix += fmt.Sprintf("[dp=%d]", *e.DataParallelRank)
 	}
 	return fmt.Sprintf("%s@%s%s", e.PodIdentifier, e.DeviceTier, suffix)
 }

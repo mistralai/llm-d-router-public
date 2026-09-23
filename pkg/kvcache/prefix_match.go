@@ -27,6 +27,7 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
 )
@@ -48,8 +49,8 @@ const unknownTierWeight = 0.0
 // positions: positions where pos&mask == 0 poll ctx.Err().
 const matchCancellationMask = 255
 
-// PodMatch is one pod's prefix match for a key sequence. All values cover
-// the contiguous chain of keys the pod holds, counted from the first key.
+// PodMatch is one cache endpoint's prefix match for a key sequence. All values
+// cover the contiguous chain of keys the endpoint holds, counted from the first key.
 type PodMatch struct {
 	// WeightedScore sums, per block of the chain, the highest device-tier
 	// weight among the pod's entries for that block. Tiers without a
@@ -69,11 +70,27 @@ type PodMatch struct {
 }
 
 // MatchBlockKeys runs the prefix matcher over keys for the pods in podFilter
-// (every pod when empty) and returns one PodMatch per pod that holds the
-// first key. Empty keys match nothing. The matcher walks the index when the
-// backend is a kvblock.KeyWalker and otherwise materializes Lookup; both
-// feed the same accumulator.
+// (every pod when empty) and returns the highest-scoring match for each pod.
+// Empty keys match nothing. The matcher walks the index when the backend is a
+// kvblock.KeyWalker and otherwise materializes Lookup.
 func (k *Indexer) MatchBlockKeys(ctx context.Context, keys []kvblock.BlockHash,
+	podFilter sets.Set[string],
+) (map[string]PodMatch, error) {
+	matches, err := k.matchBlockKeys(ctx, keys, podFilter)
+	return collapseDataParallelMatches(matches), err
+}
+
+// MatchBlockKeysByEndpoint returns independent matches for logical data-parallel
+// endpoints. Rank-scoped entries are keyed by BuildDPScoringKey; other entries
+// are keyed by pod identifier.
+func (k *Indexer) MatchBlockKeysByEndpoint(ctx context.Context, keys []kvblock.BlockHash,
+	podFilter sets.Set[string],
+) (map[string]PodMatch, error) {
+	return k.matchBlockKeys(ctx, keys, podFilter)
+}
+
+// matchBlockKeys returns independent matches for each logical cache endpoint.
+func (k *Indexer) matchBlockKeys(ctx context.Context, keys []kvblock.BlockHash,
 	podFilter sets.Set[string],
 ) (map[string]PodMatch, error) {
 	if len(keys) == 0 {
@@ -134,11 +151,34 @@ func matchWalk(ctx context.Context, walker kvblock.KeyWalker, keys []kvblock.Blo
 	acc := acquireAccumulator(weights, filter)
 	defer releaseAccumulator(acc)
 
+	pods := ordinalTable{}
+	var buildErr error
 	err := walker.WalkKeys(ctx, keys, func(_ int, found bool, entries []kvblock.EntryRef) bool {
-		return found && len(entries) > 0 && acc.key(entries)
+		if !found || len(entries) == 0 {
+			return false
+		}
+		acc.beginKey(len(entries))
+		for i := range entries {
+			e := &entries[i]
+			rank := routing.NoDataParallelRank
+			if e.DataParallelRank != nil {
+				rank = *e.DataParallelRank
+			}
+			candidate, err := routing.BuildDPScoringKey(e.PodIdentifier, rank)
+			if err != nil {
+				buildErr = err
+				return false
+			}
+			acc.entry(candidate, pods.of(candidate), e.PodIdentifier,
+				e.DeviceTier, e.TierOrdinal, e.Speculative)
+		}
+		return acc.endKey()
 	})
 	if err != nil {
 		return nil, err
+	}
+	if buildErr != nil {
+		return nil, buildErr
 	}
 	return acc.result(), nil
 }
@@ -155,6 +195,23 @@ func matchLookup(ctx context.Context, index kvblock.Index, keys []kvblock.BlockH
 	return matchMaterialized(ctx, keys, keyToPods, weights, filter)
 }
 
+func collapseDataParallelMatches(matches map[string]PodMatch) map[string]PodMatch {
+	podMatches := make(map[string]PodMatch, len(matches))
+	selectedKeys := make(map[string]string, len(matches))
+	for scoringKey, match := range matches {
+		podIdentifier, _ := routing.ParseDPScoringKey(scoringKey)
+		current, exists := podMatches[podIdentifier]
+		if !exists || match.WeightedScore > current.WeightedScore ||
+			(match.WeightedScore == current.WeightedScore && match.MatchedBlocks > current.MatchedBlocks) ||
+			(match.WeightedScore == current.WeightedScore && match.MatchedBlocks == current.MatchedBlocks &&
+				scoringKey < selectedKeys[podIdentifier]) {
+			podMatches[podIdentifier] = match
+			selectedKeys[podIdentifier] = scoringKey
+		}
+	}
+	return podMatches
+}
+
 // matchMaterialized feeds the accumulator from a Lookup result, walking keys
 // in order and stopping at the first key without entries. Pod and tier
 // ordinals are assigned per call, since materialized entries carry none.
@@ -166,7 +223,6 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 	defer releaseAccumulator(acc)
 
 	pods, tiers := ordinalTable{}, ordinalTable{}
-	var refs []kvblock.EntryRef
 	for pos, key := range keys {
 		if pos&matchCancellationMask == 0 && ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -175,15 +231,21 @@ func matchMaterialized(ctx context.Context, keys []kvblock.BlockHash,
 		if len(entries) == 0 {
 			break
 		}
-		refs = refs[:0]
-		for _, e := range entries {
-			refs = append(refs, kvblock.EntryRef{
-				PodEntry:    e,
-				PodOrdinal:  pods.of(e.PodIdentifier),
-				TierOrdinal: tiers.of(e.DeviceTier),
-			})
+		acc.beginKey(len(entries))
+		for i := range entries {
+			e := &entries[i]
+			rank := routing.NoDataParallelRank
+			if e.DataParallelRank != nil {
+				rank = *e.DataParallelRank
+			}
+			candidate, buildErr := routing.BuildDPScoringKey(e.PodIdentifier, rank)
+			if buildErr != nil {
+				return nil, buildErr
+			}
+			acc.entry(candidate, pods.of(candidate), e.PodIdentifier,
+				e.DeviceTier, tiers.of(e.DeviceTier), e.Speculative)
 		}
-		if !acc.key(refs) {
+		if !acc.endKey() {
 			break
 		}
 	}
@@ -294,16 +356,18 @@ type matchSlot struct {
 	confirmedAlive bool
 }
 
-// prefixAccumulator folds an ordered walk over request keys into per-pod
+// prefixAccumulator folds an ordered walk over request keys into per-endpoint
 // prefix matches. It is the single implementation of the matching rules:
-// candidates are the pods holding the first key, each chain ends at the
-// first key its pod does not hold, duplicate entries for a pod at one key
-// take the highest weight, and every tier tracks its own contiguous prefix.
+// candidates are the endpoints holding the first key, each chain ends at the
+// first key its endpoint does not hold, duplicate entries for an endpoint at
+// one key take the highest weight, and every tier tracks its own contiguous
+// prefix.
 //
-// Feeders present each key's entries through key, in key order, and stop at
-// the first key without entries or once key reports no live chain. Ordinals
-// only need to be stable within one accumulation; they key request-local
-// tables and never size state, so sparse or large values cost nothing.
+// Feeders present each key through beginKey, entry, and endKey, in key order,
+// and stop at the first key without entries or once endKey reports no live
+// chain. Ordinals only need to be stable within one accumulation; they key
+// request-local tables and never size state, so sparse or large values cost
+// nothing.
 type prefixAccumulator struct {
 	weights map[string]float64
 	filter  sets.Set[string]
@@ -337,68 +401,57 @@ func releaseAccumulator(a *prefixAccumulator) {
 	accumulatorPool.Put(a)
 }
 
-// key folds one key's entries into the chains and reports whether any chain
-// is still alive. entries is borrowed for the duration of the call.
-func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
+// beginKey starts the next key. numEntries sizes the candidate table at the
+// first key.
+func (a *prefixAccumulator) beginKey(numEntries int) {
 	a.keyStamp++
 	if a.first {
-		a.table.reset(len(entries))
+		a.table.reset(numEntries)
 	}
-
-	var prev *kvblock.EntryRef
-	for i := range entries {
-		ref := &entries[i]
-		// Another rank of an endpoint just folded at this key adds nothing
-		// to its chains.
-		if prev != nil && ref.PodOrdinal == prev.PodOrdinal && ref.TierOrdinal == prev.TierOrdinal &&
-			ref.Speculative == prev.Speculative {
-			continue
-		}
-		prev = ref
-
-		s, ok := a.table.lookup(ref.PodOrdinal)
-		if !ok {
-			if !a.first || (a.filter.Len() > 0 && !a.filter.Has(ref.PodIdentifier)) {
-				continue // the first key fixes the candidate set
-			}
-			s = a.newSlot(ref.PodIdentifier)
-			a.table.insert(ref.PodOrdinal, s)
-		}
-		slot := &a.slots[s]
-
-		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
-		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
-			tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
-		} else {
-			slot.confirmedSeen = a.keyStamp
-		}
-
-		w := a.weightOf(tier, tierOrdinal)
-		switch {
-		case slot.seen != a.keyStamp:
-			slot.seen = a.keyStamp
-			slot.weight = w
-		case w > slot.weight:
-			slot.weight = w
-		}
-
-		if !a.stampTier(slot, tierOrdinal) && a.first {
-			slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrdinal, name: tier, seen: a.keyStamp, alive: true})
-		}
-	}
-	return a.endKey()
 }
 
-// stampTier marks tier as held at the current key and reports whether the
-// slot tracks that tier.
-func (a *prefixAccumulator) stampTier(slot *matchSlot, tierOrdinal uint32) bool {
+// entry records that pod holds the current key in tier.
+func (a *prefixAccumulator) entry(
+	pod string,
+	podOrdinal uint32,
+	filterPod string,
+	tier string,
+	tierOrdinal uint32,
+	speculative bool,
+) {
+	s, ok := a.table.lookup(podOrdinal)
+	if !ok {
+		if !a.first || (a.filter.Len() > 0 && !a.filter.Has(filterPod)) {
+			return // the first key fixes the candidate set
+		}
+		s = a.newSlot(pod)
+		a.table.insert(podOrdinal, s)
+	}
+	slot := &a.slots[s]
+
+	if speculative || tier == SpeculativeTier {
+		tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
+	} else {
+		slot.confirmedSeen = a.keyStamp
+	}
+	w := a.weightOf(tier, tierOrdinal)
+	switch {
+	case slot.seen != a.keyStamp:
+		slot.seen = a.keyStamp
+		slot.weight = w
+	case w > slot.weight:
+		slot.weight = w
+	}
+
 	for i := range slot.tiers {
 		if slot.tiers[i].ordinal == tierOrdinal {
 			slot.tiers[i].seen = a.keyStamp
-			return true
+			return
 		}
 	}
-	return false
+	if a.first {
+		slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrdinal, name: tier, seen: a.keyStamp, alive: true})
+	}
 }
 
 // endKey closes the current key and reports whether any chain is still
