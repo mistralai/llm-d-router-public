@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"sync"
 	"time"
 
@@ -41,9 +42,11 @@ func init() {
 }
 
 const (
-	RedisStateStoreType = "redis-state-store"
-	defaultAddress      = "localhost:6379"
-	defaultTTL          = 180 * time.Second
+	RedisStateStoreType  = "redis-state-store"
+	defaultAddress       = "localhost:6379"
+	defaultTTL           = 180 * time.Second
+	concreteValuePrefix  = "\x00llm-d-redis-concrete\x00"
+	concreteValueVersion = uint8(1)
 )
 
 var _ fwkdl.CrossReplicaSyncer = (*RedisStateStore)(nil)
@@ -56,8 +59,8 @@ type redisConfig struct {
 }
 
 // RedisStateStore is a CrossReplicaSyncer backed by Redis for cross-replica
-// state sharing. Set prepares each endpoint's aggregate, and Get serves the
-// prepared value from memory.
+// state sharing. Set caches each endpoint's peer values, and Get aggregates
+// unexpired peers from memory.
 type RedisStateStore struct {
 	typedName fwkplugin.TypedName
 	replicaID string
@@ -67,11 +70,16 @@ type RedisStateStore struct {
 }
 
 type aggregateCacheEntry struct {
+	values    []cachedReplicaValue
+	aggregate func([]any) any
+}
+
+type cachedReplicaValue struct {
 	value     any
 	expiresAt time.Time
 }
 
-func RedisStateStoreFactory(name string, params *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
+func RedisStateStoreFactory(name string, params *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 	var cfg redisConfig
 	if params != nil {
 		if err := params.Decode(&cfg); err != nil {
@@ -90,6 +98,9 @@ func RedisStateStoreFactory(name string, params *json.Decoder, handle fwkplugin.
 		}
 		ttl = parsed
 	}
+	if ttl <= 0 {
+		return nil, fmt.Errorf("redis-state-store: ttl must be positive, got %s", ttl)
+	}
 
 	hostname, _ := os.Hostname()
 	if hostname == "" {
@@ -101,14 +112,6 @@ func RedisStateStoreFactory(name string, params *json.Decoder, handle fwkplugin.
 		Password: cfg.Password,
 		DB:       cfg.DB,
 	})
-
-	ctx := context.Background()
-	if handle != nil && handle.Context() != nil {
-		ctx = handle.Context()
-	}
-	if err := client.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("redis-state-store: failed to connect to Redis at %s: %w", cfg.Address, err)
-	}
 
 	return &RedisStateStore{
 		typedName: fwkplugin.TypedName{Type: RedisStateStoreType, Name: name},
@@ -136,23 +139,111 @@ type stampedValue struct {
 	WrittenAt time.Time
 }
 
+type concreteValueHeader struct {
+	Version   uint8
+	Type      string
+	WrittenAt time.Time
+}
+
+func concreteTypeID(valueType reflect.Type) string {
+	if valueType.Name() != "" {
+		if valueType.PkgPath() == "" {
+			return valueType.Name()
+		}
+		return valueType.PkgPath() + "." + valueType.Name()
+	}
+
+	switch valueType.Kind() {
+	case reflect.Pointer:
+		return "*" + concreteTypeID(valueType.Elem())
+	case reflect.Slice:
+		return "[]" + concreteTypeID(valueType.Elem())
+	case reflect.Array:
+		return fmt.Sprintf("[%d]%s", valueType.Len(), concreteTypeID(valueType.Elem()))
+	case reflect.Map:
+		return "map[" + concreteTypeID(valueType.Key()) + "]" + concreteTypeID(valueType.Elem())
+	default:
+		return valueType.String()
+	}
+}
+
 func encodeStamped(value any, now time.Time) ([]byte, error) {
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(stampedValue{Value: value, WrittenAt: now}); err != nil {
+	// Keep the existing representation for registered and built-in values so
+	// deployments can be upgraded while older replicas are still publishing.
+	if err := gob.NewEncoder(&buf).Encode(stampedValue{Value: value, WrittenAt: now}); err == nil {
+		return buf.Bytes(), nil
+	}
+
+	buf.Reset()
+	buf.WriteString(concreteValuePrefix)
+	encoder := gob.NewEncoder(&buf)
+	if err := encoder.Encode(concreteValueHeader{
+		Version:   concreteValueVersion,
+		Type:      concreteTypeID(reflect.TypeOf(value)),
+		WrittenAt: now,
+	}); err != nil {
+		return nil, err
+	}
+	if err := encoder.Encode(value); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
-func gobDecode(data []byte) (stampedValue, error) {
+func gobDecode(data []byte, prototype any) (stampedValue, error) {
+	if bytes.HasPrefix(data, []byte(concreteValuePrefix)) {
+		return decodeConcreteValue(data[len(concreteValuePrefix):], prototype)
+	}
+
 	var value stampedValue
 	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&value); err != nil {
 		return stampedValue{}, err
 	}
+	if prototype != nil && reflect.TypeOf(value.Value) != reflect.TypeOf(prototype) {
+		return stampedValue{}, fmt.Errorf("stored type %T does not match expected type %T", value.Value, prototype)
+	}
 	return value, nil
 }
 
-// Set publishes this replica's value and prepares the aggregate returned by Get.
+func decodeConcreteValue(data []byte, prototype any) (stampedValue, error) {
+	if prototype == nil {
+		return stampedValue{}, errors.New("cannot decode stored value without a type prototype")
+	}
+
+	decoder := gob.NewDecoder(bytes.NewReader(data))
+	var header concreteValueHeader
+	if err := decoder.Decode(&header); err != nil {
+		return stampedValue{}, err
+	}
+	if header.Version != concreteValueVersion {
+		return stampedValue{}, fmt.Errorf("unsupported concrete value version %d", header.Version)
+	}
+
+	valueType := reflect.TypeOf(prototype)
+	expectedType := concreteTypeID(valueType)
+	if header.Type != expectedType {
+		return stampedValue{}, fmt.Errorf("stored type %s does not match expected type %s", header.Type, expectedType)
+	}
+	var target reflect.Value
+	if valueType.Kind() == reflect.Pointer {
+		target = reflect.New(valueType.Elem())
+	} else {
+		target = reflect.New(valueType)
+	}
+	if err := decoder.Decode(target.Interface()); err != nil {
+		return stampedValue{}, err
+	}
+	var value any
+	if valueType.Kind() == reflect.Pointer {
+		value = target.Interface()
+	} else {
+		value = target.Elem().Interface()
+	}
+	return stampedValue{Value: value, WrittenAt: header.WrittenAt}, nil
+}
+
+// Set publishes this replica's value and caches the peer values used by Get.
 func (s *RedisStateStore) Set(ctx context.Context, key fwkdl.StateKey, endpointID string, value any, aggregate func([]any) any) error {
 	logger := ctrl.LoggerFrom(ctx)
 	now := time.Now()
@@ -176,41 +267,44 @@ func (s *RedisStateStore) Set(ctx context.Context, key fwkdl.StateKey, endpointI
 	if err != nil {
 		return fmt.Errorf("redis-state-store: hgetall: %w", err)
 	}
-	values := make([]any, 0, len(raw))
+	values := make([]cachedReplicaValue, 0, len(raw))
 	for field, encoded := range raw {
-		stamped, err := gobDecode([]byte(encoded))
+		if field == s.replicaID {
+			continue
+		}
+		stamped, err := gobDecode([]byte(encoded), value)
 		if err != nil {
 			if v := logger.V(logutil.DEBUG); v.Enabled() {
 				v.Info("redis-state-store: decode error", "field", field, "error", err)
 			}
 			continue
 		}
-		if now.Sub(stamped.WrittenAt) > s.ttl {
+		expiresAt := stamped.WrittenAt.Add(s.ttl)
+		if !expiresAt.After(now) {
 			if v := logger.V(logutil.DEBUG); v.Enabled() {
 				v.Info("redis-state-store: skipping stale entry", "field", field, "age", now.Sub(stamped.WrittenAt), "ttl", s.ttl)
 			}
 			continue
 		}
-		values = append(values, stamped.Value)
+		values = append(values, cachedReplicaValue{value: stamped.Value, expiresAt: expiresAt})
 	}
 
 	if len(values) == 0 {
 		s.cache.Delete(hashKey)
 		return nil
 	}
-	aggregated := aggregate(values)
 	s.cache.Store(hashKey, &aggregateCacheEntry{
-		value:     aggregated,
-		expiresAt: now.Add(s.ttl),
+		values:    values,
+		aggregate: aggregate,
 	})
 
 	if v := logger.V(logutil.DEBUG); v.Enabled() {
-		v.Info("redis-state-store: Set", "key", string(key), "endpoint", endpointID, "replica", s.replicaID, "numReplicas", len(values), "result", fmt.Sprintf("%+v", aggregated))
+		v.Info("redis-state-store: Set", "key", string(key), "endpoint", endpointID, "replica", s.replicaID, "numPeers", len(values))
 	}
 	return nil
 }
 
-// Get returns the aggregate prepared by the most recent Set.
+// Get aggregates the unexpired peer values cached by the most recent Set.
 func (s *RedisStateStore) Get(_ context.Context, key fwkdl.StateKey, endpointID string) (any, bool, error) {
 	hashKey := s.hashKey(key, endpointID)
 	cached, ok := s.cache.Load(hashKey)
@@ -218,11 +312,18 @@ func (s *RedisStateStore) Get(_ context.Context, key fwkdl.StateKey, endpointID 
 		return nil, false, nil
 	}
 	entry := cached.(*aggregateCacheEntry)
-	if entry.expiresAt.Before(time.Now()) {
+	now := time.Now()
+	values := make([]any, 0, len(entry.values))
+	for _, cachedValue := range entry.values {
+		if cachedValue.expiresAt.After(now) {
+			values = append(values, cachedValue.value)
+		}
+	}
+	if len(values) == 0 {
 		s.cache.CompareAndDelete(hashKey, cached)
 		return nil, false, nil
 	}
-	return entry.value, true, nil
+	return entry.aggregate(values), true, nil
 }
 
 func (s *RedisStateStore) Delete(ctx context.Context, key fwkdl.StateKey, endpointID string) error {
@@ -258,7 +359,7 @@ func (s *RedisStateStore) GetOrSet(ctx context.Context, key fwkdl.StateKey, id s
 		return nil, false, fmt.Errorf("redis-state-store: getorset: %w", err)
 	}
 
-	actual, err := gobDecode([]byte(stored))
+	actual, err := gobDecode([]byte(stored), candidate)
 	if err != nil {
 		return nil, false, fmt.Errorf("redis-state-store: getorset decode: %w", err)
 	}
