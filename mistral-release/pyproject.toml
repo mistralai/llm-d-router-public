@@ -1,7 +1,7 @@
 [project]
 name = "mistral-release"
 version = "0.1.0"
-description = "Rebuild the mistral-main branch from feature branches replayed on upstream/main."
+description = "Rebuild mistral-main from feature branches on a selected upstream base."
 requires-python = ">=3.11"
 dependencies = []
 

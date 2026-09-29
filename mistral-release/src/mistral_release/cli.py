@@ -1,12 +1,10 @@
 """Command-line entry point that wires the pieces together.
 
-Rebuild the ``mistral-main`` branch from scratch on top of ``upstream/main``:
-``mistral-main`` is reconstructed as ``upstream/main`` plus every mistral-specific
-commit contributed by the branches listed in ``.mistral_branches.txt``. Branches
-are applied in list order; commits already present upstream or applied by an
-earlier branch are skipped. ``upstream-main`` is mirrored to the latest
-``upstream/main`` at the same time, and both branches are pushed together
-atomically.
+Rebuild ``mistral-main`` from the configured base and feature branches. With
+``--update-main``, the base is ``upstream/main`` and the tool also updates
+``upstream-main``. Otherwise, the base is ``origin/upstream-main``. The tool applies
+the feature branches in list order. It skips commits that are in the base or an
+earlier branch.
 
 The rebuild happens in a throwaway detached worktree, so the current checkout is
 never touched. Nothing is pushed unless ``--push`` is given. On ``--push`` local
@@ -78,14 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--main-branch",
         default=DEFAULT_MAIN_BRANCH,
-        help="branch mirrored to upstream/main",
+        help="origin branch that stores the pinned upstream base",
     )
     parser.add_argument(
         "--update-main",
         action=argparse.BooleanOptionalAction,
-        default=None,
-        help="mirror upstream/main into origin/<main-branch> "
-        "(default: only for the canonical target)",
+        help="Use upstream/main as the base. Mirror it into "
+        "origin/<main-branch>. Without this option, use origin/<main-branch> "
+        "as the base.",
     )
     parser.add_argument(
         "--force-push-main",
@@ -108,8 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--triggered-by",
         default=None,
         help="branch whose push triggered this run (CI push events). The rebuild "
-        "runs only if it is the main branch or a listed feature branch; otherwise "
-        "the run exits cleanly. In this mode the main branch is never updated.",
+        "runs only for the main branch, branches branch, or a listed feature "
+        "branch. Other branches cause a clean exit. This mode uses the pinned "
+        "main branch as the base.",
     )
     parser.add_argument(
         "--push",
@@ -138,6 +137,10 @@ def _run(args: argparse.Namespace) -> int:
     repo_root = Path(git_out("rev-parse", "--show-toplevel"))
     config_ref = args.config_ref or f"{args.origin_remote}/{args.branches_branch}"
     current_branch = git_out("rev-parse", "--abbrev-ref", "HEAD", cwd=repo_root)
+    target_branch = args.target_branch or DEFAULT_TARGET_BRANCH
+    update_main = args.update_main is True
+    if args.triggered_by is not None:
+        update_main = False
 
     config_kind, config_value, config_desc = config_source(
         repo_root, args.config, config_ref, args.branches_branch
@@ -155,11 +158,10 @@ def _run(args: argparse.Namespace) -> int:
             return 2
 
     if not args.no_fetch:
-        print(
-            f"Fetching {args.upstream_remote}/{args.upstream_branch} "
-            f"and {args.origin_remote} ..."
-        )
-        git("fetch", args.upstream_remote, args.upstream_branch, cwd=repo_root)
+        if update_main:
+            print(f"Fetching {args.upstream_remote}/{args.upstream_branch} ...")
+            git("fetch", args.upstream_remote, args.upstream_branch, cwd=repo_root)
+        print(f"Fetching {args.origin_remote} ...")
         git("fetch", "--prune", args.origin_remote, cwd=repo_root)
 
     if branches_branch_guard_applies(
@@ -184,11 +186,6 @@ def _run(args: argparse.Namespace) -> int:
             "or a synced branch.\n"
         )
 
-    target_branch = args.target_branch or DEFAULT_TARGET_BRANCH
-    update_main = args.update_main
-    if update_main is None:
-        update_main = target_branch == DEFAULT_TARGET_BRANCH
-
     try:
         branches, config_text = load_config(config_kind, config_value, repo_root)
     except (GitError, OSError) as exc:
@@ -207,18 +204,24 @@ def _run(args: argparse.Namespace) -> int:
         )
         return 2
 
-    if args.triggered_by is not None:
-        # A push-triggered run mirrors CI: it only ever rebuilds the target and never
-        # touches the main branch, whatever --update-main would otherwise select.
-        update_main = False
-        if not is_triggering_branch(args.triggered_by, args.main_branch, branches):
-            print(
-                f"Push to '{args.triggered_by}' does not affect {target_branch}: it is "
-                f"neither '{args.main_branch}' nor a listed branch. Nothing to do."
-            )
-            return 0
+    if args.triggered_by is not None and not is_triggering_branch(
+        args.triggered_by,
+        args.main_branch,
+        args.branches_branch,
+        branches,
+    ):
+        print(
+            f"Push to '{args.triggered_by}' does not affect {target_branch}: it is "
+            f"not '{args.main_branch}', '{args.branches_branch}', or a listed "
+            "feature branch. Nothing to do."
+        )
+        return 0
 
-    base_ref = f"{args.upstream_remote}/{args.upstream_branch}"
+    base_ref = (
+        f"{args.upstream_remote}/{args.upstream_branch}"
+        if update_main
+        else f"{args.origin_remote}/{args.main_branch}"
+    )
     base_sha = git_out("rev-parse", base_ref, cwd=repo_root)
 
     missing = [
