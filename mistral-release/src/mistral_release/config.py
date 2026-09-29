@@ -22,14 +22,17 @@ def reserved_conflicts(branches: list[str], reserved: Iterable[str]) -> list[str
 
 
 def is_triggering_branch(
-    triggered_by: str, main_branch: str, branches: list[str]
+    triggered_by: str,
+    main_branch: str,
+    branches_branch: str,
+    branches: list[str],
 ) -> bool:
     """Returns whether a push to ``triggered_by`` should rebuild the target.
 
-    A push matters only when it lands on the main branch (a new upstream base) or on
-    one of the feature branches that feed the rebuild. Any other push is a no-op.
+    The main branch supplies the base. The branches branch supplies the ordered
+    list. The listed feature branches supply the changes.
     """
-    return triggered_by == main_branch or triggered_by in branches
+    return triggered_by in {main_branch, branches_branch} or triggered_by in branches
 
 
 def branches_branch_guard_applies(
