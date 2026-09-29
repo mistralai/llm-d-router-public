@@ -52,6 +52,17 @@ type GenericEvent interface {
 	Type() EventType
 }
 
+// UnknownEvent preserves an unsupported tag. A batch that contains this event
+// invalidates the source cache scope because its effect on residency is unknown.
+type UnknownEvent struct {
+	Tag EventType
+}
+
+// Type returns the event type.
+func (e *UnknownEvent) Type() EventType {
+	return e.Tag
+}
+
 // EventBatch represents a batch of generic events from an inference engine.
 type EventBatch struct {
 	Timestamp        float64

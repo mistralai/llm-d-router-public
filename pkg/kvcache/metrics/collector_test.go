@@ -52,6 +52,7 @@ func TestCollectorsIncludesAllMetrics(t *testing.T) {
 		{"MaxPodHitCount", MaxPodHitCount},
 		{"DedupRemovedHashesSuppressed", DedupRemovedHashesSuppressed},
 		{"DedupRemovedHashesForwarded", DedupRemovedHashesForwarded},
+		{"UnknownEvents", UnknownEvents},
 		{"KVEventStoresSkipped", KVEventStoresSkipped},
 		{"KVEventRemovalsSkipped", KVEventRemovalsSkipped},
 		{"SubscriberActive", SubscriberActive},
@@ -74,7 +75,7 @@ func TestKVEventsMetricNames(t *testing.T) {
 	// subsystem with the kv_cache_events prefix.
 	reg := prometheus.NewRegistry()
 	kvevents := []prometheus.Collector{
-		KVEventStoresSkipped, KVEventRemovalsSkipped,
+		KVEventStoresSkipped, KVEventRemovalsSkipped, UnknownEvents,
 		SubscriberActive, SubscriberReconnections, MessagesReceived,
 		ZMQErrors, PoolQueueDepth, PoolCapacity,
 	}
@@ -89,6 +90,7 @@ func TestKVEventsMetricNames(t *testing.T) {
 	ZMQErrors.WithLabelValues("pod-a", "recv").Inc()
 	KVEventStoresSkipped.WithLabelValues("sliding_window", "unsupported_cache_kind").Inc()
 	KVEventRemovalsSkipped.WithLabelValues("sliding_window", "unsupported_cache_kind").Inc()
+	UnknownEvents.Inc()
 	PoolQueueDepth.Set(3)
 	PoolCapacity.Set(4)
 
@@ -109,6 +111,7 @@ func TestKVEventsMetricNames(t *testing.T) {
 		"llm_d_epp_kv_cache_events_zmq_errors_total",
 		"llm_d_epp_kv_cache_events_stores_skipped_total",
 		"llm_d_epp_kv_cache_events_removals_skipped_total",
+		"llm_d_epp_kv_cache_events_unknown_events_total",
 		"llm_d_epp_kv_cache_events_pool_queue_depth",
 		"llm_d_epp_kv_cache_events_pool_capacity",
 	} {
