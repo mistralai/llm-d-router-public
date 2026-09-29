@@ -55,6 +55,9 @@ The first line of output states exactly which file or ref the list was read from
 so a missing branch is never a surprise. The rebuilt branch always carries that
 exact `.mistral_branches.txt`, so any build documents the list that produced it.
 
+The base depends on the main-branch option. `--update-main` uses the fetched
+`upstream/main`. `--no-update-main` uses the pinned `origin/upstream-main` mirror.
+
 Dry-run (default, touches nothing):
 
 ```sh
@@ -84,13 +87,13 @@ behind. Pass
 The **Build mistral-main branch** GitHub Action rebuilds `mistral-main` for you.
 
 - **On every push**: the action runs, but the tool exits cleanly and does nothing
-  unless the pushed branch is `upstream-main` or one of the branches listed in
-  `.mistral_branches.txt`. When it is, `mistral-main` is rebuilt and force-pushed.
-  A push-triggered run never touches `upstream-main`. So pushing a feature branch
-  that is in the list (or updating `mistral-branches`) is enough to refresh
-  `mistral-main`.
+  unless the pushed branch is `upstream-main`, `mistral-branches`, or one of the
+  branches listed in `.mistral_branches.txt`. The tool rebuilds `mistral-main`
+  from `origin/upstream-main`. A push-triggered run does not fetch the live
+  upstream base and does not update `upstream-main`.
 - **Manual dispatch**: use it to force a rebuild, to run a dry-run (uncheck *push*),
-  or to also mirror `upstream-main` to the latest `upstream/main` (check *update main*).
+  or to mirror `upstream-main` to the latest `upstream/main` (check *update main*).
+  Without *update main*, the run uses the pinned `origin/upstream-main` base.
 
 The tool's own pushes do not start another run: with the default `GITHUB_TOKEN`,
 GitHub does not re-trigger workflows from pushes it makes, and a push to
@@ -113,6 +116,9 @@ the `mistral-branches` worktree, add your branch to `.mistral_branches.txt`
 ```sh
 uv run --project mistral-release update-mistral-main --target-branch myuser/try --push
 ```
+
+A throwaway target uses `origin/upstream-main` by default. This keeps the test base
+equal to the pinned base that push-triggered rebuilds use.
 
 To just check whether an edit builds cleanly before pushing it, a plain dry-run on
 `mistral-branches` with the edit uncommitted is enough:
