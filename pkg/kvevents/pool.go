@@ -783,6 +783,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			p.clearPod(ctx, podIdentifier)
 
 		default:
+			metrics.UnknownEvents.Inc()
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)
 		}
 	}

@@ -1430,6 +1430,18 @@ func TestPool_DedupMetricsCountBlockHashes(t *testing.T) {
 		"second remove must forward all 4 constituent block hashes")
 }
 
+func TestPool_UnknownEventMetric(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, _, _ := newTestPool(t, 16)
+	before := counterValue(t, metrics.UnknownEvents)
+
+	pool.processEventBatch(ctx, &EventBatch{
+		Events: []GenericEvent{&UnknownEvent{Tag: "FutureEvent"}},
+	}, "pod-unknown", "test-model")
+
+	assert.Equal(t, 1.0, counterValue(t, metrics.UnknownEvents)-before)
+}
+
 // stubAdapter is a minimal EngineAdapter that shards every message onto the
 // same key and decodes to an empty batch, so tasks flow through the pool
 // without exercising any engine-specific parsing.

@@ -52,6 +52,16 @@ type GenericEvent interface {
 	Type() EventType
 }
 
+// UnknownEvent preserves an event tag that this router does not handle.
+type UnknownEvent struct {
+	Tag EventType
+}
+
+// Type returns the event type.
+func (e *UnknownEvent) Type() EventType {
+	return e.Tag
+}
+
 // EventBatch represents a batch of generic events from an inference engine.
 type EventBatch struct {
 	Timestamp        float64

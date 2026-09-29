@@ -52,6 +52,7 @@ func TestCollectorsIncludesAllMetrics(t *testing.T) {
 		{"MaxPodHitCount", MaxPodHitCount},
 		{"DedupRemovedHashesSuppressed", DedupRemovedHashesSuppressed},
 		{"DedupRemovedHashesForwarded", DedupRemovedHashesForwarded},
+		{"UnknownEvents", UnknownEvents},
 		{"KVEventStoresSkipped", KVEventStoresSkipped},
 		{"KVEventRemovalsSkipped", KVEventRemovalsSkipped},
 		{"SubscriberActive", SubscriberActive},
