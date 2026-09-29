@@ -580,6 +580,26 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 		"modelName", modelName,
 		"eventCount", len(batch.Events))
 
+	unknownCount := 0
+	for _, event := range batch.Events {
+		if _, ok := event.(*UnknownEvent); ok {
+			unknownCount++
+		}
+	}
+	if unknownCount > 0 {
+		metrics.UnknownEvents.Add(float64(unknownCount))
+		debugLogger.Info("Unknown events invalidate the source cache state",
+			"podIdentifier", podIdentifier,
+			"dataParallelRank", batch.DataParallelRank,
+			"unknownEventCount", unknownCount)
+		if batch.DataParallelRank == nil {
+			p.clearPod(ctx, podIdentifier)
+		} else {
+			p.clearRank(ctx, podIdentifier, *batch.DataParallelRank)
+		}
+		return
+	}
+
 	// Process each event in the batch
 	for _, genericEvent := range batch.Events {
 		switch ev := genericEvent.(type) {
@@ -825,8 +845,6 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				p.clearRank(ctx, podIdentifier, *batch.DataParallelRank)
 			}
 
-		default:
-			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)
 		}
 	}
 }
