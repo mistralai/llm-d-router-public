@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,10 +48,6 @@ const (
 var testStateKey = fwkdl.StateKey("inflight")
 
 type customValue struct {
-	Count int
-}
-
-type otherCustomValue struct {
 	Count int
 }
 
@@ -190,26 +185,22 @@ func TestEncodeStampedUsesConcreteValueStream(t *testing.T) {
 	writtenAt := time.Unix(123, 456).UTC()
 	data, err := encodeStamped(&customValue{Count: 7}, writtenAt)
 	require.NoError(t, err)
-	require.True(t, bytes.HasPrefix(data, []byte(concreteValuePrefix)))
 
-	decoder := gob.NewDecoder(bytes.NewReader(data[len(concreteValuePrefix):]))
-	var header concreteValueHeader
-	require.NoError(t, decoder.Decode(&header))
-	require.Equal(t, concreteValueVersion, header.Version)
-	require.Equal(t, concreteTypeID(reflect.TypeOf(&customValue{})), header.Type)
-	require.Equal(t, writtenAt, header.WrittenAt)
+	decoder := gob.NewDecoder(bytes.NewReader(data))
+	var decodedAt time.Time
+	require.NoError(t, decoder.Decode(&decodedAt))
+	require.Equal(t, writtenAt, decodedAt)
 
 	var value customValue
 	require.NoError(t, decoder.Decode(&value))
 	require.Equal(t, customValue{Count: 7}, value)
 }
 
-func TestEncodeStampedUsesConcreteValueStreamForRegisteredValue(t *testing.T) {
+func TestEncodeStampedSupportsInFlightLoad(t *testing.T) {
 	writtenAt := time.Unix(123, 456).UTC()
 	want := &attrconcurrency.InFlightLoad{Tokens: 7, Requests: 2}
 	data, err := encodeStamped(want, writtenAt)
 	require.NoError(t, err)
-	require.True(t, bytes.HasPrefix(data, []byte(concreteValuePrefix)))
 
 	stamped, err := gobDecode(data, &attrconcurrency.InFlightLoad{})
 	require.NoError(t, err)
@@ -403,22 +394,6 @@ func TestGetOrSetSupportsUnregisteredConcreteValue(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, existed)
 	require.Equal(t, &customValue{Count: 1}, actual)
-}
-
-func TestGetOrSetRejectsDifferentConcreteValueType(t *testing.T) {
-	server := miniredis.RunT(t)
-	storeA, _ := newTestStore(t, server, "epp-a")
-	storeB, _ := newTestStore(t, server, "epp-b")
-	ctx := context.Background()
-
-	_, existed, err := storeA.GetOrSet(ctx, "request", "request-id", &customValue{Count: 1})
-	require.NoError(t, err)
-	require.False(t, existed)
-
-	actual, existed, err := storeB.GetOrSet(ctx, "request", "request-id", &otherCustomValue{Count: 2})
-	require.ErrorContains(t, err, "does not match expected type")
-	require.False(t, existed)
-	require.Nil(t, actual)
 }
 
 func TestGetOrSetIsLinearizable(t *testing.T) {

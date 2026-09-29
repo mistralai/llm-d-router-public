@@ -37,11 +37,9 @@ import (
 )
 
 const (
-	RedisStateStoreType  = "redis-state-store"
-	defaultAddress       = "localhost:6379"
-	defaultTTL           = 180 * time.Second
-	concreteValuePrefix  = "\x00llm-d-redis-concrete\x00"
-	concreteValueVersion = uint8(1)
+	RedisStateStoreType = "redis-state-store"
+	defaultAddress      = "localhost:6379"
+	defaultTTL          = 180 * time.Second
 )
 
 var _ fwkdl.CrossReplicaSyncer = (*RedisStateStore)(nil)
@@ -134,47 +132,14 @@ type stampedValue struct {
 	WrittenAt time.Time
 }
 
-type concreteValueHeader struct {
-	Version   uint8
-	Type      string
-	WrittenAt time.Time
-}
-
-func concreteTypeID(valueType reflect.Type) string {
-	if valueType.Name() != "" {
-		if valueType.PkgPath() == "" {
-			return valueType.Name()
-		}
-		return valueType.PkgPath() + "." + valueType.Name()
-	}
-
-	switch valueType.Kind() {
-	case reflect.Pointer:
-		return "*" + concreteTypeID(valueType.Elem())
-	case reflect.Slice:
-		return "[]" + concreteTypeID(valueType.Elem())
-	case reflect.Array:
-		return fmt.Sprintf("[%d]%s", valueType.Len(), concreteTypeID(valueType.Elem()))
-	case reflect.Map:
-		return "map[" + concreteTypeID(valueType.Key()) + "]" + concreteTypeID(valueType.Elem())
-	default:
-		return valueType.String()
-	}
-}
-
 func encodeStamped(value any, now time.Time) ([]byte, error) {
 	if value == nil {
 		return nil, errors.New("cannot encode nil value")
 	}
 
 	var buf bytes.Buffer
-	buf.WriteString(concreteValuePrefix)
 	encoder := gob.NewEncoder(&buf)
-	if err := encoder.Encode(concreteValueHeader{
-		Version:   concreteValueVersion,
-		Type:      concreteTypeID(reflect.TypeOf(value)),
-		WrittenAt: now,
-	}); err != nil {
+	if err := encoder.Encode(now); err != nil {
 		return nil, err
 	}
 	if err := encoder.Encode(value); err != nil {
@@ -184,31 +149,17 @@ func encodeStamped(value any, now time.Time) ([]byte, error) {
 }
 
 func gobDecode(data []byte, prototype any) (stampedValue, error) {
-	if !bytes.HasPrefix(data, []byte(concreteValuePrefix)) {
-		return stampedValue{}, errors.New("unsupported value encoding")
-	}
-	return decodeConcreteValue(data[len(concreteValuePrefix):], prototype)
-}
-
-func decodeConcreteValue(data []byte, prototype any) (stampedValue, error) {
 	if prototype == nil {
 		return stampedValue{}, errors.New("cannot decode stored value without a type prototype")
 	}
 
 	decoder := gob.NewDecoder(bytes.NewReader(data))
-	var header concreteValueHeader
-	if err := decoder.Decode(&header); err != nil {
+	var writtenAt time.Time
+	if err := decoder.Decode(&writtenAt); err != nil {
 		return stampedValue{}, err
-	}
-	if header.Version != concreteValueVersion {
-		return stampedValue{}, fmt.Errorf("unsupported concrete value version %d", header.Version)
 	}
 
 	valueType := reflect.TypeOf(prototype)
-	expectedType := concreteTypeID(valueType)
-	if header.Type != expectedType {
-		return stampedValue{}, fmt.Errorf("stored type %s does not match expected type %s", header.Type, expectedType)
-	}
 	var target reflect.Value
 	if valueType.Kind() == reflect.Pointer {
 		target = reflect.New(valueType.Elem())
@@ -224,7 +175,7 @@ func decodeConcreteValue(data []byte, prototype any) (stampedValue, error) {
 	} else {
 		value = target.Elem().Interface()
 	}
-	return stampedValue{Value: value, WrittenAt: header.WrittenAt}, nil
+	return stampedValue{Value: value, WrittenAt: writtenAt}, nil
 }
 
 // Set publishes this replica's value and caches the peer values used by Get.

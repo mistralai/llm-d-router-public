@@ -32,9 +32,9 @@ Parameters:
 The configured Redis server must support field expiration and `SET NX GET`.
 Redis 7.4 or newer is required.
 
-Values stored under the same state key must use the same concrete Go type and
-must be encodable by `encoding/gob`. The store supports concrete value types
-without requiring contributors to register them globally with `gob.Register`.
+Values stored under the same state key must use a compatible `encoding/gob`
+schema. Each EPP decodes peer values into the type supplied by its local
+contributor without requiring global `gob.Register` calls.
 
 ## State Model
 
