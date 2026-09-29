@@ -160,22 +160,11 @@ func gobDecode(data []byte, prototype any) (stampedValue, error) {
 	}
 
 	valueType := reflect.TypeOf(prototype)
-	var target reflect.Value
-	if valueType.Kind() == reflect.Pointer {
-		target = reflect.New(valueType.Elem())
-	} else {
-		target = reflect.New(valueType)
-	}
+	target := reflect.New(valueType)
 	if err := decoder.Decode(target.Interface()); err != nil {
 		return stampedValue{}, err
 	}
-	var value any
-	if valueType.Kind() == reflect.Pointer {
-		value = target.Interface()
-	} else {
-		value = target.Elem().Interface()
-	}
-	return stampedValue{Value: value, WrittenAt: writtenAt}, nil
+	return stampedValue{Value: target.Elem().Interface(), WrittenAt: writtenAt}, nil
 }
 
 // Set publishes this replica's value and caches the peer values used by Get.
