@@ -204,15 +204,15 @@ func TestEncodeStampedUsesConcreteValueStream(t *testing.T) {
 	require.Equal(t, customValue{Count: 7}, value)
 }
 
-func TestEncodeStampedKeepsRegisteredValueFormat(t *testing.T) {
+func TestEncodeStampedUsesConcreteValueStreamForRegisteredValue(t *testing.T) {
 	writtenAt := time.Unix(123, 456).UTC()
 	want := &attrconcurrency.InFlightLoad{Tokens: 7, Requests: 2}
 	data, err := encodeStamped(want, writtenAt)
 	require.NoError(t, err)
-	require.False(t, bytes.HasPrefix(data, []byte(concreteValuePrefix)))
+	require.True(t, bytes.HasPrefix(data, []byte(concreteValuePrefix)))
 
-	var stamped stampedValue
-	require.NoError(t, gob.NewDecoder(bytes.NewReader(data)).Decode(&stamped))
+	stamped, err := gobDecode(data, &attrconcurrency.InFlightLoad{})
+	require.NoError(t, err)
 	require.Equal(t, want, stamped.Value)
 	require.Equal(t, writtenAt, stamped.WrittenAt)
 }

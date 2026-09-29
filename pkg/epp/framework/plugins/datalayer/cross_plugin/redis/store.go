@@ -34,12 +34,7 @@ import (
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
-	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 )
-
-func init() {
-	gob.Register(&attrconcurrency.InFlightLoad{})
-}
 
 const (
 	RedisStateStoreType  = "redis-state-store"
@@ -168,14 +163,11 @@ func concreteTypeID(valueType reflect.Type) string {
 }
 
 func encodeStamped(value any, now time.Time) ([]byte, error) {
-	var buf bytes.Buffer
-	// Keep the existing representation for registered and built-in values so
-	// deployments can be upgraded while older replicas are still publishing.
-	if err := gob.NewEncoder(&buf).Encode(stampedValue{Value: value, WrittenAt: now}); err == nil {
-		return buf.Bytes(), nil
+	if value == nil {
+		return nil, errors.New("cannot encode nil value")
 	}
 
-	buf.Reset()
+	var buf bytes.Buffer
 	buf.WriteString(concreteValuePrefix)
 	encoder := gob.NewEncoder(&buf)
 	if err := encoder.Encode(concreteValueHeader{
@@ -192,18 +184,10 @@ func encodeStamped(value any, now time.Time) ([]byte, error) {
 }
 
 func gobDecode(data []byte, prototype any) (stampedValue, error) {
-	if bytes.HasPrefix(data, []byte(concreteValuePrefix)) {
-		return decodeConcreteValue(data[len(concreteValuePrefix):], prototype)
+	if !bytes.HasPrefix(data, []byte(concreteValuePrefix)) {
+		return stampedValue{}, errors.New("unsupported value encoding")
 	}
-
-	var value stampedValue
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&value); err != nil {
-		return stampedValue{}, err
-	}
-	if prototype != nil && reflect.TypeOf(value.Value) != reflect.TypeOf(prototype) {
-		return stampedValue{}, fmt.Errorf("stored type %T does not match expected type %T", value.Value, prototype)
-	}
-	return value, nil
+	return decodeConcreteValue(data[len(concreteValuePrefix):], prototype)
 }
 
 func decodeConcreteValue(data []byte, prototype any) (stampedValue, error) {
