@@ -106,9 +106,12 @@ func (k *Indexer) matchBlockKeys(ctx context.Context, keys []kvblock.BlockHash,
 
 	var matches map[string]PodMatch
 	var err error
-	if k.keyWalker != nil {
+	switch {
+	case k.compactWalker != nil:
+		matches, err = matchCompactWalk(ctx, k.compactWalker, keys, k.tierWeights, podFilter)
+	case k.keyWalker != nil:
 		matches, err = matchWalk(ctx, k.keyWalker, keys, k.tierWeights, podFilter)
-	} else {
+	default:
 		matches, err = matchLookup(ctx, k.kvBlockIndex, keys, k.tierWeights, podFilter)
 	}
 	if err != nil {
@@ -126,6 +129,30 @@ func (k *Indexer) matchBlockKeys(ctx context.Context, keys []kvblock.BlockHash,
 		semconv.LLMDKVCachePrefixMatchLongestChain(blocksFound),
 	)
 	return matches, nil
+}
+
+func matchCompactWalk(ctx context.Context, walker kvblock.CompactKeyWalker, keys []kvblock.BlockHash,
+	weights map[string]float64, filter sets.Set[string],
+) (map[string]PodMatch, error) {
+	acc := acquireAccumulator(weights, filter)
+	defer releaseAccumulator(acc)
+
+	var buildErr error
+	err := walker.WalkCompactKeys(ctx, keys, func(_ int, found bool, entries []kvblock.CompactEntryRef) bool {
+		if !found || len(entries) == 0 {
+			return false
+		}
+		var keepGoing bool
+		keepGoing, buildErr = acc.compactKey(entries, walker)
+		return buildErr == nil && keepGoing
+	})
+	if err != nil {
+		return nil, err
+	}
+	if buildErr != nil {
+		return nil, buildErr
+	}
+	return acc.result(), nil
 }
 
 // maxMatchedBlocks returns the longest chain among matches.
@@ -319,6 +346,68 @@ func (t *slotTable) insert(ordinal uint32, slot int32) {
 	t.buckets[i] = slotRef{ordinal: ordinal, slot: uint32(slot) + 1}
 }
 
+type compactEndpoint struct {
+	pod                 uint32
+	dataParallelRank    int
+	hasDataParallelRank bool
+}
+
+type compactSlotRef struct {
+	endpoint compactEndpoint
+	slot     uint32
+}
+
+type compactSlotTable struct {
+	buckets []compactSlotRef
+}
+
+func (t *compactSlotTable) reset(numEntries int) {
+	size := 2
+	for size < numEntries*2 {
+		size <<= 1
+	}
+	if cap(t.buckets) < size {
+		t.buckets = make([]compactSlotRef, size)
+		return
+	}
+	t.buckets = t.buckets[:size]
+	clear(t.buckets)
+}
+
+func (t *compactSlotTable) lookup(endpoint compactEndpoint) (int32, bool) {
+	mask := uint64(len(t.buckets) - 1)
+	rank := uint64(endpoint.dataParallelRank)
+	hash := uint64(endpoint.pod)*11400714819323198485 ^ rank ^ rank>>32
+	if endpoint.hasDataParallelRank {
+		hash ^= 0x9e3779b97f4a7c15
+	}
+	i := hash & mask
+	for {
+		bucket := t.buckets[i]
+		if bucket.slot == 0 {
+			return 0, false
+		}
+		if bucket.endpoint == endpoint {
+			return int32(bucket.slot - 1), true
+		}
+		i = (i + 1) & mask
+	}
+}
+
+func (t *compactSlotTable) insert(endpoint compactEndpoint, slot int32) {
+	mask := uint64(len(t.buckets) - 1)
+	rank := uint64(endpoint.dataParallelRank)
+	hash := uint64(endpoint.pod)*11400714819323198485 ^ rank ^ rank>>32
+	if endpoint.hasDataParallelRank {
+		hash ^= 0x9e3779b97f4a7c15
+	}
+	i := hash & mask
+	for t.buckets[i].slot != 0 {
+		i = (i + 1) & mask
+	}
+	t.buckets[i] = compactSlotRef{endpoint: endpoint, slot: uint32(slot) + 1}
+}
+
 // tierChain tracks one tier's contiguous prefix for a candidate pod.
 type tierChain struct {
 	ordinal uint32
@@ -363,11 +452,12 @@ type prefixAccumulator struct {
 	weights map[string]float64
 	filter  sets.Set[string]
 
-	table    slotTable
-	slots    []matchSlot
-	active   []int32
-	keyStamp uint32
-	first    bool
+	table        slotTable
+	compactTable compactSlotTable
+	slots        []matchSlot
+	active       []int32
+	keyStamp     uint32
+	first        bool
 
 	// weightCache holds the weight of every tier seen in this accumulation,
 	// scanned linearly: requests see a handful of tiers.
@@ -399,6 +489,81 @@ func (a *prefixAccumulator) beginKey(numEntries int) {
 	if a.first {
 		a.table.reset(numEntries)
 	}
+}
+
+func (a *prefixAccumulator) compactKey(entries []kvblock.CompactEntryRef,
+	names kvblock.CompactKeyWalker,
+) (bool, error) {
+	a.keyStamp++
+	if a.first {
+		a.compactTable.reset(len(entries))
+	}
+
+	for i := range entries {
+		ref := &entries[i]
+		rank, hasRank := ref.DataParallelRank()
+		endpoint := compactEndpoint{
+			pod:                 ref.PodOrdinal,
+			dataParallelRank:    rank,
+			hasDataParallelRank: hasRank,
+		}
+		s, ok := a.compactTable.lookup(endpoint)
+		if !ok {
+			if !a.first {
+				continue
+			}
+			pod := names.PodName(ref.PodOrdinal)
+			if a.filter.Len() > 0 && !a.filter.Has(pod) {
+				continue
+			}
+			routingRank := routing.NoDataParallelRank
+			if hasRank {
+				routingRank = rank
+			}
+			candidate, err := routing.BuildDPScoringKey(pod, routingRank)
+			if err != nil {
+				return false, err
+			}
+			s = a.newSlot(candidate)
+			a.compactTable.insert(endpoint, s)
+		}
+		slot := &a.slots[s]
+
+		tierOrdinal := ref.TierOrdinal()
+		tier := SpeculativeTier
+		if !ref.Speculative() {
+			tier = names.TierName(tierOrdinal)
+		}
+		if ref.Speculative() || tier == SpeculativeTier {
+			tierOrdinal = speculativeTierOrdinal
+		}
+		weight := a.weightOf(tier, tierOrdinal)
+		switch {
+		case slot.seen != a.keyStamp:
+			slot.seen = a.keyStamp
+			slot.weight = weight
+		case weight > slot.weight:
+			slot.weight = weight
+		}
+
+		tracked := false
+		for tierIdx := range slot.tiers {
+			if slot.tiers[tierIdx].ordinal == tierOrdinal {
+				slot.tiers[tierIdx].seen = a.keyStamp
+				tracked = true
+				break
+			}
+		}
+		if a.first && !tracked {
+			slot.tiers = append(slot.tiers, tierChain{
+				ordinal: tierOrdinal,
+				name:    tier,
+				seen:    a.keyStamp,
+				alive:   true,
+			})
+		}
+	}
+	return a.endKey(), nil
 }
 
 // entry records that pod holds the current key in tier.

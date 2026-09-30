@@ -66,14 +66,22 @@ func BenchmarkScoreTokensMultiRank(b *testing.B) {
 	entries := make([]kvblock.PodEntry, 0, pods*ranks)
 	for p := 0; p < pods; p++ {
 		for r := 0; r < ranks; r++ {
+			rank := r
 			entries = append(entries, kvblock.PodEntry{
 				PodIdentifier: fmt.Sprintf("10.0.%d.%d:8200", p/256, p%256), DeviceTier: "gpu",
-				HasGroup: true, GroupIdx: kvblock.GroupID(r),
+				HasGroup: true, GroupIdx: kvblock.GroupID(r), DataParallelRank: &rank,
 			})
 		}
 	}
 	if err := indexer.KVBlockIndex().Add(ctx, nil, keys, entries); err != nil {
 		b.Fatal(err)
+	}
+	endpointMatches, err := indexer.MatchBlockKeysByEndpoint(ctx, keys, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(endpointMatches) != pods*ranks {
+		b.Fatalf("matched %d endpoints, want %d", len(endpointMatches), pods*ranks)
 	}
 
 	b.ReportAllocs()

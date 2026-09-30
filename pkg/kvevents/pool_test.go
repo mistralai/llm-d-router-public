@@ -1501,6 +1501,33 @@ func TestPool_DedupMetricsCountBlockHashes(t *testing.T) {
 		"second remove must forward all 4 constituent block hashes")
 }
 
+func TestPool_UnknownEventInvalidatesRank(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, _ := newTestPool(t, 16)
+	before := counterValue(t, metrics.UnknownEvents)
+	rank0, rank1 := 0, 1
+	key := kvblock.BlockHash(42)
+	require.NoError(t, idx.Add(ctx, nil, []kvblock.BlockHash{key}, []kvblock.PodEntry{
+		{PodIdentifier: "pod-unknown", DeviceTier: "gpu", DataParallelRank: &rank0},
+		{PodIdentifier: "pod-unknown", DeviceTier: "gpu", DataParallelRank: &rank1},
+	}))
+
+	pool.processEventBatch(ctx, &EventBatch{
+		Events: []GenericEvent{
+			&UnknownEvent{Tag: "FutureEvent"},
+			&BlockStoredEvent{BlockHashes: []uint64{99}, Tokens: makeTokens(16)},
+		},
+		DataParallelRank: &rank0,
+	}, "pod-unknown", "test-model")
+
+	assert.Equal(t, 1.0, counterValue(t, metrics.UnknownEvents)-before)
+	result, err := idx.Lookup(ctx, []kvblock.BlockHash{key}, nil)
+	require.NoError(t, err)
+	require.Len(t, result[key], 1)
+	require.NotNil(t, result[key][0].DataParallelRank)
+	assert.Equal(t, rank1, *result[key][0].DataParallelRank)
+}
+
 // stubAdapter is a minimal EngineAdapter that shards every message onto the
 // same key and decodes to an empty batch, so tasks flow through the pool
 // without exercising any engine-specific parsing.

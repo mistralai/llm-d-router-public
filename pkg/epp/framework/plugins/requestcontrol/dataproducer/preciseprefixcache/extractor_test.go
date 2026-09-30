@@ -702,8 +702,8 @@ func newRankPodMappingProducerWithRanks(t *testing.T, subscribers subscriberMana
 	}
 }
 
-func rankEndpoint(group string, rank int) fwkdl.Endpoint {
-	return rankEndpointAt(group, rank, "10.0.0.10")
+func rankEndpoint(rank int) fwkdl.Endpoint {
+	return rankEndpointAt("7", rank, "10.0.0.10")
 }
 
 func rankEndpointAt(group string, rank int, address string) fwkdl.Endpoint {
@@ -755,7 +755,7 @@ func TestProducer_RankPodMappingUsesWorkerTransportAndLeaderIdentity(t *testing.
 
 	require.NoError(t, p.Extract(context.Background(), fwkdl.EndpointEvent{
 		Type:     fwkdl.EventAddOrUpdate,
-		Endpoint: rankEndpoint("7", 1),
+		Endpoint: rankEndpoint(1),
 	}))
 	assert.Empty(t, subscribers.endpoints)
 
@@ -779,7 +779,7 @@ func TestProducer_RankPodMappingOffsetsPortsByGlobalRank(t *testing.T) {
 	podHandler := &rankPodNotificationHandler{producer: p}
 
 	require.NoError(t, endpointHandler.Extract(context.Background(), fwkdl.EndpointEvent{
-		Type: fwkdl.EventAddOrUpdate, Endpoint: rankEndpoint("7", 3),
+		Type: fwkdl.EventAddOrUpdate, Endpoint: rankEndpoint(3),
 	}))
 	require.NoError(t, podHandler.Extract(context.Background(), fwkdl.NotificationEvent{
 		Type:   fwkdl.EventAddOrUpdate,
@@ -805,7 +805,7 @@ func TestProducer_RankPodMappingHandlesPodFirstOrdering(t *testing.T) {
 
 	require.NoError(t, endpointHandler.Extract(context.Background(), fwkdl.EndpointEvent{
 		Type:     fwkdl.EventAddOrUpdate,
-		Endpoint: rankEndpoint("7", 1),
+		Endpoint: rankEndpoint(1),
 	}))
 
 	require.Len(t, subscribers.endpoints, 1)
@@ -827,7 +827,7 @@ func TestProducer_RankPodMappingReplacesSubscriberAfterWorkerRestart(t *testing.
 
 	require.NoError(t, endpointHandler.Extract(context.Background(), fwkdl.EndpointEvent{
 		Type:     fwkdl.EventAddOrUpdate,
-		Endpoint: rankEndpoint("7", 2),
+		Endpoint: rankEndpoint(2),
 	}))
 	for _, ip := range []string{"10.0.0.22", "10.0.0.32"} {
 		require.NoError(t, podHandler.Extract(context.Background(), fwkdl.NotificationEvent{
@@ -852,7 +852,7 @@ func TestProducer_RankPodMappingDuplicateWorkerUpdateIsNoOp(t *testing.T) {
 	podHandler := &rankPodNotificationHandler{producer: p}
 
 	require.NoError(t, endpointHandler.Extract(context.Background(), fwkdl.EndpointEvent{
-		Type: fwkdl.EventAddOrUpdate, Endpoint: rankEndpoint("7", 2),
+		Type: fwkdl.EventAddOrUpdate, Endpoint: rankEndpoint(2),
 	}))
 	worker := rankWorkerPod(t, "worker-7-2", "7", 2, "10.0.0.22", true)
 	for range 2 {
@@ -880,7 +880,7 @@ func TestProducer_RankPodMappingClearsOnlyRestartedRank(t *testing.T) {
 
 	require.NoError(t, endpointHandler.Extract(context.Background(), fwkdl.EndpointEvent{
 		Type:     fwkdl.EventAddOrUpdate,
-		Endpoint: rankEndpoint("7", 3),
+		Endpoint: rankEndpoint(3),
 	}))
 	worker := rankWorkerPod(t, "worker-7-3", "7", 3, "10.0.0.23", true)
 	require.NoError(t, podHandler.Extract(context.Background(), fwkdl.NotificationEvent{
@@ -908,7 +908,7 @@ func TestProducer_RankPodMappingEndpointDeleteUsesStoredIdentity(t *testing.T) {
 	endpointHandler := &rankEndpointHandler{producer: p}
 	podHandler := &rankPodNotificationHandler{producer: p}
 
-	endpoint := rankEndpoint("7", 2)
+	endpoint := rankEndpoint(2)
 	require.NoError(t, podHandler.Extract(context.Background(), fwkdl.NotificationEvent{
 		Type: fwkdl.EventAddOrUpdate, Object: rankWorkerPod(t, "worker-7-2", "7", 2, "10.0.0.22", true),
 	}))
@@ -939,7 +939,7 @@ func TestProducer_RankPodMappingNotReadyWorkerRemovesSubscriber(t *testing.T) {
 	podHandler := &rankPodNotificationHandler{producer: p}
 
 	require.NoError(t, endpointHandler.Extract(context.Background(), fwkdl.EndpointEvent{
-		Type: fwkdl.EventAddOrUpdate, Endpoint: rankEndpoint("7", 1),
+		Type: fwkdl.EventAddOrUpdate, Endpoint: rankEndpoint(1),
 	}))
 	worker := rankWorkerPod(t, "worker-7-1", "7", 1, "10.0.0.21", true)
 	require.NoError(t, podHandler.Extract(context.Background(), fwkdl.NotificationEvent{
@@ -965,7 +965,7 @@ func TestProducer_RankPodMappingFiltersWorkerPods(t *testing.T) {
 	endpointHandler := &rankEndpointHandler{producer: p}
 	podHandler := &rankPodNotificationHandler{producer: p}
 	require.NoError(t, endpointHandler.Extract(context.Background(), fwkdl.EndpointEvent{
-		Type: fwkdl.EventAddOrUpdate, Endpoint: rankEndpoint("7", 1),
+		Type: fwkdl.EventAddOrUpdate, Endpoint: rankEndpoint(1),
 	}))
 
 	wrongNamespace := rankWorkerPod(t, "wrong-ns", "7", 1, "10.0.0.31", true)
@@ -1022,7 +1022,7 @@ func TestProducer_RankPodMappingSupportsMultipleRanksPerPod(t *testing.T) {
 
 	for _, rank := range []int{2, 3} {
 		require.NoError(t, endpointHandler.Extract(context.Background(), fwkdl.EndpointEvent{
-			Type: fwkdl.EventAddOrUpdate, Endpoint: rankEndpoint("7", rank),
+			Type: fwkdl.EventAddOrUpdate, Endpoint: rankEndpoint(rank),
 		}))
 	}
 	require.NoError(t, podHandler.Extract(context.Background(), fwkdl.NotificationEvent{

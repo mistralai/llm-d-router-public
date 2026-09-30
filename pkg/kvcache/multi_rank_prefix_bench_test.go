@@ -26,9 +26,9 @@ import (
 )
 
 // Multi-rank fixture: 1,034 blocks held by 40 endpoints, each endpoint
-// carrying eight rank entries that share its PodIdentifier and differ only by
-// GroupIdx. Every block therefore holds 320 entries that must collapse to 40
-// matched pods.
+// carrying eight rank entries that share its PodIdentifier and differ by
+// GroupIdx and DataParallelRank. Every block therefore holds 320 entries that
+// must collapse to 40 matched pods.
 const (
 	multiRankBlocks = 1034
 	multiRankPods   = 40
@@ -56,9 +56,10 @@ func multiRankIndexer(tb testing.TB) (*kvcache.Indexer, []kvblock.BlockHash) {
 	entries := make([]kvblock.PodEntry, 0, multiRankPods*multiRankRanks)
 	for p := range multiRankPods {
 		for r := range multiRankRanks {
+			rank := r
 			entries = append(entries, kvblock.PodEntry{
 				PodIdentifier: multiRankPodID(p), DeviceTier: "gpu",
-				HasGroup: true, GroupIdx: kvblock.GroupID(r),
+				HasGroup: true, GroupIdx: kvblock.GroupID(r), DataParallelRank: &rank,
 			})
 		}
 	}
@@ -68,6 +69,9 @@ func multiRankIndexer(tb testing.TB) (*kvcache.Indexer, []kvblock.BlockHash) {
 	wrapped := kvblock.NewTracedIndex(kvblock.NewInstrumentedIndex(inner))
 	if _, ok := wrapped.(kvblock.KeyWalker); !ok {
 		tb.Fatal("production decorator chain does not expose KeyWalker: benchmark would measure the fallback")
+	}
+	if _, ok := wrapped.(kvblock.CompactKeyWalker); !ok {
+		tb.Fatal("production decorator chain does not expose CompactKeyWalker")
 	}
 	return kvcache.NewIndexerForTest(&mockTokenProcessor{}, wrapped, multiRankBackends), keys
 }
@@ -97,6 +101,19 @@ func validateMultiRank(tb testing.TB, matches map[string]kvcache.PodMatch) {
 
 func TestMultiRankFixtureSemantics(t *testing.T) {
 	indexer, keys := multiRankIndexer(t)
+	endpointMatches, err := indexer.MatchBlockKeysByEndpoint(context.Background(), keys, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(endpointMatches) != multiRankPods*multiRankRanks {
+		t.Fatalf("got %d endpoint matches, want %d", len(endpointMatches), multiRankPods*multiRankRanks)
+	}
+	for endpoint, match := range endpointMatches {
+		if match.MatchedBlocks != multiRankBlocks {
+			t.Fatalf("%s matched %d blocks, want %d", endpoint, match.MatchedBlocks, multiRankBlocks)
+		}
+	}
+
 	matches, err := indexer.MatchBlockKeys(context.Background(), keys, nil)
 	if err != nil {
 		t.Fatal(err)

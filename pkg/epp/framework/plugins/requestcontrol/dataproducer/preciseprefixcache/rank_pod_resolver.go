@@ -277,11 +277,11 @@ func (r *rankPodResolver) plan(id types.NamespacedName) (*rankSubscription, *ran
 func (r *rankPodResolver) desiredLocked(id types.NamespacedName) (*rankSubscription, error) {
 	endpoint, ok := r.endpoints[id]
 	if !ok || endpoint.metadata.Address == "" || endpoint.metadata.Port == "" {
-		return nil, nil
+		return nil, nil //nolint:nilnil // An incomplete endpoint does not require a subscription.
 	}
 	worker, ok := r.workers[endpoint.key]
 	if !ok {
-		return nil, nil
+		return nil, nil //nolint:nilnil // A leader without a worker does not require a subscription.
 	}
 	rank := endpoint.key.rank
 	transportPort := r.socketPort + rank

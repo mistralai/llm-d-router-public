@@ -141,6 +141,13 @@ var (
 	DedupRemovedHashesForwarded = newDualCounter("kvevents", "dedup_removed_hashes_forwarded_total",
 		"kv_cache_events_dedup_removed_hashes_forwarded_total",
 		"Block hashes forwarded for eviction after the KV-event dedup filter (block hashes, not BlockRemoved events)")
+	// UnknownEvents counts events that use an unsupported wire tag.
+	UnknownEvents = prometheus.NewCounter(prometheus.CounterOpts{
+		Subsystem: routerSubsystem, Name: "kv_cache_events_unknown_events_total",
+		Help: metricsutil.HelpMsgWithStability(
+			"KV-cache events with an unsupported wire tag",
+			compbasemetrics.ALPHA),
+	})
 	// KVEventStoresSkipped counts group-aware stores that cannot safely
 	// contribute to prefix indexing.
 	KVEventStoresSkipped = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -211,7 +218,7 @@ func Collectors() []prometheus.Collector {
 	return []prometheus.Collector{
 		Admissions, Evictions,
 		LookupRequests, LookupHits, LookupLatency, MaxPodHitCount,
-		DedupRemovedHashesSuppressed, DedupRemovedHashesForwarded,
+		DedupRemovedHashesSuppressed, DedupRemovedHashesForwarded, UnknownEvents,
 		KVEventStoresSkipped, KVEventRemovalsSkipped,
 		SubscriberActive, SubscriberReconnections, MessagesReceived, ZMQErrors,
 		PoolQueueDepth, PoolCapacity,
