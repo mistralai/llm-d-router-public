@@ -86,13 +86,13 @@ def test_reserved_conflicts_clean_list_is_empty():
 
 
 def test_is_triggering_branch():
-    branches = ["mistral-branches", "feat/a"]
-    assert is_triggering_branch("main", "main", branches) is True
-    assert is_triggering_branch("feat/a", "main", branches) is True
-    assert is_triggering_branch("mistral-branches", "main", branches) is True
-    assert is_triggering_branch("feat/other", "main", branches) is False
-    # the rebuilt target itself is not a source branch, so its push is a no-op
-    assert is_triggering_branch("mistral-main", "main", branches) is False
+    branches = ["feat/a"]
+    args = ("main", "mistral-branches", branches)
+    assert is_triggering_branch("main", *args) is True
+    assert is_triggering_branch("feat/a", *args) is True
+    assert is_triggering_branch("mistral-branches", *args) is True
+    assert is_triggering_branch("feat/other", *args) is False
+    assert is_triggering_branch("mistral-main", *args) is False
 
 
 def test_branches_branch_guard_applies():
