@@ -25,7 +25,7 @@ jobs:
       pull-requests: write # Required to post comments on PRs
     steps:
       - name: Check signed commits in PR
-        uses: 1Password/check-signed-commits-action@v1 # Use the action
+        uses: 1Password/check-signed-commits-action@ed2885f3ed2577a4f5d3c3fe895432a557d23d52 # v1
         with:
           comment: |
             🚨 Unsigned commits detected! Please sign your commits.
@@ -50,7 +50,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - name: Verify Signed-off-by trailer matches commit author email (DCO)
