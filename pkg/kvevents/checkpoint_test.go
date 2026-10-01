@@ -112,6 +112,84 @@ func TestCheckpointRoundTripIncludesAppliedSourceHeader(t *testing.T) {
 	require.Empty(t, kept)
 }
 
+func TestCheckpointRebasesMappedIndexWithLaterMutations(t *testing.T) {
+	pool, index, _ := newTestPool(t, 16)
+	ctx := t.Context()
+	first := kvblock.PodEntry{PodIdentifier: "first:8000", DeviceTier: "gpu"}
+	second := kvblock.PodEntry{PodIdentifier: "second:8000", DeviceTier: "gpu"}
+	require.NoError(t, index.Add(ctx,
+		[]kvblock.BlockHash{11}, []kvblock.BlockHash{101}, []kvblock.PodEntry{first},
+	))
+	path := filepath.Join(t.TempDir(), "index.checkpoint")
+	_, err := pool.WriteCheckpoint(path, testFingerprint)
+	require.NoError(t, err)
+
+	require.NoError(t, index.Add(ctx,
+		[]kvblock.BlockHash{12}, []kvblock.BlockHash{101}, []kvblock.PodEntry{second},
+	))
+	_, err = pool.WriteCheckpoint(path, testFingerprint)
+	require.NoError(t, err)
+
+	restored, restoredIndex, _ := newTestPool(t, 16)
+	ok, err := restored.RestoreCheckpoint(path, testFingerprint)
+	require.NoError(t, err)
+	require.True(t, ok)
+	hits, err := restoredIndex.Lookup(ctx, []kvblock.BlockHash{101}, nil)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []kvblock.PodEntry{first, second}, hits[101])
+	requestKey, err := restoredIndex.GetRequestKey(ctx, 11)
+	require.NoError(t, err)
+	require.Equal(t, kvblock.BlockHash(101), requestKey)
+	requestKey, err = restoredIndex.GetRequestKey(ctx, 12)
+	require.NoError(t, err)
+	require.Equal(t, kvblock.BlockHash(101), requestKey)
+}
+
+func TestCheckpointFromRestoredWriterIncludesLaterMutations(t *testing.T) {
+	directory := t.TempDir()
+	ctx := t.Context()
+	first := kvblock.PodEntry{PodIdentifier: "first:8000", DeviceTier: "gpu"}
+	retained := kvblock.PodEntry{PodIdentifier: "retained:8000", DeviceTier: "gpu"}
+	added := kvblock.PodEntry{PodIdentifier: "added:8000", DeviceTier: "gpu"}
+
+	firstPool, firstIndex, _ := newTestPool(t, 16)
+	require.NoError(t, firstIndex.Add(ctx,
+		[]kvblock.BlockHash{11}, []kvblock.BlockHash{101}, []kvblock.PodEntry{first, retained},
+	))
+	firstResult, err := firstPool.WriteCheckpointForWriter(directory, "epp-1", testFingerprint)
+	require.NoError(t, err)
+
+	secondPool, secondIndex, _ := newTestPool(t, 16)
+	restored, err := secondPool.RestoreCheckpoint(firstResult.Path, testFingerprint)
+	require.NoError(t, err)
+	require.True(t, restored)
+	require.NoError(t, secondIndex.Evict(ctx, 11, kvblock.EngineKey, []kvblock.PodEntry{first}))
+	require.NoError(t, secondIndex.Add(ctx,
+		[]kvblock.BlockHash{12, 13}, []kvblock.BlockHash{101, 102}, []kvblock.PodEntry{added},
+	))
+	secondResult, err := secondPool.WriteCheckpointForWriter(directory, "epp-2", testFingerprint)
+	require.NoError(t, err)
+
+	thirdPool, thirdIndex, _ := newTestPool(t, 16)
+	restored, err = thirdPool.RestoreCheckpoint(secondResult.Path, testFingerprint)
+	require.NoError(t, err)
+	require.True(t, restored)
+	hits, err := thirdIndex.Lookup(ctx, []kvblock.BlockHash{101, 102}, nil)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []kvblock.PodEntry{retained, added}, hits[101])
+	require.Equal(t, []kvblock.PodEntry{added}, hits[102])
+
+	for engineKey, expectedRequestKey := range map[kvblock.BlockHash]kvblock.BlockHash{
+		11: 101,
+		12: 101,
+		13: 102,
+	} {
+		requestKey, err := thirdIndex.GetRequestKey(ctx, engineKey)
+		require.NoError(t, err)
+		require.Equal(t, expectedRequestKey, requestKey)
+	}
+}
+
 func TestRestoreLatestCheckpointUsesNewestWriterSnapshot(t *testing.T) {
 	directory := t.TempDir()
 	older, olderIndex, _ := newTestPool(t, 16)
@@ -220,6 +298,35 @@ func TestCheckpointHeaderUsesContiguousSections(t *testing.T) {
 	}
 	require.Equal(t, uint64(info.Size()), offset)
 	require.NoError(t, verifyCheckpointBody(file, uint64(info.Size()), header.BodyChecksum))
+}
+
+func TestCheckpointDoesNotInstallPreparedIndexWhenRenameFails(t *testing.T) {
+	base, err := kvblock.NewInMemoryIndex(&kvblock.InMemoryIndexConfig{Size: 8, PodCacheSize: 2})
+	require.NoError(t, err)
+	tracked := &trackingFileIndex{Index: base, snapshotter: base}
+	pool, err := NewPool(DefaultConfig(), tracked, nil, nil)
+	require.NoError(t, err)
+	destination := filepath.Join(t.TempDir(), "destination")
+	require.NoError(t, os.Mkdir(destination, 0o700))
+
+	_, err = pool.WriteCheckpoint(destination, testFingerprint)
+	require.ErrorContains(t, err, "replace checkpoint")
+	require.True(t, tracked.prepared.Load())
+	require.False(t, tracked.installed.Load())
+}
+
+func TestCheckpointThroughSnapshotOnlyWrapper(t *testing.T) {
+	base, err := kvblock.NewInMemoryIndex(&kvblock.InMemoryIndexConfig{Size: 8, PodCacheSize: 2})
+	require.NoError(t, err)
+	snapshotOnly := &snapshotOnlyCheckpointIndex{Index: base, snapshotter: base}
+	wrapped := kvblock.NewInstrumentedIndex(snapshotOnly)
+	_, fileCapable := wrapped.(kvblock.FileSnapshotter)
+	require.False(t, fileCapable)
+	pool, err := NewPool(DefaultConfig(), wrapped, nil, nil)
+	require.NoError(t, err)
+
+	_, err = pool.WriteCheckpoint(filepath.Join(t.TempDir(), "index.checkpoint"), testFingerprint)
+	require.NoError(t, err)
 }
 
 func TestCheckpointHeaderRejectsUnknownFlags(t *testing.T) {
@@ -780,6 +887,23 @@ type addFailingCheckpointIndex struct {
 	snapshotter kvblock.Snapshotter
 }
 
+type trackingFileIndex struct {
+	kvblock.Index
+	snapshotter kvblock.FileSnapshotter
+	prepared    atomic.Bool
+	installed   atomic.Bool
+}
+
+type snapshotOnlyCheckpointIndex struct {
+	kvblock.Index
+	snapshotter kvblock.Snapshotter
+}
+
+type trackingPreparedSnapshot struct {
+	inner     kvblock.PreparedFileSnapshot
+	installed *atomic.Bool
+}
+
 type clearFailOnceIndex struct {
 	kvblock.Index
 	clearAttempts atomic.Int32
@@ -818,6 +942,47 @@ func (i *addFailingCheckpointIndex) WriteSnapshot(dst io.Writer) error {
 func (i *addFailingCheckpointIndex) RestoreSnapshot(src io.Reader) error {
 	return i.snapshotter.RestoreSnapshot(src)
 }
+
+func (i *trackingFileIndex) WriteSnapshot(dst io.Writer) error {
+	return i.snapshotter.WriteSnapshot(dst)
+}
+
+func (i *snapshotOnlyCheckpointIndex) WriteSnapshot(dst io.Writer) error {
+	return i.snapshotter.WriteSnapshot(dst)
+}
+
+func (i *snapshotOnlyCheckpointIndex) RestoreSnapshot(src io.Reader) error {
+	return i.snapshotter.RestoreSnapshot(src)
+}
+
+func (i *trackingFileIndex) RestoreSnapshot(src io.Reader) error {
+	return i.snapshotter.RestoreSnapshot(src)
+}
+
+func (i *trackingFileIndex) RestoreSnapshotFile(file *os.File, offset, length int64) error {
+	return i.snapshotter.RestoreSnapshotFile(file, offset, length)
+}
+
+func (i *trackingFileIndex) PrepareSnapshotFile(
+	file *os.File, offset, length int64,
+) (kvblock.PreparedFileSnapshot, error) {
+	prepared, err := i.snapshotter.PrepareSnapshotFile(file, offset, length)
+	if err != nil {
+		return nil, err
+	}
+	i.prepared.Store(true)
+	return &trackingPreparedSnapshot{inner: prepared, installed: &i.installed}, nil
+}
+
+func (p *trackingPreparedSnapshot) Install() error {
+	if err := p.inner.Install(); err != nil {
+		return err
+	}
+	p.installed.Store(true)
+	return nil
+}
+
+func (p *trackingPreparedSnapshot) Close() { p.inner.Close() }
 
 func checkpointReplayServer(
 	t *testing.T,

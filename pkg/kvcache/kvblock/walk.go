@@ -124,14 +124,10 @@ func (r CompactEntryRef) DataParallelRank() (int, bool) {
 //     consumer must not rely on. It is borrowed: read-only and valid only
 //     until visit returns, after which the index may reorder or overwrite its
 //     backing array. Consumers copy what they keep.
-//   - visit must not call back into the index; the generation's lock is held
-//     for the duration of the call. If visit panics, the lock is released
-//     and the panic propagates to the caller.
-//   - A visit sees an internally consistent generation, exclusive of writers
-//     and other visits using that generation. Capacity eviction may detach it
-//     and a later Add may install a new generation of the same key while
-//     visit runs. There is no snapshot across positions: a concurrent Add,
-//     Evict, or Clear may be visible at some positions and not at others.
+//   - visit must not call back into the index because the view lock is held.
+//   - A visit receives one copied generation. There is no snapshot across
+//     positions. A concurrent Add, Evict, or Clear can be visible at some
+//     positions and not at others.
 //   - Cancellation is polled at the first position, every 256th position
 //     after it, and once more when the walk ends, so a cancelled ctx always
 //     yields ctx.Err(); visits may run between the cancellation and the
@@ -157,22 +153,30 @@ type CompactKeyWalker interface {
 	TierName(ordinal uint32) string
 }
 
-// WalkKeys implements KeyWalker. Each key is peeked under the LRU's shared
-// lock and its entries visited under that key's own lock; the visited prefix
-// is promoted in a deferred call, so every exit path refreshes what was read.
+// WalkKeys implements KeyWalker. The visited prefix is promoted in a deferred
+// call, so every exit path refreshes what was read.
 func (m *InMemoryIndex) WalkKeys(ctx context.Context, requestKeys []BlockHash,
 	visit func(pos int, found bool, entries []EntryRef) bool,
 ) error {
+	m.viewMu.RLock()
+	defer m.viewMu.RUnlock()
+	m.baseStateMu.RLock()
+	defer m.baseStateMu.RUnlock()
 	visited := 0
-	entries := m.data.borrowEntries()
-	defer m.data.returnEntries(entries)
+	compact := make([]CompactEntryRef, 0, int(m.data.entryCap))
+	entries := make([]EntryRef, 0, int(m.data.entryCap))
 	// Every exit, cancellation included, refreshes what was read.
 	defer func() { m.data.promote(requestKeys[:visited]) }()
 	for pos, key := range requestKeys {
 		if pos&cancellationCheckMask == 0 && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		found, keepGoing := m.data.visit(key, pos, entries, visit)
+		compact, found := m.mergedCompactEntriesLocked(key, compact)
+		entries = entries[:0]
+		for _, ref := range compact {
+			entries = append(entries, ref.entry(m.pods, m.tiers))
+		}
+		keepGoing := visit(pos, found, entries)
 		if found {
 			visited = pos + 1
 		}
@@ -187,13 +191,36 @@ func (m *InMemoryIndex) WalkKeys(ctx context.Context, requestKeys []BlockHash,
 func (m *InMemoryIndex) WalkCompactKeys(ctx context.Context, requestKeys []BlockHash,
 	visit func(pos int, found bool, entries []CompactEntryRef) bool,
 ) error {
+	m.viewMu.RLock()
+	defer m.viewMu.RUnlock()
+	if m.base == nil {
+		visited := 0
+		defer func() { m.data.promote(requestKeys[:visited]) }()
+		for pos, key := range requestKeys {
+			if pos&cancellationCheckMask == 0 && ctx.Err() != nil {
+				return ctx.Err()
+			}
+			found, keepGoing := m.data.visitCompact(key, pos, visit)
+			if found {
+				visited = pos + 1
+			}
+			if !keepGoing {
+				return ctx.Err()
+			}
+		}
+		return ctx.Err()
+	}
+	m.baseStateMu.RLock()
+	defer m.baseStateMu.RUnlock()
 	visited := 0
+	entries := make([]CompactEntryRef, 0, int(m.data.entryCap))
 	defer func() { m.data.promote(requestKeys[:visited]) }()
 	for pos, key := range requestKeys {
 		if pos&cancellationCheckMask == 0 && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		found, keepGoing := m.data.visitCompact(key, pos, visit)
+		entries, found := m.mergedCompactEntriesLocked(key, entries)
+		keepGoing := visit(pos, found, entries)
 		if found {
 			visited = pos + 1
 		}

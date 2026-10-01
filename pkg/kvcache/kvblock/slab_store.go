@@ -111,9 +111,8 @@ type slabStore struct {
 	runBumps  []runBump
 	freeRuns  []runHead
 
-	pods        *interner
-	tiers       *interner
-	entryBuffer sync.Pool
+	pods  *interner
+	tiers *interner
 }
 
 func newSlabStore(size, entryCap int, pods, tiers *interner) (*slabStore, error) {
@@ -138,10 +137,6 @@ func newSlabStore(size, entryCap int, pods, tiers *interner) (*slabStore, error)
 		freeRuns:   make([]runHead, entryCap+1),
 		pods:       pods,
 		tiers:      tiers,
-	}
-	s.entryBuffer.New = func() any {
-		entries := make([]EntryRef, 0, entryCap)
-		return &entries
 	}
 	return s, nil
 }
@@ -490,6 +485,11 @@ func (s *slabStore) addAllLocked(n *slabNode, records []slabRef) error {
 }
 
 func (s *slabStore) add(key BlockHash, records []slabRef) error {
+	_, _, err := s.addTracked(key, records)
+	return err
+}
+
+func (s *slabStore) addTracked(key BlockHash, records []slabRef) (BlockHash, bool, error) {
 	for {
 		s.mu.Lock()
 		if id, found := s.items[key]; found {
@@ -505,40 +505,37 @@ func (s *slabStore) add(key BlockHash, records []slabRef) error {
 			}
 			err := s.addAllLocked(n, records)
 			n.mu.Unlock()
-			return err
+			return EmptyBlockHash, false, err
 		}
 
-		err := s.addNewWithStoreLockHeld(key, records)
+		evicted, didEvict, err := s.addNewTrackedWithStoreLockHeld(key, records)
 		s.mu.Unlock()
-		return err
+		return evicted, didEvict, err
 	}
-}
-
-func (s *slabStore) addWithStoreLockHeld(key BlockHash, records []slabRef) error {
-	if id, found := s.items[key]; found {
-		n := s.node(id)
-		s.moveToHeadLocked(id, n)
-		n.mu.Lock()
-		err := s.addAllLocked(n, records)
-		n.mu.Unlock()
-		return err
-	}
-	return s.addNewWithStoreLockHeld(key, records)
 }
 
 func (s *slabStore) addNewWithStoreLockHeld(key BlockHash, records []slabRef) error {
+	_, _, err := s.addNewTrackedWithStoreLockHeld(key, records)
+	return err
+}
+
+func (s *slabStore) addNewTrackedWithStoreLockHeld(key BlockHash, records []slabRef) (BlockHash, bool, error) {
 	var staged slabNode
 	if err := s.addAllLocked(&staged, records); err != nil {
 		s.freeRun(staged.head, staged.runCap)
-		return err
+		return EmptyBlockHash, false, err
 	}
+	evicted := EmptyBlockHash
+	didEvict := false
 	if s.len == s.capacity {
+		evicted = s.node(s.tail).hash
+		didEvict = true
 		s.releaseNodeLocked(s.tail)
 	}
 	id, n, err := s.allocNodeLocked(key)
 	if err != nil {
 		s.freeRun(staged.head, staged.runCap)
-		return err
+		return EmptyBlockHash, false, err
 	}
 	n.mu.Lock()
 	n.head = staged.head
@@ -548,7 +545,7 @@ func (s *slabStore) addNewWithStoreLockHeld(key BlockHash, records []slabRef) er
 	s.items[key] = id
 	s.insertHeadLocked(id, n)
 	s.len++
-	return nil
+	return evicted, didEvict, nil
 }
 
 func (s *slabStore) capture(key BlockHash, promote bool) (*slabNode, uint64, bool) {
@@ -574,15 +571,15 @@ func (s *slabStore) capture(key BlockHash, promote bool) (*slabNode, uint64, boo
 	return n, n.version, true
 }
 
-func (s *slabStore) filteredEntries(key BlockHash, allowed map[uint32]struct{}, filtered bool) ([]PodEntry, int, bool) {
+func (s *slabStore) filteredEntries(key BlockHash, allowed map[uint32]struct{}, filtered bool) ([]PodEntry, bool) {
 	n, version, found := s.capture(key, false)
 	if !found {
-		return nil, 0, false
+		return nil, false
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.hash != key || n.version != version {
-		return nil, 0, false
+		return nil, false
 	}
 
 	total := int(n.runLen)
@@ -599,28 +596,7 @@ func (s *slabStore) filteredEntries(key BlockHash, allowed map[uint32]struct{}, 
 		}
 		entries = append(entries, refs[i].entry(s.pods, s.tiers).PodEntry)
 	}
-	return entries, total, true
-}
-
-func (s *slabStore) visit(key BlockHash, pos int, entries *[]EntryRef,
-	visit func(int, bool, []EntryRef) bool,
-) (found, keepGoing bool) {
-	n, version, found := s.capture(key, false)
-	if !found {
-		return false, visit(pos, false, nil)
-	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.hash != key || n.version != version {
-		return false, visit(pos, false, nil)
-	}
-
-	refs := s.refs(n.head, n.runCap)
-	*entries = (*entries)[:0]
-	for i := 0; i < int(n.runLen); i++ {
-		*entries = append(*entries, refs[i].entry(s.pods, s.tiers))
-	}
-	return true, visit(pos, true, *entries)
+	return entries, true
 }
 
 func (s *slabStore) visitCompact(key BlockHash, pos int,
@@ -636,16 +612,6 @@ func (s *slabStore) visitCompact(key BlockHash, pos int,
 		return false, visit(pos, false, nil)
 	}
 	return true, visit(pos, true, s.refs(n.head, n.runCap)[:n.runLen])
-}
-
-func (s *slabStore) borrowEntries() *[]EntryRef {
-	return s.entryBuffer.Get().(*[]EntryRef)
-}
-
-func (s *slabStore) returnEntries(entries *[]EntryRef) {
-	clear(*entries)
-	*entries = (*entries)[:0]
-	s.entryBuffer.Put(entries)
 }
 
 func (s *slabStore) promote(keys []BlockHash) {

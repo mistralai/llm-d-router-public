@@ -170,7 +170,7 @@ func TestInMemoryAddPreflightsSameClassGrowth(t *testing.T) {
 	require.ErrorContains(t, err, "slab reference capacity exhausted")
 
 	for _, key := range []BlockHash{1, 2} {
-		entries, _, found := index.data.filteredEntries(key, nil, false)
+		entries, found := index.data.filteredEntries(key, nil, false)
 		require.True(t, found)
 		assert.Equal(t, []PodEntry{existing}, entries)
 	}
@@ -216,8 +216,8 @@ func TestInMemoryAddAndEngineEvictDoNotDeadlock(t *testing.T) {
 		addDone <- index.Add(context.Background(), []BlockHash{engineKey}, []BlockHash{newRequestKey}, []PodEntry{entry})
 	}()
 	require.Eventually(t, func() bool {
-		if index.mu.TryLock() {
-			index.mu.Unlock()
+		if index.mutationMu.TryLock() {
+			index.mutationMu.Unlock()
 			return false
 		}
 		return true
@@ -261,7 +261,7 @@ func TestInMemoryAddReplacesFullRunWithoutReferenceCapacity(t *testing.T) {
 	second := PodEntry{PodIdentifier: "pod-b", DeviceTier: "gpu"}
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{1}, []PodEntry{second}))
 
-	entries, _, found := index.data.filteredEntries(1, nil, false)
+	entries, found := index.data.filteredEntries(1, nil, false)
 	require.True(t, found)
 	assert.Equal(t, []PodEntry{second}, entries)
 }

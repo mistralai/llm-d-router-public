@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"io"
 	"math"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -165,10 +166,42 @@ func TestCheckpointCapabilitySurvivesIndexWrappers(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			_, isSnapshotter := wrapped.(Snapshotter)
 			require.True(t, isSnapshotter)
+			_, isFileSnapshotter := wrapped.(FileSnapshotter)
+			require.True(t, isFileSnapshotter)
 			_, isCompactWalker := wrapped.(CompactKeyWalker)
 			require.True(t, isCompactWalker)
 		})
 	}
+}
+
+func TestSnapshotOnlyCapabilitySurvivesIndexWrappers(t *testing.T) {
+	index, err := NewInMemoryIndex(DefaultInMemoryIndexConfig())
+	require.NoError(t, err)
+	snapshotOnly := &snapshotOnlyIndex{Index: index, snapshotter: index}
+	for name, wrapped := range map[string]Index{
+		"instrumented": NewInstrumentedIndex(snapshotOnly),
+		"traced":       NewTracedIndex(snapshotOnly),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, isSnapshotter := wrapped.(Snapshotter)
+			require.True(t, isSnapshotter)
+			_, isFileSnapshotter := wrapped.(FileSnapshotter)
+			require.False(t, isFileSnapshotter)
+		})
+	}
+}
+
+type snapshotOnlyIndex struct {
+	Index
+	snapshotter Snapshotter
+}
+
+func (i *snapshotOnlyIndex) WriteSnapshot(dst io.Writer) error {
+	return i.snapshotter.WriteSnapshot(dst)
+}
+
+func (i *snapshotOnlyIndex) RestoreSnapshot(src io.Reader) error {
+	return i.snapshotter.RestoreSnapshot(src)
 }
 
 func mustRequestKey(t *testing.T, index *InMemoryIndex, engineKey BlockHash) BlockHash {
@@ -179,7 +212,7 @@ func mustRequestKey(t *testing.T, index *InMemoryIndex, engineKey BlockHash) Blo
 }
 
 func BenchmarkInMemoryIndexWriteSnapshot(b *testing.B) {
-	index := benchmarkCheckpointIndex(b, 100_000)
+	index := benchmarkCheckpointIndex(b)
 	var size countingWriter
 	require.NoError(b, index.WriteSnapshot(&size))
 	b.ReportMetric(float64(size.written)/100_000, "bytes/entry")
@@ -191,8 +224,27 @@ func BenchmarkInMemoryIndexWriteSnapshot(b *testing.B) {
 	}
 }
 
+func BenchmarkInMemoryIndexWriteFileBackedSnapshot(b *testing.B) {
+	source := benchmarkCheckpointIndex(b)
+	file, err := os.CreateTemp(b.TempDir(), "index-*.bin")
+	require.NoError(b, err)
+	defer file.Close()
+	require.NoError(b, source.WriteSnapshot(file))
+	info, err := file.Stat()
+	require.NoError(b, err)
+	target, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 100_000, PodCacheSize: 4})
+	require.NoError(b, err)
+	require.NoError(b, target.RestoreSnapshotFile(file, 0, info.Size()))
+	b.SetBytes(info.Size())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		require.NoError(b, target.WriteSnapshot(io.Discard))
+	}
+}
+
 func BenchmarkInMemoryIndexRestoreSnapshot(b *testing.B) {
-	index := benchmarkCheckpointIndex(b, 100_000)
+	index := benchmarkCheckpointIndex(b)
 	var checkpoint bytes.Buffer
 	require.NoError(b, index.WriteSnapshot(&checkpoint))
 	b.ReportMetric(float64(checkpoint.Len())/100_000, "bytes/entry")
@@ -206,7 +258,27 @@ func BenchmarkInMemoryIndexRestoreSnapshot(b *testing.B) {
 	}
 }
 
-func benchmarkCheckpointIndex(b *testing.B, size int) *InMemoryIndex {
+func BenchmarkInMemoryIndexRestoreSnapshotFile(b *testing.B) {
+	index := benchmarkCheckpointIndex(b)
+	file, err := os.CreateTemp(b.TempDir(), "index-*.bin")
+	require.NoError(b, err)
+	defer file.Close()
+	require.NoError(b, index.WriteSnapshot(file))
+	info, err := file.Stat()
+	require.NoError(b, err)
+	b.SetBytes(info.Size())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		target, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 100_000, PodCacheSize: 4})
+		require.NoError(b, err)
+		require.NoError(b, target.RestoreSnapshotFile(file, 0, info.Size()))
+		target.base.close()
+	}
+}
+
+func benchmarkCheckpointIndex(b *testing.B) *InMemoryIndex {
+	const size = 100_000
 	b.Helper()
 	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: size, PodCacheSize: 4})
 	require.NoError(b, err)
