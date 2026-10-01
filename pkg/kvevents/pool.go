@@ -16,11 +16,13 @@ package kvevents
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -38,6 +40,9 @@ import (
 const (
 	defaultEventSourceDeviceTier = "gpu"
 	defaultPodSelector           = ""
+	resetRetryInterval           = 100 * time.Millisecond
+	// DefaultCheckpointQueueDepth bounds ingress while checkpoint I/O stops workers.
+	DefaultCheckpointQueueDepth = 65536
 )
 
 // normalizeDeviceTier lowercases an event's device tier and defaults an empty
@@ -71,19 +76,39 @@ func blockStoredEventDigestible(ev *BlockStoredEvent) (bool, string) {
 	if ev.GroupIdx == nil {
 		return true, ""
 	}
+	if *ev.GroupIdx < 0 {
+		return false, "invalid_group"
+	}
 	if !isPrefixIndexableSpecKind(ev.KVCacheSpecKind) {
 		return false, "unsupported_cache_kind"
 	}
-	if len(ev.Tokens) == 0 {
-		return true, ""
-	}
 	if ev.BlockSize <= 0 {
 		return false, "invalid_block_size"
+	}
+	if ev.KVCacheSpecSlidingWindowSize != nil && *ev.KVCacheSpecSlidingWindowSize < 0 {
+		return false, "invalid_sliding_window"
+	}
+	if len(ev.Tokens) == 0 {
+		return true, ""
 	}
 	if len(ev.Tokens)%ev.BlockSize != 0 || len(ev.Tokens)/ev.BlockSize != len(ev.BlockHashes) {
 		return false, "non_dense_block_span"
 	}
 	return true, ""
+}
+
+func blockStoredEventGroupMetadata(ev *BlockStoredEvent) (kvblock.GroupMetadata, bool) {
+	if ev.GroupIdx == nil || *ev.GroupIdx < 0 || ev.KVCacheSpecKind == "" || ev.BlockSize <= 0 {
+		return kvblock.GroupMetadata{}, false
+	}
+	if ev.KVCacheSpecSlidingWindowSize != nil && *ev.KVCacheSpecSlidingWindowSize < 0 {
+		return kvblock.GroupMetadata{}, false
+	}
+	return kvblock.GroupMetadata{
+		Kind:              string(ev.KVCacheSpecKind),
+		BlockSize:         ev.BlockSize,
+		SlidingWindowSize: ev.KVCacheSpecSlidingWindowSize,
+	}, true
 }
 
 // Config holds the configuration for the event processing pool.
@@ -94,6 +119,9 @@ type Config struct {
 	TopicFilter string `json:"topicFilter"`
 	// Concurrency is the number of parallel workers to run.
 	Concurrency int `json:"concurrency"`
+	// MaxQueueDepth limits messages that wait for event processing.
+	// A full queue applies backpressure to subscribers. Zero disables the limit.
+	MaxQueueDepth int `json:"maxQueueDepth,omitempty"`
 	// EngineType selects the inference engine adapter ("vllm" or "sglang").
 	// Default: "vllm".
 	EngineType string `json:"engineType,omitempty"`
@@ -191,6 +219,16 @@ type Pool struct {
 	// tier, KV-cache group, DP rank) and a store must be counted only after
 	// Index.Add succeeds — both of which only the Pool observes.
 	dedup *eventDedupFilter
+	// checkpointMu stops event application at a complete message boundary.
+	checkpointMu       sync.RWMutex
+	checkpointWriteMu  sync.Mutex
+	appliedSourcesMu   sync.RWMutex
+	appliedSources     map[string]checkpointSource
+	invalidSources     map[string]map[uint64]struct{}
+	sourceGenerations  map[string]uint64
+	retiredGenerations map[string]map[uint64]struct{}
+	nextGeneration     atomic.Uint64
+	nextInvalidation   atomic.Uint64
 	// tracer is resolved once: tracing.Tracer rebuilds its instrumentation
 	// options on every call, which is not free on the per-message event path.
 	// Nil when Config.Tracing is unset, which is what startSpan tests to skip
@@ -201,6 +239,10 @@ type Pool struct {
 	// tracked incrementally rather than by summing queue.Len() so that the
 	// depth gauge stays O(1) on the enqueue/dequeue hot path.
 	queueDepth atomic.Int64
+	started    atomic.Bool
+	queueSlots chan struct{}
+	stopped    chan struct{}
+	stopOnce   sync.Once
 }
 
 // NewPool creates a Pool with a sharded worker setup.
@@ -219,16 +261,26 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 	if cfg.Concurrency <= 0 {
 		return nil, fmt.Errorf("kvEventsConfig.concurrency must be positive, got %d", cfg.Concurrency)
 	}
-
+	if cfg.MaxQueueDepth < 0 {
+		return nil, fmt.Errorf("kvEventsConfig.maxQueueDepth must not be negative, got %d", cfg.MaxQueueDepth)
+	}
 	p := &Pool{
-		queues:         make([]workqueue.TypedRateLimitingInterface[*RawMessage], cfg.Concurrency),
-		concurrency:    cfg.Concurrency,
-		index:          index,
-		tokenProcessor: tokenProcessor,
-		adapter:        adapter,
-		groupCatalog:   kvblock.NewGroupCatalog(),
-		dedup:          newEventDedupFilter(),
-		tracer:         newEventTracer(cfg.Tracing),
+		queues:             make([]workqueue.TypedRateLimitingInterface[*RawMessage], cfg.Concurrency),
+		concurrency:        cfg.Concurrency,
+		index:              index,
+		tokenProcessor:     tokenProcessor,
+		adapter:            adapter,
+		groupCatalog:       kvblock.NewGroupCatalog(),
+		dedup:              newEventDedupFilter(),
+		appliedSources:     make(map[string]checkpointSource),
+		invalidSources:     make(map[string]map[uint64]struct{}),
+		sourceGenerations:  make(map[string]uint64),
+		retiredGenerations: make(map[string]map[uint64]struct{}),
+		tracer:             newEventTracer(cfg.Tracing),
+		stopped:            make(chan struct{}),
+	}
+	if cfg.MaxQueueDepth > 0 {
+		p.queueSlots = make(chan struct{}, cfg.MaxQueueDepth)
 	}
 
 	for i := 0; i < p.concurrency; i++ {
@@ -279,6 +331,11 @@ func (p *Pool) addQueueDepth(delta int64) {
 	metrics.PoolQueueDepth.Set(float64(p.queueDepth.Add(delta)))
 }
 
+// QueueDepth returns the number of messages that wait for a worker.
+func (p *Pool) QueueDepth() int64 {
+	return p.queueDepth.Load()
+}
+
 // GroupCatalog returns the KV cache group metadata learned from events.
 func (p *Pool) GroupCatalog() *kvblock.GroupCatalog {
 	return p.groupCatalog
@@ -291,6 +348,7 @@ func (p *Pool) Start(ctx context.Context) {
 	logger.Info("Starting sharded event processing pool", "workers", p.concurrency)
 
 	metrics.PoolCapacity.Set(float64(p.concurrency))
+	p.started.Store(true)
 
 	p.wg.Add(p.concurrency)
 	for i := 0; i < p.concurrency; i++ {
@@ -304,6 +362,7 @@ func (p *Pool) Shutdown(ctx context.Context) {
 	logger := log.FromContext(ctx)
 	logger.Info("Shutting down event processing pool...")
 
+	p.stopOnce.Do(func() { close(p.stopped) })
 	for _, queue := range p.queues {
 		queue.ShutDown()
 	}
@@ -324,6 +383,9 @@ func (p *Pool) Shutdown(ctx context.Context) {
 func (p *Pool) AddTask(task *RawMessage) {
 	key := task.SourceEndpoint
 	if key == "" {
+		key = task.EventSourceID
+	}
+	if key == "" {
 		key = p.adapter.ShardingKey(task)
 	}
 	// Use an FNV-1a hash to deterministically select a queue.
@@ -335,17 +397,47 @@ func (p *Pool) AddTask(task *RawMessage) {
 
 	//nolint:gosec // if concurrency overflows then the world is in trouble anyway
 	queueIndex := h.Sum32() % uint32(p.concurrency)
+	if p.queueSlots != nil {
+		select {
+		case p.queueSlots <- struct{}{}:
+		case <-p.stopped:
+			return
+		}
+	}
+	if p.queues[queueIndex].ShuttingDown() {
+		if p.queueSlots != nil {
+			<-p.queueSlots
+		}
+		return
+	}
 	p.queues[queueIndex].Add(task)
 	p.addQueueDepth(1)
 }
 
 // resetForSource queues an engine reset on the same shard as its event stream.
-func (p *Pool) resetForSource(topic, sourceEndpoint string, dataParallelRank *int) {
+func (p *Pool) resetForSource(
+	topic, eventSourceID, eventEndpoint, sourceEndpoint string,
+	dataParallelRank *int,
+) {
+	resetVersion := p.beginSourceReset(eventSourceID)
+	p.resetSourceInvalidations(
+		topic, eventSourceID, eventEndpoint, sourceEndpoint, dataParallelRank, []uint64{resetVersion},
+	)
+}
+
+func (p *Pool) resetSourceInvalidations(
+	topic, eventSourceID, eventEndpoint, sourceEndpoint string,
+	dataParallelRank *int,
+	resetVersions []uint64,
+) {
 	p.AddTask(&RawMessage{
 		Topic:                 topic,
+		EventSourceID:         eventSourceID,
+		EventEndpoint:         eventEndpoint,
 		SourceEndpoint:        sourceEndpoint,
 		ResetDataParallelRank: dataParallelRank,
 		reset:                 true,
+		resetVersions:         resetVersions,
 	})
 }
 
@@ -359,16 +451,29 @@ func (p *Pool) worker(ctx context.Context, workerIndex int) {
 		if shutdown {
 			return
 		}
+		if p.queueSlots != nil {
+			<-p.queueSlots
+		}
+		p.addQueueDepth(-1)
 
 		// Use a nested func to ensure Done is always called.
 		func(task *RawMessage) {
 			defer queue.Done(task)
-			p.processRawMessage(ctx, task)
-			// Task succeeded, remove it from the queue.
+			for !p.processRawMessage(ctx, task) {
+				if !task.reset {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-p.stopped:
+					return
+				case <-time.After(resetRetryInterval):
+				}
+			}
+			// Remove the completed task from workqueue retry tracking.
 			queue.Forget(task)
 		}(task)
-		p.addQueueDepth(-1)
-
 		// Check if context was cancelled after processing a task.
 		select {
 		case <-ctx.Done():
@@ -379,19 +484,30 @@ func (p *Pool) worker(ctx context.Context, workerIndex int) {
 }
 
 // processRawMessage decodes the raw message payload using the adapter and processes the resulting event batch.
-func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
+func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) bool {
+	p.checkpointMu.RLock()
+	defer p.checkpointMu.RUnlock()
+	if !msg.reset && p.sourceGenerationIsRetired(msg.EventSourceID, msg.sourceGeneration) {
+		return true
+	}
+
 	logger := log.FromContext(ctx)
 	if msg.reset {
 		podID := msg.SourceEndpoint
 		if podID == "" {
 			podID = p.adapter.ShardingKey(msg)
 		}
+		var err error
 		if msg.ResetDataParallelRank == nil {
-			p.clearPod(ctx, podID)
+			err = p.clearPod(ctx, podID)
 		} else {
-			p.clearRank(ctx, podID, *msg.ResetDataParallelRank)
+			err = p.clearRank(ctx, podID, *msg.ResetDataParallelRank)
 		}
-		return
+		if err != nil {
+			return false
+		}
+		p.completeSourceReset(msg)
+		return true
 	}
 
 	// Parent to the receive span while keeping the worker's context for
@@ -421,7 +537,19 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 			span.SetStatus(codes.Error, err.Error())
 		}
 		logger.Error(err, "Failed to parse message")
-		return
+		podID = msg.SourceEndpoint
+		if podID == "" {
+			podID = p.adapter.ShardingKey(msg)
+		}
+		active, clearErr := p.recoverFailedMessage(ctx, msg, podID, msg.SourceDataParallelRank)
+		if !active {
+			return true
+		}
+		if clearErr != nil {
+			logger.Error(clearErr, "Failed to clear state after a KV-event decode error",
+				"podIdentifier", podID)
+		}
+		return false
 	}
 
 	if msg.SourceEndpoint != "" {
@@ -435,7 +563,176 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 		)
 	}
 
-	p.processEventBatch(ctx, &batch, podID, modelName)
+	if err := p.processEventBatch(ctx, &batch, podID, modelName); err != nil {
+		logger.Error(err, "KV-event batch did not apply completely", "podIdentifier", podID)
+		active, clearErr := p.recoverFailedMessage(ctx, msg, podID, batch.DataParallelRank)
+		if !active {
+			return true
+		}
+		if clearErr != nil {
+			logger.Error(clearErr, "Failed to clear state after a KV-event mutation error",
+				"podIdentifier", podID)
+		}
+		return false
+	}
+	p.recordAppliedSource(msg)
+	return true
+}
+
+func (p *Pool) recordAppliedSource(msg *RawMessage) {
+	if msg.EventSourceID == "" {
+		return
+	}
+	source := checkpointSource{
+		EventEndpoint: msg.EventEndpoint, ServingEndpoint: msg.SourceEndpoint,
+		DataParallelRank:    cloneOptionalInt(msg.SourceDataParallelRank),
+		LastAppliedSequence: msg.Sequence, EventDigest: checkpointEventDigest(msg.Topic, msg.Payload),
+	}
+	p.appliedSourcesMu.Lock()
+	if generation, found := p.sourceGenerations[msg.EventSourceID]; found &&
+		msg.sourceGeneration != generation {
+		p.appliedSourcesMu.Unlock()
+		return
+	}
+	if _, retired := p.retiredGenerations[msg.EventSourceID][msg.sourceGeneration]; retired {
+		p.appliedSourcesMu.Unlock()
+		return
+	}
+	source.Generation = msg.sourceGeneration
+	p.appliedSources[msg.EventSourceID] = source
+	p.appliedSourcesMu.Unlock()
+}
+
+func (p *Pool) registerSource(eventSourceID string) uint64 {
+	if eventSourceID == "" {
+		return 0
+	}
+	generation := p.nextGeneration.Add(1)
+	p.appliedSourcesMu.Lock()
+	p.sourceGenerations[eventSourceID] = generation
+	p.appliedSourcesMu.Unlock()
+	return generation
+}
+
+func (p *Pool) retireSourceGeneration(eventSourceID string, generation uint64) {
+	if eventSourceID == "" || generation == 0 {
+		return
+	}
+	p.appliedSourcesMu.Lock()
+	if p.retiredGenerations[eventSourceID] == nil {
+		p.retiredGenerations[eventSourceID] = make(map[uint64]struct{})
+	}
+	p.retiredGenerations[eventSourceID][generation] = struct{}{}
+	p.appliedSourcesMu.Unlock()
+}
+
+func (p *Pool) sourceGenerationIsRetired(eventSourceID string, generation uint64) bool {
+	if eventSourceID == "" || generation == 0 {
+		return false
+	}
+	p.appliedSourcesMu.RLock()
+	_, retired := p.retiredGenerations[eventSourceID][generation]
+	p.appliedSourcesMu.RUnlock()
+	return retired
+}
+
+func (p *Pool) forgetSourceState(eventSourceID string) {
+	p.checkpointMu.Lock()
+	p.appliedSourcesMu.Lock()
+	delete(p.appliedSources, eventSourceID)
+	delete(p.invalidSources, eventSourceID)
+	p.appliedSourcesMu.Unlock()
+	p.checkpointMu.Unlock()
+}
+
+func (p *Pool) markSourceInvalid(eventSourceID string) uint64 {
+	if eventSourceID == "" {
+		return 0
+	}
+	version := p.nextInvalidation.Add(1)
+	p.appliedSourcesMu.Lock()
+	p.addSourceInvalidationVersionLocked(eventSourceID, version)
+	p.appliedSourcesMu.Unlock()
+	return version
+}
+
+func (p *Pool) addSourceInvalidationLocked(eventSourceID string) uint64 {
+	version := p.nextInvalidation.Add(1)
+	p.addSourceInvalidationVersionLocked(eventSourceID, version)
+	return version
+}
+
+func (p *Pool) addSourceInvalidationVersionLocked(eventSourceID string, version uint64) {
+	if p.invalidSources[eventSourceID] == nil {
+		p.invalidSources[eventSourceID] = make(map[uint64]struct{})
+	}
+	p.invalidSources[eventSourceID][version] = struct{}{}
+}
+
+func (p *Pool) beginSourceReset(eventSourceID string) uint64 {
+	return p.markSourceInvalid(eventSourceID)
+}
+
+func (p *Pool) completeSourceReset(msg *RawMessage) {
+	if msg.EventSourceID == "" {
+		return
+	}
+	p.appliedSourcesMu.Lock()
+	if source, found := p.appliedSources[msg.EventSourceID]; found &&
+		source.matches(msg.EventEndpoint, msg.SourceEndpoint, msg.ResetDataParallelRank) {
+		delete(p.appliedSources, msg.EventSourceID)
+	}
+	for _, version := range msg.resetVersions {
+		delete(p.invalidSources[msg.EventSourceID], version)
+	}
+	if len(p.invalidSources[msg.EventSourceID]) == 0 {
+		delete(p.invalidSources, msg.EventSourceID)
+	}
+	p.appliedSourcesMu.Unlock()
+}
+
+func (p *Pool) invalidateFailedSource(
+	ctx context.Context,
+	msg *RawMessage,
+	podID string,
+	dataParallelRank *int,
+) (uint64, bool, error) {
+	p.appliedSourcesMu.Lock()
+	defer p.appliedSourcesMu.Unlock()
+	if msg.EventSourceID != "" && msg.sourceGeneration != 0 {
+		if _, retired := p.retiredGenerations[msg.EventSourceID][msg.sourceGeneration]; retired {
+			return 0, false, nil
+		}
+	}
+	var err error
+	if podID != "" {
+		err = p.clearSource(ctx, podID, dataParallelRank)
+	}
+	if msg.EventSourceID == "" {
+		return 0, true, err
+	}
+	return p.addSourceInvalidationLocked(msg.EventSourceID), true, err
+}
+
+func (p *Pool) recoverFailedMessage(
+	ctx context.Context,
+	msg *RawMessage,
+	podID string,
+	dataParallelRank *int,
+) (bool, error) {
+	if msg.onFailure != nil {
+		return msg.onFailure(ctx, podID, dataParallelRank)
+	}
+	_, active, err := p.invalidateFailedSource(ctx, msg, podID, dataParallelRank)
+	return active, err
+}
+
+func cloneOptionalInt(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 // decode spans the adapter's payload decode. It wraps the call rather than the
@@ -462,22 +759,34 @@ func (p *Pool) decode(ctx context.Context, msg *RawMessage) (string, string, Eve
 	return podID, modelName, batch, nil
 }
 
-func (p *Pool) clearPod(ctx context.Context, podIdentifier string) {
+func (p *Pool) clearPod(ctx context.Context, podIdentifier string) error {
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 	if err := p.index.Clear(ctx, podIdentifier); err != nil {
 		debugLogger.Error(err, "Failed to clear pod from index",
 			"podIdentifier", podIdentifier)
+		return err
 	}
 	p.dedup.clear(podIdentifier)
+	p.groupCatalog.Clear(podIdentifier)
+	return nil
 }
 
-func (p *Pool) clearRank(ctx context.Context, podIdentifier string, dataParallelRank int) {
+func (p *Pool) clearSource(ctx context.Context, podIdentifier string, dataParallelRank *int) error {
+	if dataParallelRank == nil {
+		return p.clearPod(ctx, podIdentifier)
+	}
+	return p.clearRank(ctx, podIdentifier, *dataParallelRank)
+}
+
+func (p *Pool) clearRank(ctx context.Context, podIdentifier string, dataParallelRank int) error {
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 	if err := kvblock.ClearDataParallelRank(ctx, p.index, podIdentifier, dataParallelRank); err != nil {
 		debugLogger.Error(err, "Failed to clear data-parallel rank from index",
 			"podIdentifier", podIdentifier, "dataParallelRank", dataParallelRank)
+		return err
 	}
 	p.dedup.clearRank(podIdentifier, dataParallelRank)
+	return nil
 }
 
 // realignExtraFeatures converts per-engine-block extra features to per-canonical-block
@@ -536,13 +845,13 @@ func realignExtraFeatures(engineFeatures []*kvblock.BlockExtraFeatures, canonica
 func (p *Pool) handleDeviceTierUpdate(
 	ctx context.Context, tokens []uint32, engineKeys []kvblock.BlockHash,
 	podEntries []kvblock.PodEntry, podIdentifier, deviceTier string,
-) bool {
+) (bool, error) {
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 
 	// Only attempt resolution when tokens are truly absent; partial-block
 	// events (tokens < blockSize) should just be skipped.
 	if len(tokens) != 0 || len(engineKeys) == 0 {
-		return false
+		return false, nil
 	}
 
 	seen := make(map[kvblock.BlockHash]struct{})
@@ -561,19 +870,19 @@ func (p *Pool) handleDeviceTierUpdate(
 	if len(resolvedKeys) == 0 {
 		debugLogger.Info("no indexed engine keys found for device-tier update, skipping",
 			"podIdentifier", podIdentifier, "engineKeyCount", len(engineKeys))
-		return false
+		return false, nil
 	}
 
 	if err := p.index.Add(ctx, nil, resolvedKeys, podEntries); err != nil {
 		debugLogger.Error(err, "Failed to add device-tier update to index",
 			"podIdentifier", podIdentifier, "deviceTier", deviceTier)
-		return false
+		return false, fmt.Errorf("add device-tier update to index: %w", err)
 	}
-	return true
+	return true, nil
 }
 
 // processEventBatch processes a batch of events using type switches.
-func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIdentifier, modelName string) {
+func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIdentifier, modelName string) error {
 	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
 	debugLogger.V(logging.TRACE).Info("Processing event batch",
 		"podID", podIdentifier,
@@ -593,13 +902,13 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			"dataParallelRank", batch.DataParallelRank,
 			"unknownEventCount", unknownCount)
 		if batch.DataParallelRank == nil {
-			p.clearPod(ctx, podIdentifier)
+			return p.clearPod(ctx, podIdentifier)
 		} else {
-			p.clearRank(ctx, podIdentifier, *batch.DataParallelRank)
+			return p.clearRank(ctx, podIdentifier, *batch.DataParallelRank)
 		}
-		return
 	}
 
+	var batchErrs []error
 	// Process each event in the batch
 	for _, genericEvent := range batch.Events {
 		switch ev := genericEvent.(type) {
@@ -633,15 +942,13 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 					if meta, found := p.groupCatalog.Get(podIdentifier, g); found {
 						ev.KVCacheSpecKind = KVCacheSpecKind(meta.Kind)
 					}
-				} else {
-					p.groupCatalog.Learn(podIdentifier, g, kvblock.GroupMetadata{
-						Kind:              string(ev.KVCacheSpecKind),
-						BlockSize:         ev.BlockSize,
-						SlidingWindowSize: ev.KVCacheSpecSlidingWindowSize,
-					})
 				}
 				podEntries[0].HasGroup = true
 				podEntries[0].GroupIdx = g
+			}
+
+			if metadata, valid := blockStoredEventGroupMetadata(ev); valid {
+				p.groupCatalog.Learn(podIdentifier, kvblock.GroupID(*ev.GroupIdx), metadata)
 			}
 
 			if digestible, reason := blockStoredEventDigestible(ev); !digestible {
@@ -656,7 +963,6 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 					"blockSize", ev.BlockSize)
 				continue
 			}
-
 			engineKeys := make([]kvblock.BlockHash, len(ev.BlockHashes))
 			for i, hash := range ev.BlockHashes {
 				engineKeys[i] = kvblock.BlockHash(hash)
@@ -675,6 +981,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 						"numTokens", len(ev.Tokens),
 						"numBlockHashes", len(ev.BlockHashes),
 						"blockSize", ev.BlockSize)
+					batchErrs = append(batchErrs, fmt.Errorf("get parent request key: %w", err))
 					continue
 				}
 				parentRequestKey = key
@@ -687,6 +994,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				if err != nil {
 					debugLogger.Error(err, "Failed to parse extra keys",
 						"podIdentifier", podIdentifier)
+					batchErrs = append(batchErrs, fmt.Errorf("parse extra keys: %w", err))
 					continue
 				}
 			}
@@ -736,11 +1044,17 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			if err != nil {
 				debugLogger.Error(err, "Failed to generate request keys",
 					"podIdentifier", podIdentifier, "effectiveModelName", effectiveModelName)
+				batchErrs = append(batchErrs, fmt.Errorf("generate request keys: %w", err))
 				continue
 			}
 
 			if len(requestKeys) == 0 {
-				if p.handleDeviceTierUpdate(ctx, ev.Tokens, engineKeys, podEntries, podIdentifier, deviceTier) {
+				applied, err := p.handleDeviceTierUpdate(
+					ctx, ev.Tokens, engineKeys, podEntries, podIdentifier, deviceTier,
+				)
+				if err != nil {
+					batchErrs = append(batchErrs, err)
+				} else if applied {
 					p.dedup.trackStore(storeScope, ev.BlockHashes)
 				}
 				continue
@@ -751,6 +1065,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			if err := p.index.Add(ctx, engineKeys, requestKeys, podEntries); err != nil {
 				debugLogger.Error(err, "Failed to add event to index",
 					"podIdentifier", podIdentifier, "event", ev)
+				batchErrs = append(batchErrs, fmt.Errorf("add event to index: %w", err))
 				continue
 			}
 			p.dedup.trackStore(storeScope, ev.BlockHashes)
@@ -819,6 +1134,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				if err := p.index.Evict(ctx, engineKey, kvblock.EngineKey, podEntries); err != nil {
 					debugLogger.Error(err, "Failed to evict engine key from index",
 						"podIdentifier", podIdentifier, "engineKey", engineKey)
+					batchErrs = append(batchErrs, fmt.Errorf("evict engine key %s: %w", engineKey.String(), err))
 					continue
 				}
 			}
@@ -840,11 +1156,16 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 					"podIdentifier", podIdentifier, "deviceTier", ev.DeviceTier)
 			}
 			if batch.DataParallelRank == nil {
-				p.clearPod(ctx, podIdentifier)
+				if err := p.clearPod(ctx, podIdentifier); err != nil {
+					batchErrs = append(batchErrs, err)
+				}
 			} else {
-				p.clearRank(ctx, podIdentifier, *batch.DataParallelRank)
+				if err := p.clearRank(ctx, podIdentifier, *batch.DataParallelRank); err != nil {
+					batchErrs = append(batchErrs, err)
+				}
 			}
 
 		}
 	}
+	return errors.Join(batchErrs...)
 }

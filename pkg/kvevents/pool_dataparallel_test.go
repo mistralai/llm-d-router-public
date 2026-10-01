@@ -31,7 +31,7 @@ func TestDataParallelRanksAreIndexedIndependently(t *testing.T) {
 	tokens := makeTokens(16)
 
 	for rank := range 2 {
-		pool.processEventBatch(ctx, &EventBatch{
+		requireProcessEventBatch(t, pool, ctx, &EventBatch{
 			DataParallelRank: &rank,
 			Events: []GenericEvent{
 				&BlockStoredEvent{
@@ -39,7 +39,7 @@ func TestDataParallelRanksAreIndexedIndependently(t *testing.T) {
 					Tokens:      tokens,
 				},
 			},
-		}, podIdentifier, "test-model")
+		}, podIdentifier)
 	}
 
 	keys, err := tokenProcessor.TokensToKVBlockKeys(
@@ -61,19 +61,19 @@ func TestDataParallelRemovalPreservesSiblingRank(t *testing.T) {
 	rank0, rank1 := 0, 1
 
 	for _, rank := range []*int{&rank0, &rank1} {
-		pool.processEventBatch(ctx, &EventBatch{
+		requireProcessEventBatch(t, pool, ctx, &EventBatch{
 			DataParallelRank: rank,
 			Events: []GenericEvent{
 				&BlockStoredEvent{BlockHashes: []uint64{1}, Tokens: tokens},
 			},
-		}, podIdentifier, "test-model")
+		}, podIdentifier)
 	}
-	pool.processEventBatch(ctx, &EventBatch{
+	requireProcessEventBatch(t, pool, ctx, &EventBatch{
 		DataParallelRank: &rank0,
 		Events: []GenericEvent{
 			&BlockRemovedEvent{BlockHashes: []uint64{1}},
 		},
-	}, podIdentifier, "test-model")
+	}, podIdentifier)
 
 	keys, err := tokenProcessor.TokensToKVBlockKeys(
 		kvblock.EmptyBlockHash, tokens, "test-model", nil)
@@ -93,17 +93,17 @@ func TestDataParallelAllBlocksClearedPreservesSiblingRank(t *testing.T) {
 	rank0, rank1 := 0, 1
 
 	for _, rank := range []*int{&rank0, &rank1} {
-		pool.processEventBatch(ctx, &EventBatch{
+		requireProcessEventBatch(t, pool, ctx, &EventBatch{
 			DataParallelRank: rank,
 			Events: []GenericEvent{
 				&BlockStoredEvent{BlockHashes: []uint64{1}, Tokens: tokens},
 			},
-		}, podIdentifier, "test-model")
+		}, podIdentifier)
 	}
-	pool.processEventBatch(ctx, &EventBatch{
+	requireProcessEventBatch(t, pool, ctx, &EventBatch{
 		DataParallelRank: &rank0,
 		Events:           []GenericEvent{&AllBlocksClearedEvent{}},
-	}, podIdentifier, "test-model")
+	}, podIdentifier)
 
 	keys, err := tokenProcessor.TokensToKVBlockKeys(
 		kvblock.EmptyBlockHash, tokens, "test-model", nil)

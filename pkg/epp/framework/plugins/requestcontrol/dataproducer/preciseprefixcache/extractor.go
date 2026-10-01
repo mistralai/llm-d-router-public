@@ -56,18 +56,20 @@ func (p *Producer) Extract(ctx context.Context, event fwkdl.EndpointEvent) error
 		return p.ensureSubscriber(ctx, meta)
 	case event.Type == fwkdl.EventAddOrUpdate || event.Type == fwkdl.EventDelete:
 		removed := p.subscribersManager.RemoveSubscriber(ctx, endpointKey)
-		// Deleted endpoints can have speculative entries without a subscriber.
 		if !removed {
 			if event.Type == fwkdl.EventAddOrUpdate {
 				return nil
 			}
+			// Deleted endpoints can have speculative entries without a subscriber.
 			if meta.Address != "" {
 				podIdentifier := fmt.Sprintf("%s:%s", meta.Address, meta.Port)
 				var err error
 				if meta.DataParallelRank == nil {
 					err = p.kvCacheIndexer.KVBlockIndex().Clear(ctx, podIdentifier)
 				} else {
-					err = kvblock.ClearDataParallelRank(ctx, p.kvCacheIndexer.KVBlockIndex(), podIdentifier, *meta.DataParallelRank)
+					err = kvblock.ClearDataParallelRank(
+						ctx, p.kvCacheIndexer.KVBlockIndex(), podIdentifier, *meta.DataParallelRank,
+					)
 				}
 				if err != nil {
 					logger.Error(err, "Failed to clear index entries for removed endpoint",

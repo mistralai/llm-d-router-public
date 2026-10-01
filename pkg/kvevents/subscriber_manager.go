@@ -157,14 +157,18 @@ func (sm *SubscriberManager) RemoveSubscriber(ctx context.Context, podIdentifier
 // same serving endpoint.
 func (sm *SubscriberManager) retireSubscriber(entry *subscriberEntry) {
 	resetSource := entry.sourceEndpoint != ""
+	var sharedSubscribers []*zmqSubscriber
 	if resetSource {
 		for _, other := range sm.subscribers {
 			if other != entry && other.sourceEndpoint == entry.sourceEndpoint &&
 				equalOptionalInt(other.dataParallelRank, entry.dataParallelRank) {
 				resetSource = false
-				break
+				sharedSubscribers = append(sharedSubscribers, other.subscriber)
 			}
 		}
+	}
+	for _, subscriber := range sharedSubscribers {
+		subscriber.requestRecovery()
 	}
 	entry.cancel()
 	entry.subscriber.retire(resetSource)

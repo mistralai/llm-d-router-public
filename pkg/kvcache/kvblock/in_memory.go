@@ -109,6 +109,9 @@ var errIndexCardinality = errors.New("index cardinality limit reached")
 
 // InMemoryIndex is an in-memory implementation of the Index interface.
 type InMemoryIndex struct {
+	// snapshotMu keeps mutations out of a checkpoint while readers continue to
+	// use the index. Restore runs before concurrent access starts.
+	snapshotMu sync.RWMutex
 	// mu protects engine-key-level check-and-act operations (Evict's allEmpty
 	// check + mapping removal vs Add's pod entry insertion) to prevent TOCTOU races.
 	mu sync.Mutex
@@ -274,6 +277,8 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	}
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Add")
+	m.snapshotMu.RLock()
+	defer m.snapshotMu.RUnlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -329,6 +334,8 @@ func (m *InMemoryIndex) Evict(ctx context.Context, key BlockHash, keyType KeyTyp
 	}
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Evict")
+	m.snapshotMu.RLock()
+	defer m.snapshotMu.RUnlock()
 	var recordBuffer [1]slabRef // KV removal events contain one pod entry.
 	records := recordBuffer[:0]
 	if len(entries) > len(recordBuffer) {
@@ -402,6 +409,8 @@ func (m *InMemoryIndex) ClearRank(ctx context.Context, podIdentifier string, dat
 }
 
 func (m *InMemoryIndex) clear(ctx context.Context, podIdentifier string, dataParallelRank *int) error {
+	m.snapshotMu.RLock()
+	defer m.snapshotMu.RUnlock()
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Clear")
 
 	m.pods.mu.Lock()

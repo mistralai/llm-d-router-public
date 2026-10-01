@@ -37,6 +37,21 @@ type instrumentedCompactWalker struct {
 	compact CompactKeyWalker
 }
 
+type instrumentedSnapshotter struct {
+	*instrumentedIndex
+	snapshotterForwarder
+}
+
+type instrumentedWalkerSnapshotter struct {
+	*instrumentedWalker
+	snapshotterForwarder
+}
+
+type instrumentedCompactSnapshotter struct {
+	*instrumentedCompactWalker
+	snapshotterForwarder
+}
+
 // NewInstrumentedIndex wraps an Index and emits metrics for Add, Evict,
 // Lookup, and WalkKeys. The wrapper is a KeyWalker exactly when next is one.
 // Read metrics count and time Lookup and WalkKeys calls; contiguous-chain
@@ -44,13 +59,33 @@ type instrumentedCompactWalker struct {
 func NewInstrumentedIndex(next Index) Index {
 	m := &instrumentedIndex{next: next}
 	if compact, ok := next.(CompactKeyWalker); ok {
-		return &instrumentedCompactWalker{
+		wrapped := &instrumentedCompactWalker{
 			instrumentedWalker: &instrumentedWalker{instrumentedIndex: m, walker: compact},
 			compact:            compact,
 		}
+		if snapshotter, ok := next.(Snapshotter); ok {
+			return &instrumentedCompactSnapshotter{
+				instrumentedCompactWalker: wrapped,
+				snapshotterForwarder:      snapshotterForwarder{Snapshotter: snapshotter},
+			}
+		}
+		return wrapped
 	}
 	if walker, ok := next.(KeyWalker); ok {
-		return &instrumentedWalker{instrumentedIndex: m, walker: walker}
+		wrapped := &instrumentedWalker{instrumentedIndex: m, walker: walker}
+		if snapshotter, ok := next.(Snapshotter); ok {
+			return &instrumentedWalkerSnapshotter{
+				instrumentedWalker:   wrapped,
+				snapshotterForwarder: snapshotterForwarder{Snapshotter: snapshotter},
+			}
+		}
+		return wrapped
+	}
+	if snapshotter, ok := next.(Snapshotter); ok {
+		return &instrumentedSnapshotter{
+			instrumentedIndex:    m,
+			snapshotterForwarder: snapshotterForwarder{Snapshotter: snapshotter},
+		}
 	}
 	return m
 }

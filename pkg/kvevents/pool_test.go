@@ -39,6 +39,17 @@ func newTestPool(t *testing.T, blockSize int) (
 	return pool, idx, tp
 }
 
+func requireProcessEventBatch(
+	t *testing.T,
+	pool *Pool,
+	ctx context.Context,
+	batch *EventBatch,
+	podIdentifier string,
+) {
+	t.Helper()
+	require.NoError(t, pool.processEventBatch(ctx, batch, podIdentifier, "test-model"))
+}
+
 type recordingIndex struct {
 	kvblock.Index
 	getRequestKeyCalls int
@@ -379,7 +390,7 @@ func TestCanonicalWritePath_FallbackLegacy(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, batch, "pod-legacy", "test-model")
+	requireProcessEventBatch(t, pool, ctx, batch, "pod-legacy")
 
 	// Verify engine->request mapping exists in the Index (legacy 1:1 path)
 	for _, ek := range engineKeys {
@@ -410,7 +421,7 @@ func TestCanonicalWritePath_ManyToOne(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, batch, "pod-a", "test-model")
+	requireProcessEventBatch(t, pool, ctx, batch, "pod-a")
 
 	// Compute expected canonical keys independently
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
@@ -458,7 +469,7 @@ func TestCanonicalWritePath_OneToMany(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, batch, "pod-b", "test-model")
+	requireProcessEventBatch(t, pool, ctx, batch, "pod-b")
 
 	// Compute expected canonical keys independently
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
@@ -492,7 +503,7 @@ func TestCanonicalWritePath_OneToMany(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, removeBatch, "pod-b", "test-model")
+	requireProcessEventBatch(t, pool, ctx, removeBatch, "pod-b")
 
 	for _, ck := range canonicalKeys[:2] {
 		result, err := idx.Lookup(ctx, []kvblock.BlockHash{ck}, nil)
@@ -529,7 +540,7 @@ func TestCanonicalEviction_Eager(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, batch, "pod-a", "test-model")
+	requireProcessEventBatch(t, pool, ctx, batch, "pod-a")
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
 		kvblock.EmptyBlockHash, tokens, "test-model", nil)
@@ -544,7 +555,7 @@ func TestCanonicalEviction_Eager(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, removeBatch, "pod-a", "test-model")
+	requireProcessEventBatch(t, pool, ctx, removeBatch, "pod-a")
 
 	// Verify canonical key 0 is evicted
 	result0, err := idx.Lookup(ctx, []kvblock.BlockHash{canonicalKeys[0]}, nil)
@@ -579,7 +590,7 @@ func TestCanonicalWritePath_CrossEngineScoring(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, batchA, "pod-a", "test-model")
+	requireProcessEventBatch(t, pool, ctx, batchA, "pod-a")
 
 	// Engine B: block size 32, 4 engine keys
 	batchB := &EventBatch{
@@ -591,7 +602,7 @@ func TestCanonicalWritePath_CrossEngineScoring(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, batchB, "pod-b", "test-model")
+	requireProcessEventBatch(t, pool, ctx, batchB, "pod-b")
 
 	// Both produce the same 2 canonical keys
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
@@ -632,7 +643,7 @@ func TestCanonicalEviction_UnknownEngineKey(t *testing.T) {
 
 	// Should not panic or error, just skip
 	assert.NotPanics(t, func() {
-		pool.processEventBatch(ctx, removeBatch, "pod-x", "test-model")
+		requireProcessEventBatch(t, pool, ctx, removeBatch, "pod-x")
 	})
 }
 
@@ -737,7 +748,7 @@ func TestCanonicalWritePath_ExtraKeysOneToMany(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, batch, "pod-extra", "test-model")
+	requireProcessEventBatch(t, pool, ctx, batch, "pod-extra")
 
 	// Compute expected canonical keys (no extra features for text-only)
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
@@ -779,7 +790,7 @@ func TestCanonicalWritePath_ExtraKeysManyToOne(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, batch, "pod-extra-m1", "test-model")
+	requireProcessEventBatch(t, pool, ctx, batch, "pod-extra-m1")
 
 	// Compute expected canonical keys (no extra features for text-only)
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
@@ -816,7 +827,7 @@ func TestBlockStoredEvent_OffloadingEmptyTokens(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, gpuBatch, "pod-a", "test-model")
+	requireProcessEventBatch(t, pool, ctx, gpuBatch, "pod-a")
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
 		kvblock.EmptyBlockHash, tokens, "test-model", nil)
@@ -842,7 +853,7 @@ func TestBlockStoredEvent_OffloadingEmptyTokens(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, cpuBatch, "pod-a", "test-model")
+	requireProcessEventBatch(t, pool, ctx, cpuBatch, "pod-a")
 
 	// Verify both GPU and CPU entries now exist for each canonical key.
 	for _, ck := range canonicalKeys {
@@ -878,7 +889,7 @@ func TestBlockStoredEvent_OffloadingUnknownEngineKeys(t *testing.T) {
 	}
 
 	assert.NotPanics(t, func() {
-		pool.processEventBatch(ctx, cpuBatch, "pod-x", "test-model")
+		requireProcessEventBatch(t, pool, ctx, cpuBatch, "pod-x")
 	})
 }
 
@@ -901,7 +912,7 @@ func TestBlockStoredEvent_EvictionOrderGPUThenCPU(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, gpuBatch, "pod-a", "test-model")
+	requireProcessEventBatch(t, pool, ctx, gpuBatch, "pod-a")
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
 		kvblock.EmptyBlockHash, tokens, "test-model", nil)
@@ -919,7 +930,7 @@ func TestBlockStoredEvent_EvictionOrderGPUThenCPU(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, cpuBatch, "pod-a", "test-model")
+	requireProcessEventBatch(t, pool, ctx, cpuBatch, "pod-a")
 
 	// Verify both tiers present.
 	for _, ck := range canonicalKeys {
@@ -936,7 +947,7 @@ func TestBlockStoredEvent_EvictionOrderGPUThenCPU(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, gpuEvict, "pod-a", "test-model")
+	requireProcessEventBatch(t, pool, ctx, gpuEvict, "pod-a")
 
 	// CPU entries must survive, engine→request mapping must be preserved.
 	for _, ck := range canonicalKeys {
@@ -958,7 +969,7 @@ func TestBlockStoredEvent_EvictionOrderGPUThenCPU(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, cpuEvict, "pod-a", "test-model")
+	requireProcessEventBatch(t, pool, ctx, cpuEvict, "pod-a")
 
 	// Everything should be fully cleaned up.
 	for _, ck := range canonicalKeys {
@@ -993,7 +1004,7 @@ func TestHMAGroupMetadataLearnedForRejectedKind(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, batch, "pod-hma", "test-model")
+	requireProcessEventBatch(t, pool, ctx, batch, "pod-hma")
 
 	meta, ok := pool.GroupCatalog().Get("pod-hma", kvblock.GroupID(0))
 	require.True(t, ok)
@@ -1040,7 +1051,7 @@ func TestHMAGroupKindFilter(t *testing.T) {
 			tokens := makeTokens(64)
 			engineKeys := makeEngineKeys(4, 900)
 
-			pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+			requireProcessEventBatch(t, pool, ctx, &EventBatch{Events: []GenericEvent{
 				&BlockStoredEvent{
 					BlockHashes:     engineKeys,
 					Tokens:          tokens,
@@ -1048,7 +1059,7 @@ func TestHMAGroupKindFilter(t *testing.T) {
 					KVCacheSpecKind: tt.kind,
 					BlockSize:       16,
 				},
-			}}, "pod-hma", "test-model")
+			}}, "pod-hma")
 
 			canonicalKeys, err := tp.TokensToKVBlockKeys(
 				kvblock.EmptyBlockHash, tokens, "test-model", nil)
@@ -1074,7 +1085,7 @@ func TestHMAGroupFilterRejectsSparseFullAttentionBeforeParentLookup(t *testing.T
 	pool.index = recording
 	groupIdx := 0
 
-	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+	requireProcessEventBatch(t, pool, ctx, &EventBatch{Events: []GenericEvent{
 		&BlockStoredEvent{
 			BlockHashes:     makeEngineKeys(1, 950),
 			Tokens:          makeTokens(64),
@@ -1083,7 +1094,7 @@ func TestHMAGroupFilterRejectsSparseFullAttentionBeforeParentLookup(t *testing.T
 			KVCacheSpecKind: KVCacheSpecKindFullAttention,
 			BlockSize:       16,
 		},
-	}}, "pod-hma", "test-model")
+	}}, "pod-hma")
 
 	assert.Zero(t, recording.getRequestKeyCalls)
 	_, err := idx.GetRequestKey(ctx, kvblock.BlockHash(950))
@@ -1097,7 +1108,7 @@ func TestHMAGroupFilterIgnoresRejectedGroupRemoval(t *testing.T) {
 	pool.index = recording
 	groupIdx := 1
 
-	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+	requireProcessEventBatch(t, pool, ctx, &EventBatch{Events: []GenericEvent{
 		&BlockStoredEvent{
 			BlockHashes:     makeEngineKeys(1, 980),
 			Tokens:          makeTokens(64),
@@ -1105,13 +1116,13 @@ func TestHMAGroupFilterIgnoresRejectedGroupRemoval(t *testing.T) {
 			KVCacheSpecKind: KVCacheSpecKindSlidingWindowMla,
 			BlockSize:       16,
 		},
-	}}, "pod-hma", "test-model")
-	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{
+	}}, "pod-hma")
+	requireProcessEventBatch(t, pool, ctx, &EventBatch{Events: []GenericEvent{
 		&BlockRemovedEvent{
 			BlockHashes: makeEngineKeys(1, 980),
 			GroupIdx:    &groupIdx,
 		},
-	}}, "pod-hma", "test-model")
+	}}, "pod-hma")
 
 	assert.Zero(t, recording.evictCalls)
 }
@@ -1140,7 +1151,7 @@ func TestHMAGroupLevelEviction_BlockRemoved(t *testing.T) {
 				},
 			},
 		}
-		pool.processEventBatch(ctx, batch, "pod-hma", "test-model")
+		requireProcessEventBatch(t, pool, ctx, batch, "pod-hma")
 	}
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
@@ -1165,7 +1176,7 @@ func TestHMAGroupLevelEviction_BlockRemoved(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, removeBatch, "pod-hma", "test-model")
+	requireProcessEventBatch(t, pool, ctx, removeBatch, "pod-hma")
 
 	// Group 1 should remain; group 0 should be gone
 	result, err = idx.Lookup(ctx, canonicalKeys, nil)
@@ -1197,7 +1208,7 @@ func TestCanonicalWritePath_PartialBlockDrop(t *testing.T) {
 			},
 		},
 	}
-	pool.processEventBatch(ctx, batch, "pod-partial", "test-model")
+	requireProcessEventBatch(t, pool, ctx, batch, "pod-partial")
 
 	// Verify nothing was added to the index
 	result, err := idx.Lookup(ctx, []kvblock.BlockHash{kvblock.BlockHash(1)}, nil)
@@ -1225,8 +1236,8 @@ func TestAllBlocksCleared_Dispatch(t *testing.T) {
 			},
 		}
 	}
-	pool.processEventBatch(ctx, storeBatch(500), "pod-cleared", "test-model")
-	pool.processEventBatch(ctx, storeBatch(900), "pod-kept", "test-model")
+	requireProcessEventBatch(t, pool, ctx, storeBatch(500), "pod-cleared")
+	requireProcessEventBatch(t, pool, ctx, storeBatch(900), "pod-kept")
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(
 		kvblock.EmptyBlockHash, tokens, "test-model", nil)
@@ -1234,7 +1245,7 @@ func TestAllBlocksCleared_Dispatch(t *testing.T) {
 	require.NotEmpty(t, canonicalKeys)
 
 	clearBatch := &EventBatch{Events: []GenericEvent{&AllBlocksClearedEvent{}}}
-	pool.processEventBatch(ctx, clearBatch, "pod-cleared", "test-model")
+	requireProcessEventBatch(t, pool, ctx, clearBatch, "pod-cleared")
 
 	for _, ck := range canonicalKeys {
 		result, err := idx.Lookup(ctx, []kvblock.BlockHash{ck}, nil)
@@ -1258,11 +1269,11 @@ func TestPool_AllBlocksClearedResetsDedup(t *testing.T) {
 
 	storeTwice := func() {
 		for range 2 {
-			pool.processEventBatch(ctx, &EventBatch{
+			requireProcessEventBatch(t, pool, ctx, &EventBatch{
 				Events: []GenericEvent{
 					&BlockStoredEvent{BlockHashes: engineKeys, Tokens: tokens, ParentHash: 0},
 				},
-			}, "pod-clr", "test-model")
+			}, "pod-clr")
 		}
 	}
 
@@ -1270,25 +1281,25 @@ func TestPool_AllBlocksClearedResetsDedup(t *testing.T) {
 	storeTwice()
 
 	// Clear wipes both the index and the dedup counts for the pod.
-	pool.processEventBatch(ctx, &EventBatch{
+	requireProcessEventBatch(t, pool, ctx, &EventBatch{
 		Events: []GenericEvent{&AllBlocksClearedEvent{}},
-	}, "pod-clr", "test-model")
+	}, "pod-clr")
 
 	// Re-establish a single reference after the clear.
-	pool.processEventBatch(ctx, &EventBatch{
+	requireProcessEventBatch(t, pool, ctx, &EventBatch{
 		Events: []GenericEvent{
 			&BlockStoredEvent{BlockHashes: engineKeys, Tokens: tokens, ParentHash: 0},
 		},
-	}, "pod-clr", "test-model")
+	}, "pod-clr")
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
 	require.NoError(t, err)
 
 	// A single remove must now fully evict: if the pre-clear count of 2 had
 	// survived, this remove would be suppressed and the blocks would linger.
-	pool.processEventBatch(ctx, &EventBatch{
+	requireProcessEventBatch(t, pool, ctx, &EventBatch{
 		Events: []GenericEvent{&BlockRemovedEvent{BlockHashes: engineKeys}},
-	}, "pod-clr", "test-model")
+	}, "pod-clr")
 
 	for _, ck := range canonicalKeys {
 		result, err := idx.Lookup(ctx, []kvblock.BlockHash{ck}, nil)
@@ -1308,18 +1319,18 @@ func TestPool_DuplicateStoreSurvivesFirstRemove(t *testing.T) {
 	engineKeys := makeEngineKeys(4, 800)
 
 	store := func() {
-		pool.processEventBatch(ctx, &EventBatch{
+		requireProcessEventBatch(t, pool, ctx, &EventBatch{
 			Events: []GenericEvent{
 				&BlockStoredEvent{BlockHashes: engineKeys, Tokens: tokens, ParentHash: 0},
 			},
-		}, "pod-dup", "test-model")
+		}, "pod-dup")
 	}
 	remove := func() {
-		pool.processEventBatch(ctx, &EventBatch{
+		requireProcessEventBatch(t, pool, ctx, &EventBatch{
 			Events: []GenericEvent{
 				&BlockRemovedEvent{BlockHashes: engineKeys},
 			},
-		}, "pod-dup", "test-model")
+		}, "pod-dup")
 	}
 
 	store() // overlapping chunk A announces these constituent hashes
@@ -1366,20 +1377,20 @@ func TestPool_DuplicateCPUOffloadRemovalSurvivesFirstRemove(t *testing.T) {
 
 	// Step 1: GPU store with tokens establishes the engine->request mapping
 	// that the empty-token CPU offload path resolves against.
-	pool.processEventBatch(ctx, &EventBatch{
+	requireProcessEventBatch(t, pool, ctx, &EventBatch{
 		Events: []GenericEvent{
 			&BlockStoredEvent{BlockHashes: engineKeys, Tokens: tokens, ParentHash: 0},
 		},
-	}, "pod-offload", "test-model")
+	}, "pod-offload")
 
 	// Step 2: the same CPU offload (empty tokens, "CPU" tier) announced twice,
 	// as two overlapping chunks would re-announce the shared constituent hashes.
 	cpuStore := func() {
-		pool.processEventBatch(ctx, &EventBatch{
+		requireProcessEventBatch(t, pool, ctx, &EventBatch{
 			Events: []GenericEvent{
 				&BlockStoredEvent{BlockHashes: engineKeys, Tokens: nil, ParentHash: 0, DeviceTier: "CPU"},
 			},
-		}, "pod-offload", "test-model")
+		}, "pod-offload")
 	}
 	cpuStore()
 	cpuStore()
@@ -1396,11 +1407,11 @@ func TestPool_DuplicateCPUOffloadRemovalSurvivesFirstRemove(t *testing.T) {
 	}
 
 	cpuRemove := func() {
-		pool.processEventBatch(ctx, &EventBatch{
+		requireProcessEventBatch(t, pool, ctx, &EventBatch{
 			Events: []GenericEvent{
 				&BlockRemovedEvent{BlockHashes: engineKeys, DeviceTier: "CPU"},
 			},
-		}, "pod-offload", "test-model")
+		}, "pod-offload")
 	}
 
 	// Step 3: the first CPU remove (one overlapping chunk evicted) must be
@@ -1441,11 +1452,11 @@ func TestPool_DeviceTierUpdateWithNoResolvedKeysDoesNotTrack(t *testing.T) {
 
 	// CPU offload (empty tokens) for unknown engine keys: handleDeviceTierUpdate
 	// returns false, so trackStore must not be called.
-	pool.processEventBatch(ctx, &EventBatch{
+	requireProcessEventBatch(t, pool, ctx, &EventBatch{
 		Events: []GenericEvent{
 			&BlockStoredEvent{BlockHashes: engineKeys, Tokens: nil, ParentHash: 0, DeviceTier: "CPU"},
 		},
-	}, "pod-noresolve", "test-model")
+	}, "pod-noresolve")
 
 	// The dedup filter must hold no references for these hashes, so a remove on
 	// the same scope passes through unchanged (nothing was tracked to suppress).
@@ -1473,18 +1484,18 @@ func TestPool_DedupMetricsCountBlockHashes(t *testing.T) {
 	engineKeys := makeEngineKeys(4, 990)
 
 	store := func() {
-		pool.processEventBatch(ctx, &EventBatch{
+		requireProcessEventBatch(t, pool, ctx, &EventBatch{
 			Events: []GenericEvent{
 				&BlockStoredEvent{BlockHashes: engineKeys, Tokens: tokens, ParentHash: 0},
 			},
-		}, "pod-metrics", "test-model")
+		}, "pod-metrics")
 	}
 	remove := func() {
-		pool.processEventBatch(ctx, &EventBatch{
+		requireProcessEventBatch(t, pool, ctx, &EventBatch{
 			Events: []GenericEvent{
 				&BlockRemovedEvent{BlockHashes: engineKeys},
 			},
-		}, "pod-metrics", "test-model")
+		}, "pod-metrics")
 	}
 
 	suppressedBefore := counterValue(t, metrics.DedupRemovedHashesSuppressed)
@@ -1512,13 +1523,13 @@ func TestPool_UnknownEventInvalidatesRank(t *testing.T) {
 		{PodIdentifier: "pod-unknown", DeviceTier: "gpu", DataParallelRank: &rank1},
 	}))
 
-	pool.processEventBatch(ctx, &EventBatch{
+	requireProcessEventBatch(t, pool, ctx, &EventBatch{
 		Events: []GenericEvent{
 			&UnknownEvent{Tag: "FutureEvent"},
 			&BlockStoredEvent{BlockHashes: []uint64{99}, Tokens: makeTokens(16)},
 		},
 		DataParallelRank: &rank0,
-	}, "pod-unknown", "test-model")
+	}, "pod-unknown")
 
 	assert.Equal(t, 1.0, counterValue(t, metrics.UnknownEvents)-before)
 	result, err := idx.Lookup(ctx, []kvblock.BlockHash{key}, nil)
@@ -1551,6 +1562,49 @@ func TestNewPool_RejectsNonPositiveConcurrency(t *testing.T) {
 		_, err := NewPool(cfg, nil, nil, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "concurrency")
+	}
+}
+
+func TestNewPool_RejectsNegativeQueueDepth(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxQueueDepth = -1
+
+	_, err := NewPool(cfg, nil, nil, nil)
+	require.ErrorContains(t, err, "maxQueueDepth")
+}
+
+func TestPool_MaxQueueDepthAppliesBackpressure(t *testing.T) {
+	idx, err := kvblock.NewInMemoryIndex(kvblock.DefaultInMemoryIndexConfig())
+	require.NoError(t, err)
+	tp, err := kvblock.NewChunkedTokenDatabase(&kvblock.TokenProcessorConfig{
+		BlockSizeTokens: 4, HashSeed: "test",
+	})
+	require.NoError(t, err)
+	cfg := DefaultConfig()
+	cfg.MaxQueueDepth = 1
+	pool, err := NewPool(cfg, idx, tp, stubAdapter{})
+	require.NoError(t, err)
+	pool.AddTask(&RawMessage{Topic: "kv@pod-1@model-1"})
+
+	added := make(chan struct{})
+	go func() {
+		pool.AddTask(&RawMessage{Topic: "kv@pod-1@model-1", Sequence: 1})
+		close(added)
+	}()
+	select {
+	case <-added:
+		t.Fatal("second task was added while the queue was full")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	pool.Start(ctx)
+	t.Cleanup(func() { pool.Shutdown(ctx) })
+	select {
+	case <-added:
+	case <-time.After(time.Second):
+		t.Fatal("second task stayed blocked after a worker drained the queue")
 	}
 }
 

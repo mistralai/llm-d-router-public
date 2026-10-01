@@ -87,6 +87,7 @@ func newExtractorProducerWithIndex(t *testing.T, discoverPods bool, index *fakeK
 		subscribersManager: kvevents.NewSubscriberManager(pool),
 		kvEventsConfig:     cfg,
 		kvCacheIndexer:     &fakeKVCacheIndexer{index: index},
+		kvEventsPool:       pool,
 		subscriberCtx:      context.Background(),
 	}, pool
 }
@@ -841,8 +842,8 @@ func TestProducer_RankPodMappingReplacesSubscriberAfterWorkerRestart(t *testing.
 	assert.Equal(t, "tcp://10.0.0.32:5559", subscribers.endpoints[1])
 	assert.Equal(t, subscribers.ids[0], subscribers.ids[1])
 	assert.Contains(t, subscribers.removed, "ns/leader-7-rank-2")
-	assert.Equal(t, "10.0.0.10:8000", clearedPod)
-	assert.Equal(t, 2, clearedRank)
+	assert.Empty(t, clearedPod)
+	assert.Zero(t, clearedRank)
 }
 
 func TestProducer_RankPodMappingDuplicateWorkerUpdateIsNoOp(t *testing.T) {
@@ -865,7 +866,7 @@ func TestProducer_RankPodMappingDuplicateWorkerUpdateIsNoOp(t *testing.T) {
 	assert.Empty(t, subscribers.removed)
 }
 
-func TestProducer_RankPodMappingClearsOnlyRestartedRank(t *testing.T) {
+func TestProducer_RankPodMappingDelegatesRestartedRankClear(t *testing.T) {
 	subscribers := &fakeSubscriberManager{}
 	var clearedPod string
 	var clearedRank int
@@ -891,8 +892,8 @@ func TestProducer_RankPodMappingClearsOnlyRestartedRank(t *testing.T) {
 	}))
 
 	assert.Contains(t, subscribers.removed, "ns/leader-7-rank-3")
-	assert.Equal(t, "10.0.0.10:8000", clearedPod)
-	assert.Equal(t, 3, clearedRank)
+	assert.Empty(t, clearedPod)
+	assert.Zero(t, clearedRank)
 }
 
 func TestProducer_RankPodMappingEndpointDeleteUsesStoredIdentity(t *testing.T) {
@@ -923,8 +924,8 @@ func TestProducer_RankPodMappingEndpointDeleteUsesStoredIdentity(t *testing.T) {
 	}))
 
 	assert.Contains(t, subscribers.removed, "ns/leader-7-rank-2")
-	assert.Equal(t, "10.0.0.10:8000", clearedPod)
-	assert.Equal(t, 2, clearedRank)
+	assert.Empty(t, clearedPod)
+	assert.Zero(t, clearedRank)
 }
 
 func TestProducer_RankPodMappingNotReadyWorkerRemovesSubscriber(t *testing.T) {
@@ -956,7 +957,7 @@ func TestProducer_RankPodMappingNotReadyWorkerRemovesSubscriber(t *testing.T) {
 	}))
 
 	assert.Contains(t, subscribers.removed, "ns/leader-7-rank-1")
-	assert.Equal(t, 1, clearedRank)
+	assert.Zero(t, clearedRank)
 }
 
 func TestProducer_RankPodMappingFiltersWorkerPods(t *testing.T) {
