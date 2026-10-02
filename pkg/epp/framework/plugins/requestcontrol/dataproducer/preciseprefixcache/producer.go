@@ -18,9 +18,12 @@ package preciseprefixcache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"time"
 
@@ -55,6 +58,15 @@ type PluginConfig struct {
 	TokenProcessorConfig *kvblock.TokenProcessorConfig `json:"tokenProcessorConfig"`
 	IndexerConfig        *kvcache.Config               `json:"indexerConfig"`
 	KVEventsConfig       *kvevents.Config              `json:"kvEventsConfig"`
+	// CheckpointDirectory enables local index restore and periodic checkpoint writes.
+	// The directory must be on storage shared by replacement EPP pods.
+	CheckpointDirectory string `json:"checkpointDirectory,omitempty"`
+	// CheckpointWriterID selects this process's file in the shared directory.
+	// The hostname is used when this value is empty.
+	CheckpointWriterID string `json:"checkpointWriterID,omitempty"`
+	// CheckpointInterval sets the time between writes when checkpointDirectory is set.
+	// It must contain a positive Go duration because each write walks the full index.
+	CheckpointInterval string `json:"checkpointInterval,omitempty"`
 	// SpeculativeIndexing seeds predicted cache entries for the selected
 	// endpoint(s) immediately after a routing decision, so the next
 	// same-prefix request hits without waiting for engine confirmation.
@@ -95,6 +107,7 @@ type subscriberManager interface {
 type Producer struct {
 	typedName      plugin.TypedName
 	kvCacheIndexer kvCacheIndexer
+	kvEventsPool   *kvevents.Pool
 
 	subscribersManager subscriberManager
 	kvEventsConfig     *kvevents.Config
@@ -152,6 +165,10 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 // The kvcache indexer, KV-events pool, and any local ZMQ subscriber start
 // in background goroutines bound to ctx.
 func New(ctx context.Context, name string, config PluginConfig) (*Producer, error) {
+	checkpointInterval, err := validateCheckpointConfig(config)
+	if err != nil {
+		return nil, err
+	}
 	var rankResolver *rankPodResolver
 	if config.KVEventsConfig != nil && config.KVEventsConfig.PodDiscoveryConfig != nil &&
 		config.KVEventsConfig.PodDiscoveryConfig.RankPodMapping != nil {
@@ -170,6 +187,9 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	}
 	if config.KVEventsConfig == nil {
 		config.KVEventsConfig = kvevents.DefaultConfig()
+	}
+	if config.CheckpointDirectory != "" && config.KVEventsConfig.MaxQueueDepth == 0 {
+		config.KVEventsConfig.MaxQueueDepth = kvevents.DefaultCheckpointQueueDepth
 	}
 
 	var podSelector labels.Selector
@@ -201,7 +221,41 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	if err != nil {
 		return nil, fmt.Errorf("failed to create KV-events pool: %w", err)
 	}
+	checkpointID := ""
+	checkpointPath := ""
+	if config.CheckpointDirectory != "" {
+		checkpointID = checkpointFingerprint(
+			config.TokenProcessorConfig, tokenProcessor.BlockSize(),
+			config.IndexerConfig.KVBlockIndexConfig.InMemoryConfig, config.KVEventsConfig,
+		)
+		writerID := config.CheckpointWriterID
+		if writerID == "" {
+			writerID, err = os.Hostname()
+			if err != nil {
+				return nil, fmt.Errorf("get checkpoint writer hostname: %w", err)
+			}
+		}
+		checkpointPath, err = kvevents.CheckpointPathForWriter(config.CheckpointDirectory, writerID)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(config.CheckpointDirectory, 0o700); err != nil {
+			return nil, fmt.Errorf("create checkpoint directory: %w", err)
+		}
+		restoredPath, restored, restoreErr := pool.RestoreLatestCheckpoint(
+			config.CheckpointDirectory, checkpointID,
+		)
+		if restoreErr != nil {
+			log.FromContext(ctx).Error(restoreErr, "Ignoring unusable KV-event checkpoint",
+				"directory", config.CheckpointDirectory)
+		} else if restored {
+			log.FromContext(ctx).Info("Restored KV-event checkpoint", "path", restoredPath)
+		}
+	}
 	pool.Start(ctx)
+	if checkpointPath != "" {
+		go runCheckpointWriter(ctx, pool, checkpointPath, checkpointID, checkpointInterval)
+	}
 
 	subscribersManager := kvevents.NewSubscriberManager(pool)
 	if config.KVEventsConfig.ZMQEndpoint != "" {
@@ -219,6 +273,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	return &Producer{
 		typedName:          plugin.TypedName{Type: PluginType, Name: name},
 		kvCacheIndexer:     indexer,
+		kvEventsPool:       pool,
 		subscribersManager: subscribersManager,
 		kvEventsConfig:     config.KVEventsConfig,
 		podSelector:        podSelector,
@@ -231,6 +286,121 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		blockSizeTokens:    tokenProcessor.BlockSize(),
 		subscriberCtx:      ctx,
 	}, nil
+}
+
+func validateCheckpointConfig(config PluginConfig) (time.Duration, error) {
+	if config.CheckpointDirectory == "" {
+		if config.CheckpointWriterID != "" {
+			return 0, errors.New("checkpointWriterID requires checkpointDirectory")
+		}
+		if config.CheckpointInterval != "" {
+			return 0, errors.New("checkpointInterval requires checkpointDirectory")
+		}
+		return 0, nil
+	}
+	if config.KVEventsConfig == nil || !config.KVEventsConfig.DiscoverPods ||
+		config.KVEventsConfig.PodDiscoveryConfig == nil {
+		return 0, errors.New("checkpointing requires per-pod KV-event discovery")
+	}
+	if config.KVEventsConfig.ZMQEndpoint != "" {
+		return 0, errors.New("checkpointing does not support the global KV-event socket")
+	}
+	if config.KVEventsConfig.PodDiscoveryConfig.EffectiveReplayPort() < 0 {
+		return 0, errors.New("checkpointing requires KV-event replay")
+	}
+	if config.IndexerConfig == nil || config.IndexerConfig.KVBlockIndexConfig == nil ||
+		config.IndexerConfig.KVBlockIndexConfig.InMemoryConfig == nil ||
+		config.IndexerConfig.KVBlockIndexConfig.RedisConfig != nil ||
+		config.IndexerConfig.KVBlockIndexConfig.CostAwareMemoryConfig != nil {
+		return 0, errors.New("checkpointing requires the in-memory KV-block index")
+	}
+	if config.CheckpointInterval == "" {
+		return 0, errors.New("checkpointInterval is required when checkpointDirectory is set")
+	}
+	interval, err := time.ParseDuration(config.CheckpointInterval)
+	if err != nil || interval <= 0 {
+		return 0, fmt.Errorf("checkpointInterval must be a positive Go duration: %q", config.CheckpointInterval)
+	}
+	return interval, nil
+}
+
+func checkpointFingerprint(
+	config *kvblock.TokenProcessorConfig,
+	blockSize int,
+	indexConfig *kvblock.InMemoryIndexConfig,
+	eventsConfig *kvevents.Config,
+) string {
+	hashSeed := ""
+	hashAlgorithm := kvblock.HashAlgorithmCBORFNV
+	if config != nil {
+		hashSeed = config.HashSeed
+		if config.HashAlgorithm != "" {
+			hashAlgorithm = config.HashAlgorithm
+		}
+	}
+	if eventsConfig == nil {
+		eventsConfig = kvevents.DefaultConfig()
+	}
+	eventSelection := *eventsConfig
+	eventSelection.Concurrency = 0
+	eventSelection.MaxQueueDepth = 0
+	eventSelection.Tracing = false
+	if eventSelection.EngineType == "" {
+		eventSelection.EngineType = engineadapter.EngineTypeVLLM
+	}
+	podCacheSize := indexConfig.PodCacheSize
+	if podCacheSize <= 0 {
+		podCacheSize = kvblock.DefaultInMemoryIndexConfig().PodCacheSize
+	}
+	data, _ := json.Marshal(struct {
+		BlockSizeTokens int             `json:"blockSizeTokens"`
+		HashSeed        string          `json:"hashSeed"`
+		HashAlgorithm   string          `json:"hashAlgorithm"`
+		IndexSize       int             `json:"indexSize"`
+		PodCacheSize    int             `json:"podCacheSize"`
+		KVEvents        kvevents.Config `json:"kvEvents"`
+	}{
+		BlockSizeTokens: blockSize,
+		HashSeed:        hashSeed,
+		HashAlgorithm:   hashAlgorithm,
+		IndexSize:       indexConfig.Size,
+		PodCacheSize:    podCacheSize,
+		KVEvents:        eventSelection,
+	})
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
+func runCheckpointWriter(
+	ctx context.Context,
+	pool *kvevents.Pool,
+	path, configurationFingerprint string,
+	interval time.Duration,
+) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			startedAt := time.Now()
+			result, err := pool.WriteCheckpoint(path, configurationFingerprint)
+			duration := time.Since(startedAt)
+			if err != nil {
+				log.FromContext(ctx).Error(err, "Failed to write KV-event checkpoint",
+					"path", path, "duration", duration, "queueDepth", pool.QueueDepth())
+			} else {
+				log.FromContext(ctx).Info("Wrote KV-event checkpoint",
+					"path", path,
+					"sizeBytes", result.SizeBytes,
+					"sources", result.Sources,
+					"duration", duration,
+					"queueDepth", pool.QueueDepth())
+			}
+			timer.Reset(interval)
+		}
+	}
 }
 
 // RegisterDependencies adds the Pod notification source required by

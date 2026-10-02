@@ -395,8 +395,9 @@ func (p *Producer) reconcileRankEndpoint(ctx context.Context, endpointID types.N
 		}
 
 		if previous != nil {
-			p.subscribersManager.RemoveSubscriber(ctx, endpointID.String())
-			p.clearRankSubscription(ctx, previous)
+			if !p.subscribersManager.RemoveSubscriber(ctx, endpointID.String()) {
+				p.clearRankSubscription(ctx, previous)
+			}
 		}
 
 		var applied *rankSubscription
@@ -428,8 +429,9 @@ func (p *Producer) clearRankSubscription(ctx context.Context, subscription *rank
 	if subscription == nil || p.kvCacheIndexer == nil || p.kvCacheIndexer.KVBlockIndex() == nil {
 		return
 	}
-	if err := kvblock.ClearDataParallelRank(ctx, p.kvCacheIndexer.KVBlockIndex(),
-		subscription.sourceEndpoint, subscription.rank); err != nil {
+	if err := kvblock.ClearDataParallelRank(
+		ctx, p.kvCacheIndexer.KVBlockIndex(), subscription.sourceEndpoint, subscription.rank,
+	); err != nil {
 		log.FromContext(ctx).WithName(p.typedName.String()).Error(err,
 			"Failed to clear index entries for rank-pod subscriber",
 			"endpoint", subscription.id.String(),

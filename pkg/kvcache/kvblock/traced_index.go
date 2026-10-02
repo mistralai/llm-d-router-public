@@ -40,18 +40,53 @@ type tracedCompactWalker struct {
 	compact CompactKeyWalker
 }
 
+type tracedSnapshotter struct {
+	*tracedIndex
+	snapshotterForwarder
+}
+
+type tracedWalkerSnapshotter struct {
+	*tracedWalker
+	snapshotterForwarder
+}
+
+type tracedCompactSnapshotter struct {
+	*tracedCompactWalker
+	snapshotterForwarder
+}
+
 // NewTracedIndex wraps an Index and emits OpenTelemetry traces for index
 // operations. The wrapper is a KeyWalker exactly when next is one.
 func NewTracedIndex(next Index) Index {
 	t := &tracedIndex{next: next}
 	if compact, ok := next.(CompactKeyWalker); ok {
-		return &tracedCompactWalker{
+		wrapped := &tracedCompactWalker{
 			tracedWalker: &tracedWalker{tracedIndex: t, walker: compact},
 			compact:      compact,
 		}
+		if snapshotter, ok := next.(Snapshotter); ok {
+			return &tracedCompactSnapshotter{
+				tracedCompactWalker:  wrapped,
+				snapshotterForwarder: snapshotterForwarder{Snapshotter: snapshotter},
+			}
+		}
+		return wrapped
 	}
 	if walker, ok := next.(KeyWalker); ok {
-		return &tracedWalker{tracedIndex: t, walker: walker}
+		wrapped := &tracedWalker{tracedIndex: t, walker: walker}
+		if snapshotter, ok := next.(Snapshotter); ok {
+			return &tracedWalkerSnapshotter{
+				tracedWalker:         wrapped,
+				snapshotterForwarder: snapshotterForwarder{Snapshotter: snapshotter},
+			}
+		}
+		return wrapped
+	}
+	if snapshotter, ok := next.(Snapshotter); ok {
+		return &tracedSnapshotter{
+			tracedIndex:          t,
+			snapshotterForwarder: snapshotterForwarder{Snapshotter: snapshotter},
+		}
 	}
 	return t
 }

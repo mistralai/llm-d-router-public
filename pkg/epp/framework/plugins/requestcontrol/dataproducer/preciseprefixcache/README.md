@@ -33,11 +33,40 @@ upstream. No-op otherwise.
 | `tokenProcessorConfig` | object | `kvblock.DefaultTokenProcessorConfig()` | KV-block hashing for the EPP-recomputed keys (block size, hash seed). |
 | `indexerConfig` | object | `kvcache.NewDefaultConfig()` | `kvcache.Indexer` config. |
 | `kvEventsConfig` | object | `kvevents.DefaultConfig()` | KV-events pool config. |
+| `checkpointDirectory` | string | empty | Shared persistent directory for KV-event index checkpoints. |
+| `checkpointWriterID` | string | pod hostname | Identity used for this EPP's checkpoint file. |
+| `checkpointInterval` | duration | empty | Required interval between writes when `checkpointDirectory` is set. |
 | `speculativeIndexing` | bool | `false` | Seed predicted entries on routing decisions. |
 | `speculativeTTL` | duration | `2s` | TTL for speculative entries. |
 
 Set `kvEventsConfig.engineType` to `sglang` for SGLang KV-events. It defaults
 to `vllm` when omitted.
+
+Checkpointing requires the in-memory index, per-pod discovery, and a positive
+`replaySocketPort`. Each EPP atomically replaces its own file in the configured
+directory. At startup, an EPP restores the newest valid file and tries older
+files if that restore fails. The directory must be on persistent storage that
+is shared by replacement EPP pods. A snapshot stores confirmed compact-index
+entries, engine-key mappings, deduplication state, cache-group metadata, and the
+last applied event sequence for each subscriber. Prefix matching filters
+restored entries through the current request candidates, so entries for absent
+endpoints cannot affect routing.
+
+The checkpoint uses a versioned little-endian binary format with 64-bit section
+offsets and a SHA-256 body checksum. A write streams to a temporary file, syncs
+the file, and atomically replaces the prior checkpoint. Event application stops
+at a message boundary during the write. Prefix lookups continue during the write.
+
+Worker queues retain events received during a checkpoint and apply them in
+source order after the write. `maxQueueDepth` limits the combined waiting
+backlog to 65,536 messages by default. A full queue applies backpressure to the
+subscribers. Monitor `llm_d_epp_kv_cache_events_pool_queue_depth`. Checkpoint
+files are limited to 64 GiB.
+
+Restore preserves cache membership but starts with new LRU recency. Replay
+validates the saved topic and payload at each source boundary. The wire protocol
+does not provide a publisher epoch, so a publisher restart is not detectable if
+it reuses the same endpoint, sequence number, topic, and payload.
 
 For vLLM Internal or Hybrid load balancing, configure
 `dp-rank-header-handler`. Endpoint discovery creates one schedulable endpoint

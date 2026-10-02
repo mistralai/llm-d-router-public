@@ -16,7 +16,6 @@ package kvevents
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -55,17 +54,25 @@ type zmqSubscriber struct {
 	remote           bool
 	topicFilter      string
 	queueMu          sync.Mutex
+	recoveryMu       sync.Mutex
 	retired          bool
+	sourceGeneration uint64
+	recoveryRequired bool
+	recoveryVersions []uint64
+	runCancel        context.CancelFunc
 
 	// Replay state persists across reconnections within subscriber lifetime.
 	lastSeq        uint64
 	hasLastSeq     bool
 	lastLiveSeq    uint64
-	lastLiveDigest [sha256.Size]byte
+	lastLiveDigest checkpointDigest
 	hasLastLiveSeq bool
 	// replayDigests distinguishes delayed duplicate live frames from a publisher restart.
-	replayDigests     map[uint64][sha256.Size]byte
+	replayDigests     map[uint64]checkpointDigest
 	lastReplayFailure time.Time
+	// The subscriber trusts a restored boundary only after replay returns the same payload.
+	resumeDigest checkpointDigest
+	hasResume    bool
 }
 
 // newZMQSubscriber creates a new ZMQ subscriber.
@@ -75,7 +82,8 @@ func newZMQSubscriber(
 	dataParallelRank *int,
 	remote bool,
 ) *zmqSubscriber {
-	return &zmqSubscriber{
+	generation := pool.registerSource(podIdentifier)
+	subscriber := &zmqSubscriber{
 		pool:             pool,
 		podIdentifier:    podIdentifier,
 		sourceEndpoint:   sourceEndpoint,
@@ -84,7 +92,47 @@ func newZMQSubscriber(
 		dataParallelRank: dataParallelRank,
 		remote:           remote,
 		topicFilter:      topicFilter,
+		sourceGeneration: generation,
 	}
+	restoredAtEndpoint := pool.restoredSourcesAtServingEndpoint(sourceEndpoint, dataParallelRank)
+	endpointReused := false
+	for id := range restoredAtEndpoint {
+		if id != podIdentifier {
+			endpointReused = true
+			break
+		}
+	}
+	if endpointReused {
+		// Kubernetes can assign a saved serving address to a different pod. A full
+		// replay does not remove saved keys that the new pod does not report.
+		for id, source := range restoredAtEndpoint {
+			pool.resetForSource(
+				topicFilter, id, source.EventEndpoint, source.ServingEndpoint,
+				source.DataParallelRank,
+			)
+		}
+		return subscriber
+	}
+	if source, found := pool.resumeSource(
+		podIdentifier, endpoint, sourceEndpoint, dataParallelRank,
+	); found {
+		if replayEndpoint == "" {
+			pool.resetForSource(topicFilter, podIdentifier, endpoint, sourceEndpoint, dataParallelRank)
+		} else {
+			subscriber.lastSeq = source.LastAppliedSequence
+			subscriber.hasLastSeq = true
+			subscriber.resumeDigest = source.EventDigest
+			subscriber.hasResume = true
+		}
+	} else if source, found := pool.checkpointSource(podIdentifier); found {
+		// A changed transport identity can use a different sequence space. Clear
+		// the saved source before this subscriber can add events for the new one.
+		pool.resetForSource(
+			topicFilter, podIdentifier, source.EventEndpoint, source.ServingEndpoint,
+			source.DataParallelRank,
+		)
+	}
+	return subscriber
 }
 
 // parseEventFrame validates and extracts a live or replayed event frame.
@@ -109,9 +157,11 @@ func (z *zmqSubscriber) Start(ctx context.Context) {
 			logger.Info("shutting down zmq-subscriber")
 			return
 		default:
+			z.prepareRecovery()
 			// We run the subscriber in a separate function to handle socket
 			// setup/teardown and connection retries cleanly.
 			z.runSubscriber(ctx)
+			z.prepareRecovery()
 			// wait before retrying, unless the context has been canceled.
 			select {
 			case <-time.After(retryInterval):
@@ -128,6 +178,16 @@ func (z *zmqSubscriber) Start(ctx context.Context) {
 // runSubscriber connects to the ZMQ PUB socket, subscribes to the topic filter,
 // and listens for messages.
 func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
+	runCtx, runCancel := context.WithCancel(ctx)
+	if !z.installRunCancel(runCancel) {
+		runCancel()
+		return
+	}
+	defer func() {
+		runCancel()
+		z.clearRunCancel()
+	}()
+	ctx = runCtx
 	logger := log.FromContext(ctx).WithName("zmq-subscriber")
 
 	// Disable zmq4's automatic reconnect to avoid a data race in the library:
@@ -161,10 +221,22 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 	}
 
 	// Rebuild the index from buffered events without waiting for live traffic.
-	if z.replayEndpoint != "" && !z.hasLastSeq && z.canAttemptReplay() {
+	if z.replayEndpoint != "" && z.hasResume && z.canAttemptReplay() {
+		logger.Info("Validating restored KV-event stream",
+			"endpoint", z.endpoint, "replayEndpoint", z.replayEndpoint,
+			"lastAppliedSequence", z.lastSeq)
+		switch {
+		case z.requestReplay(ctx, z.lastSeq, &z.resumeDigest):
+			z.hasResume = false
+		case z.hasResume:
+			return
+		default:
+			z.requestReplay(ctx, 0, nil)
+		}
+	} else if z.replayEndpoint != "" && !z.hasLastSeq && z.canAttemptReplay() {
 		logger.Info("Requesting proactive replay on connect",
 			"endpoint", z.endpoint, "replayEndpoint", z.replayEndpoint)
-		z.requestReplay(ctx, 0)
+		z.requestReplay(ctx, 0, nil)
 	}
 
 	debugLogger := logger.V(logging.DEBUG)
@@ -192,12 +264,12 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 		}
 
 		replayAttempted := false
-		payloadDigest := sha256.Sum256(payload)
+		eventDigest := checkpointEventDigest(topic, payload)
 		replayedDigest, wasReplayed := z.replayDigests[seq]
 		sequenceReset := z.hasLastLiveSeq && (seq < z.lastLiveSeq ||
-			(seq == z.lastLiveSeq && payloadDigest != z.lastLiveDigest))
+			(seq == z.lastLiveSeq && eventDigest != z.lastLiveDigest))
 		if !z.hasLastLiveSeq && z.hasLastSeq && seq <= z.lastSeq {
-			sequenceReset = !wasReplayed || payloadDigest != replayedDigest
+			sequenceReset = !wasReplayed || eventDigest != replayedDigest
 		}
 		if sequenceReset {
 			logger.Info("Detected event sequence reset, rebuilding index",
@@ -208,14 +280,14 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			z.hasLastSeq = false
 			z.lastReplayFailure = time.Time{}
 			replayAttempted = true
-			z.requestReplay(ctx, 0)
+			z.requestReplay(ctx, 0, nil)
 		}
 
-		if z.hasLastLiveSeq && seq == z.lastLiveSeq && payloadDigest == z.lastLiveDigest {
+		if z.hasLastLiveSeq && seq == z.lastLiveSeq && eventDigest == z.lastLiveDigest {
 			continue
 		}
 		z.lastLiveSeq = seq
-		z.lastLiveDigest = payloadDigest
+		z.lastLiveDigest = eventDigest
 		z.hasLastLiveSeq = true
 		z.replayDigests = nil
 
@@ -235,7 +307,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 				"lastSeq", z.lastSeq, "currentSeq", seq, "missed", missed,
 				"endpoint", z.endpoint)
 			replayAttempted = true
-			if !z.requestReplay(ctx, z.lastSeq+1) {
+			if !z.requestReplay(ctx, z.lastSeq+1, nil) {
 				continue
 			}
 		}
@@ -246,7 +318,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			}
 			logger.Info("Joining mid-stream, requesting full replay",
 				"currentSeq", seq, "endpoint", z.endpoint)
-			if !z.requestReplay(ctx, 0) {
+			if !z.requestReplay(ctx, 0, nil) {
 				continue
 			}
 		}
@@ -293,6 +365,10 @@ func (z *zmqSubscriber) addTask(ctx context.Context, topic string, seq uint64, p
 		Payload:                payload,
 		SourceEndpoint:         z.sourceEndpoint,
 		SourceDataParallelRank: z.dataParallelRank,
+		EventSourceID:          z.podIdentifier,
+		EventEndpoint:          z.endpoint,
+		sourceGeneration:       z.sourceGeneration,
+		onFailure:              z.processingFailed,
 	}
 	// carried is bound inside the branch on purpose. Taking &sc directly makes
 	// sc escape, so it heap-allocates on every message including the ones the
@@ -314,11 +390,108 @@ func (z *zmqSubscriber) enqueue(msg *RawMessage) {
 }
 
 func (z *zmqSubscriber) resetForSource(topic string) {
-	z.enqueue(&RawMessage{
+	z.queueMu.Lock()
+	defer z.queueMu.Unlock()
+	if z.retired {
+		return
+	}
+	resetVersion := z.pool.beginSourceReset(z.podIdentifier)
+	z.pool.AddTask(&RawMessage{
 		Topic:                 topic,
+		EventSourceID:         z.podIdentifier,
+		EventEndpoint:         z.endpoint,
 		SourceEndpoint:        z.sourceEndpoint,
 		ResetDataParallelRank: z.dataParallelRank,
 		reset:                 true,
+		resetVersions:         []uint64{resetVersion},
+		sourceGeneration:      z.sourceGeneration,
+	})
+}
+
+func (z *zmqSubscriber) installRunCancel(cancel context.CancelFunc) bool {
+	z.recoveryMu.Lock()
+	defer z.recoveryMu.Unlock()
+	if z.retired || z.recoveryRequired {
+		return false
+	}
+	z.runCancel = cancel
+	return true
+}
+
+func (z *zmqSubscriber) clearRunCancel() {
+	z.recoveryMu.Lock()
+	z.runCancel = nil
+	z.recoveryMu.Unlock()
+}
+
+func (z *zmqSubscriber) processingFailed(
+	ctx context.Context,
+	podID string,
+	dataParallelRank *int,
+) (bool, error) {
+	z.recoveryMu.Lock()
+	defer z.recoveryMu.Unlock()
+	if z.retired {
+		return false, nil
+	}
+	message := &RawMessage{
+		EventSourceID: z.podIdentifier, sourceGeneration: z.sourceGeneration,
+	}
+	version, active, err := z.pool.invalidateFailedSource(ctx, message, podID, dataParallelRank)
+	if !active {
+		return false, err
+	}
+	z.recoveryVersions = append(z.recoveryVersions, version)
+	z.recoveryRequired = true
+	if z.runCancel != nil {
+		z.runCancel()
+	}
+	return true, err
+}
+
+func (z *zmqSubscriber) requestRecovery() {
+	z.recoveryMu.Lock()
+	defer z.recoveryMu.Unlock()
+	if z.retired {
+		return
+	}
+	version := z.pool.markSourceInvalid(z.podIdentifier)
+	z.recoveryVersions = append(z.recoveryVersions, version)
+	z.recoveryRequired = true
+	if z.runCancel != nil {
+		z.runCancel()
+	}
+}
+
+func (z *zmqSubscriber) prepareRecovery() {
+	z.queueMu.Lock()
+	defer z.queueMu.Unlock()
+	z.recoveryMu.Lock()
+	if z.retired || !z.recoveryRequired {
+		z.recoveryMu.Unlock()
+		return
+	}
+	z.recoveryRequired = false
+	z.lastSeq = 0
+	z.hasLastSeq = false
+	z.lastLiveSeq = 0
+	z.lastLiveDigest = checkpointDigest{}
+	z.hasLastLiveSeq = false
+	z.hasResume = false
+	z.replayDigests = nil
+	z.lastReplayFailure = time.Time{}
+	resetVersions := z.recoveryVersions
+	z.recoveryVersions = nil
+	z.recoveryMu.Unlock()
+	z.pool.AddTask(&RawMessage{
+		Topic:                 z.topicFilter,
+		EventSourceID:         z.podIdentifier,
+		EventEndpoint:         z.endpoint,
+		SourceEndpoint:        z.sourceEndpoint,
+		ResetDataParallelRank: z.dataParallelRank,
+		reset:                 true,
+		resetVersions:         resetVersions,
+		sourceGeneration:      z.sourceGeneration,
 	})
 }
 
@@ -329,9 +502,21 @@ func (z *zmqSubscriber) resetForSource(topic string) {
 func (z *zmqSubscriber) retire(resetSource bool) {
 	z.queueMu.Lock()
 	defer z.queueMu.Unlock()
+	z.recoveryMu.Lock()
 	z.retired = true
+	resetVersions := z.recoveryVersions
+	z.recoveryVersions = nil
+	z.recoveryRequired = false
+	z.recoveryMu.Unlock()
+	z.pool.retireSourceGeneration(z.podIdentifier, z.sourceGeneration)
 	if resetSource && z.sourceEndpoint != "" {
-		z.pool.resetForSource(z.topicFilter, z.sourceEndpoint, z.dataParallelRank)
+		resetVersions = append(resetVersions, z.pool.beginSourceReset(z.podIdentifier))
+		z.pool.resetSourceInvalidations(
+			z.topicFilter, z.podIdentifier, z.endpoint, z.sourceEndpoint,
+			z.dataParallelRank, resetVersions,
+		)
+	} else if !resetSource {
+		z.pool.forgetSourceState(z.podIdentifier)
 	}
 }
 
@@ -343,12 +528,17 @@ func (z *zmqSubscriber) invalidateReplay(topic string) {
 	z.resetForSource(topic)
 	z.lastSeq = 0
 	z.hasLastSeq = false
+	z.hasResume = false
 	z.replayDigests = nil
 	z.lastReplayFailure = time.Now()
 }
 
 // requestReplay requests buffered events starting from startSeq.
-func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool {
+func (z *zmqSubscriber) requestReplay(
+	ctx context.Context,
+	startSeq uint64,
+	expectedCheckpointDigest *checkpointDigest,
+) bool {
 	logger := log.FromContext(ctx).WithName("zmq-replay")
 	debugLogger := logger.V(logging.DEBUG)
 
@@ -357,11 +547,15 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 
 	replayed := 0
 	nextSeq := startSeq
+	checkpointValidated := expectedCheckpointDigest == nil
+	validatingCheckpoint := expectedCheckpointDigest != nil
 	attempt := 0
 	noProgressAttempts := 0
 	for {
 		if replayCtx.Err() != nil {
-			z.invalidateReplay(z.topicFilter)
+			if !validatingCheckpoint {
+				z.invalidateReplay(z.topicFilter)
+			}
 			logger.Info("Replay timed out",
 				"replayed", replayed, "attempts", attempt,
 				"replayEndpoint", z.replayEndpoint)
@@ -373,7 +567,9 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 		dealer := zmq4.NewDealer(attemptCtx, zmq4.WithTimeout(replayAttemptIdleTimeout))
 		if err := dealer.Dial(z.replayEndpoint); err != nil {
 			attemptCancel()
-			z.invalidateReplay(z.topicFilter)
+			if !validatingCheckpoint {
+				z.invalidateReplay(z.topicFilter)
+			}
 			metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-connect").Inc()
 			logger.Error(err, "Failed to connect replay socket",
 				"replayEndpoint", z.replayEndpoint)
@@ -388,7 +584,9 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 		if err := processReplayLimiter.Acquire(replayCtx, 1); err != nil {
 			dealer.Close()
 			attemptCancel()
-			z.invalidateReplay(z.topicFilter)
+			if !validatingCheckpoint {
+				z.invalidateReplay(z.topicFilter)
+			}
 			metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-capacity").Inc()
 			logger.Info("Replay timed out waiting for process capacity",
 				"waitDuration", time.Since(waitStarted),
@@ -406,7 +604,9 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 			dealer.Close()
 			attemptCancel()
 			processReplayLimiter.Release(1)
-			z.invalidateReplay(z.topicFilter)
+			if !validatingCheckpoint {
+				z.invalidateReplay(z.topicFilter)
+			}
 			metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-send").Inc()
 			logger.Error(err, "Failed to send replay request",
 				"nextSeq", nextSeq, "replayEndpoint", z.replayEndpoint)
@@ -419,6 +619,7 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 		expectedSeq := nextSeq
 		var receiveErr error
 		var terminalErr error
+		checkpointMismatch := false
 		for {
 			msg, err := dealer.Recv()
 			if err != nil {
@@ -446,12 +647,26 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 				break
 			}
 
-			z.addTask(ctx, topic, seq, payload)
+			eventDigest := checkpointEventDigest(topic, payload)
 			if !z.hasLastLiveSeq {
 				if z.replayDigests == nil {
-					z.replayDigests = make(map[uint64][sha256.Size]byte)
+					z.replayDigests = make(map[uint64]checkpointDigest)
 				}
-				z.replayDigests[seq] = sha256.Sum256(payload)
+				z.replayDigests[seq] = eventDigest
+			}
+			if !checkpointValidated {
+				// The boundary frame proves that the publisher did not restart and
+				// must not be applied twice.
+				if eventDigest != *expectedCheckpointDigest {
+					terminalErr = fmt.Errorf("checkpoint sequence %d event does not match", seq)
+					checkpointMismatch = true
+					break
+				}
+				checkpointValidated = true
+				validatingCheckpoint = false
+				z.hasResume = false
+			} else {
+				z.addTask(ctx, topic, seq, payload)
 			}
 			z.lastSeq = seq
 			z.hasLastSeq = true
@@ -465,7 +680,9 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 		attemptCancel()
 		processReplayLimiter.Release(1)
 		if terminalErr != nil {
-			z.invalidateReplay(z.topicFilter)
+			if !validatingCheckpoint || checkpointMismatch {
+				z.invalidateReplay(z.topicFilter)
+			}
 			metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-incomplete").Inc()
 			logger.Error(terminalErr, "Replay response is incomplete",
 				"attempt", attempt, "replayed", replayed,
@@ -473,6 +690,15 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 			return false
 		}
 		if complete {
+			if !checkpointValidated {
+				err := fmt.Errorf("checkpoint sequence %d was not available", startSeq)
+				z.invalidateReplay(z.topicFilter)
+				metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-incomplete").Inc()
+				logger.Error(err, "Replay response cannot validate checkpoint",
+					"attempt", attempt, "replayed", replayed,
+					"replayEndpoint", z.replayEndpoint)
+				return false
+			}
 			if replayed == 0 && startSeq > 0 {
 				err := fmt.Errorf("incomplete replay: sequence %d was not available", startSeq)
 				z.invalidateReplay(z.topicFilter)
@@ -498,7 +724,9 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 				if receiveErr == nil {
 					receiveErr = fmt.Errorf("replay response ended without progress")
 				}
-				z.invalidateReplay(z.topicFilter)
+				if !validatingCheckpoint {
+					z.invalidateReplay(z.topicFilter)
+				}
 				metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-no-progress").Inc()
 				logger.Error(receiveErr, "Replay stopped after no progress",
 					"attempts", attempt, "replayed", replayed,

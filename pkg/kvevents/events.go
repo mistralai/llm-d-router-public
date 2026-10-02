@@ -15,6 +15,8 @@
 package kvevents
 
 import (
+	"context"
+
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -84,11 +86,21 @@ type RawMessage struct {
 	// SourceDataParallelRank is the rank assigned to the subscriber. Nil means
 	// the serving endpoint is not configured for shared-port data parallelism.
 	SourceDataParallelRank *int
+	// EventSourceID identifies the subscriber sequence space in checkpoints.
+	EventSourceID string
+	// EventEndpoint identifies the publisher socket for checkpoint validation.
+	EventEndpoint string
 	// ResetDataParallelRank scopes a replay reset to one rank. Nil resets the
 	// whole serving endpoint.
 	ResetDataParallelRank *int
 	// reset clears the message's pod before later messages on the same queue.
 	reset bool
+	// resetVersions identify the source invalidations that this reset can resolve.
+	resetVersions []uint64
+	// sourceGeneration rejects queued messages from a retired subscriber after its replacement starts.
+	sourceGeneration uint64
+	// onFailure clears invalid state and requests recovery before retirement can proceed.
+	onFailure func(context.Context, string, *int) (bool, error)
 	// SpanContext links processing back to the span that received the message,
 	// bridging the worker-queue boundary. Only the span identity crosses, never
 	// the subscriber's context: a subscriber reconnect cancels that context, and

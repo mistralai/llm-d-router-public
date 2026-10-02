@@ -18,10 +18,17 @@ package preciseprefixcache
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
+	"net"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/go-zeromq/zmq4"
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/kvcache"
@@ -29,6 +36,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/kvevents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/vmihailenco/msgpack/v5"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -39,6 +47,348 @@ import (
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	"github.com/llm-d/llm-d-router/test/utils"
 )
+
+type checkpointLifecycleReplayMessage struct {
+	sequence uint64
+	payload  []byte
+}
+
+type checkpointLifecycleReplayServer struct {
+	mu           sync.RWMutex
+	messages     []checkpointLifecycleReplayMessage
+	requestCount int
+	lastStart    uint64
+}
+
+func (s *checkpointLifecycleReplayServer) set(messages ...checkpointLifecycleReplayMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.messages = append([]checkpointLifecycleReplayMessage(nil), messages...)
+}
+
+func (s *checkpointLifecycleReplayServer) state() (int, uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.requestCount, s.lastStart
+}
+
+func startCheckpointLifecycleReplayServer(
+	ctx context.Context,
+	t *testing.T,
+	endpoint string,
+	topic []byte,
+) *checkpointLifecycleReplayServer {
+	t.Helper()
+	server := &checkpointLifecycleReplayServer{}
+	router := zmq4.NewRouter(ctx)
+	require.NoError(t, router.Listen(endpoint))
+	t.Cleanup(func() { _ = router.Close() })
+
+	go func() {
+		for {
+			request, err := router.Recv()
+			if err != nil {
+				return
+			}
+			if len(request.Frames) != 3 || len(request.Frames[2]) < 8 {
+				continue
+			}
+			clientID := request.Frames[0]
+			start := binary.BigEndian.Uint64(request.Frames[2])
+			server.mu.Lock()
+			server.requestCount++
+			server.lastStart = start
+			messages := append([]checkpointLifecycleReplayMessage(nil), server.messages...)
+			server.mu.Unlock()
+			for _, message := range messages {
+				if message.sequence < start {
+					continue
+				}
+				sequence := make([]byte, 8)
+				binary.BigEndian.PutUint64(sequence, message.sequence)
+				if err := router.Send(zmq4.NewMsgFrom(
+					clientID, []byte{}, topic, sequence, message.payload,
+				)); err != nil {
+					break
+				}
+			}
+			terminal := make([]byte, 8)
+			binary.BigEndian.PutUint64(terminal, math.MaxUint64)
+			_ = router.Send(zmq4.NewMsgFrom(
+				clientID, []byte{}, []byte{}, terminal, []byte{},
+			))
+		}
+	}()
+
+	return server
+}
+
+func checkpointLifecycleEndpoint(ctx context.Context, t *testing.T) (string, int) {
+	t.Helper()
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	address := listener.Addr().(*net.TCPAddr)
+	endpoint := "tcp://" + address.String()
+	require.NoError(t, listener.Close())
+	return endpoint, address.Port
+}
+
+func checkpointLifecyclePayload(
+	t *testing.T,
+	blockHashes []uint64,
+	parentHash uint64,
+	tokens []uint32,
+) []byte {
+	t.Helper()
+	payload, err := msgpack.Marshal([]any{
+		1234567890.0,
+		[]any{[]any{
+			string(kvevents.EventTypeBlockStored),
+			blockHashes,
+			parentHash,
+			tokens,
+			testBlockSize,
+			nil,
+			"gpu",
+		}},
+		nil,
+	})
+	require.NoError(t, err)
+	return payload
+}
+
+func checkpointLifecycleMatchBlocks(
+	ctx context.Context,
+	producer *Producer,
+	request *scheduling.InferenceRequest,
+	endpoint scheduling.Endpoint,
+) (int, error) {
+	if err := producer.Produce(ctx, request, []scheduling.Endpoint{endpoint}); err != nil {
+		return 0, err
+	}
+	raw, ok := endpoint.Get(producer.dk)
+	if !ok {
+		return 0, errors.New("prefix cache match result is missing")
+	}
+	info, ok := raw.(*attrprefix.PrefixCacheMatchInfo)
+	if !ok {
+		return 0, fmt.Errorf("prefix cache match result has type %T", raw)
+	}
+	return info.MatchBlocks(), nil
+}
+
+func TestCheckpointLifecycleRestoresReplaysAndScores(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	t.Cleanup(cancel)
+
+	pubEndpoint, pubPort := checkpointLifecycleEndpoint(ctx, t)
+	publisher := zmq4.NewPub(ctx)
+	require.NoError(t, publisher.Listen(pubEndpoint))
+	t.Cleanup(func() { _ = publisher.Close() })
+
+	replayEndpoint, replayPort := checkpointLifecycleEndpoint(ctx, t)
+	topic := []byte("kv@127.0.0.1:8080@TestModel")
+	replay := startCheckpointLifecycleReplayServer(ctx, t, replayEndpoint, topic)
+
+	tokens := make([]uint32, 4*testBlockSize)
+	for i := range tokens {
+		tokens[i] = uint32(i + 1) // #nosec G115 -- test data is bounded
+	}
+	boundaryPayload := checkpointLifecyclePayload(t, []uint64{100, 101}, 0, tokens[:2*testBlockSize])
+	newerPayload := checkpointLifecyclePayload(t, []uint64{102, 103}, 101, tokens[2*testBlockSize:])
+	checkpointDirectory := t.TempDir()
+	tokenConfig := &kvblock.TokenProcessorConfig{BlockSizeTokens: testBlockSize, HashSeed: "lifecycle-test"}
+	indexerConfig, err := kvcache.NewDefaultConfig()
+	require.NoError(t, err)
+	eventsConfig := kvevents.DefaultConfig()
+	eventsConfig.PodDiscoveryConfig.SocketPort = pubPort
+	eventsConfig.PodDiscoveryConfig.ReplaySocketPort = replayPort
+	config := PluginConfig{
+		TokenProcessorConfig: tokenConfig,
+		IndexerConfig:        indexerConfig,
+		KVEventsConfig:       eventsConfig,
+		CheckpointDirectory:  checkpointDirectory,
+		CheckpointWriterID:   "epp-a",
+		CheckpointInterval:   "1h",
+	}
+	endpointMetadata := &fwkdl.EndpointMetadata{
+		ID:      k8stypes.NamespacedName{Namespace: "vortex", Name: "vllm-a"},
+		Address: "127.0.0.1",
+		Port:    "8080",
+	}
+	discoveryEndpoint := fwkdl.NewEndpoint(endpointMetadata, nil)
+	scoringEndpoint := scheduling.NewEndpoint(endpointMetadata, nil, nil)
+	endpointEvent := fwkdl.EndpointEvent{Type: fwkdl.EventAddOrUpdate, Endpoint: discoveryEndpoint}
+	request := &scheduling.InferenceRequest{
+		RequestID:   "checkpoint-lifecycle",
+		TargetModel: "TestModel",
+		Body: &fwkrh.InferenceRequestBody{TokenizedRequest: &fwkrh.TokenizedRequest{
+			Prompts: []fwkrh.PromptTokens{{TokenIDs: tokens}},
+		}},
+	}
+
+	firstCtx, stopFirst := context.WithCancel(ctx)
+	first, err := New(firstCtx, "precise", config)
+	require.NoError(t, err)
+	require.NoError(t, first.Extract(firstCtx, endpointEvent))
+	sequence := make([]byte, 8)
+	binary.BigEndian.PutUint64(sequence, 0)
+	require.Eventually(t, func() bool {
+		if sendErr := publisher.Send(zmq4.NewMsgFrom(topic, sequence, boundaryPayload)); sendErr != nil {
+			return false
+		}
+		matchBlocks, matchErr := checkpointLifecycleMatchBlocks(firstCtx, first, request, scoringEndpoint)
+		return matchErr == nil && matchBlocks == 2
+	}, 5*time.Second, 25*time.Millisecond)
+
+	_, err = first.kvEventsPool.WriteCheckpointForWriter(checkpointDirectory, config.CheckpointWriterID, checkpointFingerprint(
+		tokenConfig,
+		first.blockSizeTokens,
+		indexerConfig.KVBlockIndexConfig.InMemoryConfig,
+		eventsConfig,
+	))
+	require.NoError(t, err)
+	stopFirst()
+	first.subscribersManager.Shutdown(context.Background())
+	first.kvEventsPool.Shutdown(context.Background())
+
+	initialReplayRequests, _ := replay.state()
+	replay.set(
+		checkpointLifecycleReplayMessage{sequence: 0, payload: boundaryPayload},
+		checkpointLifecycleReplayMessage{sequence: 1, payload: newerPayload},
+	)
+	config.CheckpointWriterID = "epp-b"
+	secondCtx, stopSecond := context.WithCancel(ctx)
+	t.Cleanup(stopSecond)
+	second, err := New(secondCtx, "precise", config)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		stopSecond()
+		second.subscribersManager.Shutdown(context.Background())
+		second.kvEventsPool.Shutdown(context.Background())
+	})
+
+	restoredKeys, err := second.kvCacheIndexer.ComputeBlockKeysFromTokens(
+		secondCtx, tokens, request.TargetModel, nil,
+	)
+	require.NoError(t, err)
+	restored, err := second.kvCacheIndexer.KVBlockIndex().Lookup(secondCtx, restoredKeys, nil)
+	require.NoError(t, err)
+	require.Contains(t, restored, restoredKeys[0])
+	require.Contains(t, restored, restoredKeys[1])
+	require.NotContains(t, restored, restoredKeys[2])
+
+	require.NoError(t, second.Extract(secondCtx, endpointEvent))
+	require.Eventually(t, func() bool {
+		matchBlocks, matchErr := checkpointLifecycleMatchBlocks(secondCtx, second, request, scoringEndpoint)
+		return matchErr == nil && matchBlocks == 4
+	}, 5*time.Second, 25*time.Millisecond)
+	requestCount, lastStart := replay.state()
+	require.Greater(t, requestCount, initialReplayRequests)
+	require.Zero(t, lastStart)
+}
+
+func TestNewRestoresKVEventCheckpointBeforeStartingPool(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	tokenConfig := &kvblock.TokenProcessorConfig{BlockSizeTokens: 16, HashSeed: "checkpoint-test"}
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(tokenConfig)
+	require.NoError(t, err)
+	indexerConfig, err := kvcache.NewDefaultConfig()
+	require.NoError(t, err)
+	sourceIndex, err := kvblock.NewInMemoryIndex(indexerConfig.KVBlockIndexConfig.InMemoryConfig)
+	require.NoError(t, err)
+	entry := kvblock.PodEntry{PodIdentifier: "10.0.0.1:8000", DeviceTier: "gpu"}
+	require.NoError(t, sourceIndex.Add(ctx,
+		[]kvblock.BlockHash{11}, []kvblock.BlockHash{101}, []kvblock.PodEntry{entry}))
+	sourcePool, err := kvevents.NewPool(kvevents.DefaultConfig(), sourceIndex, tokenProcessor, nil)
+	require.NoError(t, err)
+	checkpointDirectory := t.TempDir()
+	eventsConfig := kvevents.DefaultConfig()
+	eventsConfig.PodDiscoveryConfig.ReplaySocketPort = 5657
+	_, err = sourcePool.WriteCheckpointForWriter(checkpointDirectory, "source-epp", checkpointFingerprint(
+		tokenConfig, tokenProcessor.BlockSize(),
+		indexerConfig.KVBlockIndexConfig.InMemoryConfig, eventsConfig,
+	))
+	require.NoError(t, err)
+
+	producer, err := New(ctx, "precise", PluginConfig{
+		TokenProcessorConfig: tokenConfig,
+		IndexerConfig:        indexerConfig,
+		KVEventsConfig:       eventsConfig,
+		CheckpointDirectory:  checkpointDirectory,
+		CheckpointWriterID:   "replacement-epp",
+		CheckpointInterval:   "1h",
+	})
+	require.NoError(t, err)
+
+	hits, err := producer.kvCacheIndexer.KVBlockIndex().Lookup(ctx, []kvblock.BlockHash{101}, nil)
+	require.NoError(t, err)
+	require.Equal(t, []kvblock.PodEntry{entry}, hits[101])
+
+	matches, err := producer.kvCacheIndexer.MatchBlockKeysByEndpoint(
+		ctx, []kvblock.BlockHash{101}, sets.New("10.0.0.2:8000"),
+	)
+	require.NoError(t, err)
+	require.Empty(t, matches)
+}
+
+func TestCheckpointConfigRequiresReplayAndInMemoryIndex(t *testing.T) {
+	indexerConfig, err := kvcache.NewDefaultConfig()
+	require.NoError(t, err)
+	eventsConfig := kvevents.DefaultConfig()
+	_, err = validateCheckpointConfig(PluginConfig{CheckpointWriterID: "epp-a"})
+	require.ErrorContains(t, err, "checkpointWriterID requires checkpointDirectory")
+
+	_, err = validateCheckpointConfig(PluginConfig{
+		IndexerConfig: indexerConfig, KVEventsConfig: eventsConfig,
+		CheckpointDirectory: "/tmp/checkpoints",
+	})
+	require.ErrorContains(t, err, "replay")
+
+	eventsConfig.PodDiscoveryConfig.ReplaySocketPort = 5657
+	eventsConfig.ZMQEndpoint = "tcp://127.0.0.1:5557"
+	_, err = validateCheckpointConfig(PluginConfig{
+		IndexerConfig: indexerConfig, KVEventsConfig: eventsConfig,
+		CheckpointDirectory: "/tmp/checkpoints", CheckpointInterval: "5m",
+	})
+	require.ErrorContains(t, err, "global KV-event socket")
+	eventsConfig.ZMQEndpoint = ""
+	_, err = validateCheckpointConfig(PluginConfig{
+		IndexerConfig: indexerConfig, KVEventsConfig: eventsConfig,
+		CheckpointDirectory: "/tmp/checkpoints",
+	})
+	require.ErrorContains(t, err, "checkpointInterval")
+
+	interval, err := validateCheckpointConfig(PluginConfig{
+		IndexerConfig: indexerConfig, KVEventsConfig: eventsConfig,
+		CheckpointDirectory: "/tmp/checkpoints", CheckpointInterval: "5m",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 5*time.Minute, interval)
+}
+
+func TestCheckpointFingerprintIncludesEventSelection(t *testing.T) {
+	indexConfig := kvblock.DefaultInMemoryIndexConfig()
+	first := kvevents.DefaultConfig()
+	first.TopicFilter = "kv@model-a"
+	second := kvevents.DefaultConfig()
+	second.TopicFilter = "kv@model-b"
+
+	firstFingerprint := checkpointFingerprint(nil, 16, indexConfig, first)
+	secondFingerprint := checkpointFingerprint(nil, 16, indexConfig, second)
+	require.NotEqual(t, firstFingerprint, secondFingerprint)
+
+	second.TopicFilter = first.TopicFilter
+	second.PodDiscoveryConfig.PodLabelSelector = "app=other"
+	require.NotEqual(t, firstFingerprint, checkpointFingerprint(nil, 16, indexConfig, second))
+
+	second.PodDiscoveryConfig.PodLabelSelector = first.PodDiscoveryConfig.PodLabelSelector
+	second.Concurrency = first.Concurrency + 1
+	second.MaxQueueDepth = first.MaxQueueDepth + 1
+	second.Tracing = !first.Tracing
+	require.Equal(t, firstFingerprint, checkpointFingerprint(nil, 16, indexConfig, second))
+}
 
 type fakeKVCacheIndexer struct {
 	computeFromTokens func(ctx context.Context, tokens []uint32, model string, extra []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error)

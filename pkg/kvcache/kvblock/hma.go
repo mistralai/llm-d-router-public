@@ -16,7 +16,10 @@ limitations under the License.
 
 package kvblock
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 // GroupID identifies a vLLM KV cache group.
 type GroupID int
@@ -26,6 +29,13 @@ type GroupMetadata struct {
 	Kind              string
 	BlockSize         int
 	SlidingWindowSize *int
+}
+
+// GroupCatalogSnapshotEntry stores one learned cache-group definition.
+type GroupCatalogSnapshotEntry struct {
+	PodIdentifier string
+	GroupID       GroupID
+	Metadata      GroupMetadata
 }
 
 // GroupCatalog is a thread-safe catalog of per-pod KV cache group metadata.
@@ -63,4 +73,55 @@ func (c *GroupCatalog) Get(podID string, g GroupID) (GroupMetadata, bool) {
 	}
 	meta, ok := groups[g]
 	return meta, ok
+}
+
+// Clear removes all group metadata for a pod.
+func (c *GroupCatalog) Clear(podID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, podID)
+}
+
+// Snapshot returns a stable, sorted copy of the catalog.
+func (c *GroupCatalog) Snapshot() []GroupCatalogSnapshotEntry {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entries := make([]GroupCatalogSnapshotEntry, 0)
+	for podID, groups := range c.entries {
+		for groupID, metadata := range groups {
+			if metadata.SlidingWindowSize != nil {
+				value := *metadata.SlidingWindowSize
+				metadata.SlidingWindowSize = &value
+			}
+			entries = append(entries, GroupCatalogSnapshotEntry{
+				PodIdentifier: podID, GroupID: groupID, Metadata: metadata,
+			})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].PodIdentifier != entries[j].PodIdentifier {
+			return entries[i].PodIdentifier < entries[j].PodIdentifier
+		}
+		return entries[i].GroupID < entries[j].GroupID
+	})
+	return entries
+}
+
+// Restore replaces the catalog with checkpointed metadata.
+func (c *GroupCatalog) Restore(entries []GroupCatalogSnapshotEntry) {
+	restored := make(map[string]map[GroupID]GroupMetadata)
+	for _, entry := range entries {
+		if restored[entry.PodIdentifier] == nil {
+			restored[entry.PodIdentifier] = make(map[GroupID]GroupMetadata)
+		}
+		metadata := entry.Metadata
+		if metadata.SlidingWindowSize != nil {
+			value := *metadata.SlidingWindowSize
+			metadata.SlidingWindowSize = &value
+		}
+		restored[entry.PodIdentifier][entry.GroupID] = metadata
+	}
+	c.mu.Lock()
+	c.entries = restored
+	c.mu.Unlock()
 }
