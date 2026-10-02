@@ -112,11 +112,8 @@ func (m *InMemoryIndex) WriteSnapshot(dst io.Writer) error {
 		return err
 	}
 
-	engineMappingCount := uint64(0)
-	if err := m.forEachSnapshotEngineMappingLocked(func(BlockHash, []BlockHash) error {
-		engineMappingCount++
-		return nil
-	}); err != nil {
+	engineMappingCount, err := m.countSnapshotEngineMappings()
+	if err != nil {
 		return err
 	}
 	if err := encoder.writeUint64(engineMappingCount); err != nil {
@@ -147,6 +144,58 @@ func (m *InMemoryIndex) WriteSnapshot(dst io.Writer) error {
 	return nil
 }
 
+// snapshotMergedEntries reads one generation without the slab or node locks.
+// WriteSnapshot holds snapshotMu, which every mutation path takes before it
+// touches the slab, the base maps, or baseClears, so all three are stable for
+// the whole write and reads need no locking. Concurrent lookups only read
+// node contents; their recency promotion touches the LRU links, which this
+// path never reads.
+func (m *InMemoryIndex) snapshotMergedEntries(key BlockHash, dst []CompactEntryRef) ([]CompactEntryRef, bool) {
+	dst = dst[:0]
+	if m.base != nil {
+		baseEntries, found := m.base.compactEntries(key, dst)
+		if found {
+			dst = baseEntries
+			write := 0
+			for _, ref := range dst {
+				if m.baseRefHiddenLocked(ref) {
+					continue
+				}
+				dst[write] = ref
+				write++
+			}
+			dst = dst[:write]
+			return dst, len(dst) > 0
+		}
+	}
+	return m.snapshotOverlayEntries(key, dst)
+}
+
+func (m *InMemoryIndex) snapshotOverlayEntries(key BlockHash, dst []CompactEntryRef) ([]CompactEntryRef, bool) {
+	id, found := m.data.items[key]
+	if !found {
+		return dst, false
+	}
+	node := m.data.node(id)
+	if node.runCap == 0 || node.hash != key {
+		return dst, false
+	}
+	return append(dst, m.data.refs(node.head, node.runCap)[:node.runLen]...), true
+}
+
+// snapshotAnyConfirmed reports whether any of the mapped request keys holds a
+// confirmed entry. It backs the engine-mapping count pass, which needs no
+// filtered key list.
+func (m *InMemoryIndex) snapshotAnyConfirmed(requestKeys []BlockHash, scratch []CompactEntryRef) bool {
+	for _, key := range requestKeys {
+		refs, found := m.snapshotMergedEntries(key, scratch[:0])
+		if found && hasConfirmedRef(refs) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *InMemoryIndex) forEachSnapshotRequestLocked(
 	visit func(BlockHash, []CompactEntryRef) error,
 ) error {
@@ -154,7 +203,7 @@ func (m *InMemoryIndex) forEachSnapshotRequestLocked(
 	if m.base != nil {
 		for key := range m.base.requestOffsets {
 			var found bool
-			refs, found = m.mergedCompactEntriesLocked(key, refs)
+			refs, found = m.snapshotMergedEntries(key, refs)
 			if found && hasConfirmedRef(refs) {
 				if err := visit(key, refs); err != nil {
 					return err
@@ -166,28 +215,54 @@ func (m *InMemoryIndex) forEachSnapshotRequestLocked(
 	for rawID := uint64(1); rawID < nextNode; rawID++ {
 		id := nodeID(rawID) // #nosec G115 -- the slab limits node identifiers to uint32.
 		node := m.data.node(id)
-		node.mu.Lock()
 		if node.runCap == 0 {
-			node.mu.Unlock()
 			continue
 		}
 		key := node.hash
 		if m.base != nil {
 			if _, duplicate := m.base.requestOffsets[key]; duplicate {
-				node.mu.Unlock()
 				continue
 			}
 		}
 		nodeRefs := m.data.refs(node.head, node.runCap)[:node.runLen]
 		if hasConfirmedRef(nodeRefs) {
 			if err := visit(key, nodeRefs); err != nil {
-				node.mu.Unlock()
 				return err
 			}
 		}
-		node.mu.Unlock()
 	}
 	return nil
+}
+
+// countSnapshotEngineMappings counts the engine keys whose mappings survive
+// the confirmed filter. It probes request keys instead of building filtered
+// lists, so the count prefix costs one pass of existence checks.
+func (m *InMemoryIndex) countSnapshotEngineMappings() (uint64, error) {
+	count := uint64(0)
+	requestKeys := make([]BlockHash, 0)
+	scratch := make([]CompactEntryRef, 0, int(m.data.entryCap))
+	if m.base != nil {
+		for engineKey := range m.base.engineOffsets {
+			if _, shadowed := m.engineToRequestKeys.Peek(engineKey); shadowed {
+				continue
+			}
+			requestKeys = requestKeys[:0]
+			requestKeys, _ = m.base.requestKeys(engineKey, requestKeys)
+			if m.snapshotAnyConfirmed(requestKeys, scratch) {
+				count++
+			}
+		}
+	}
+	for _, engineKey := range m.engineToRequestKeys.Keys() {
+		mapped, found := m.engineToRequestKeys.Peek(engineKey)
+		if !found {
+			continue
+		}
+		if m.snapshotAnyConfirmed(mapped, scratch) {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func (m *InMemoryIndex) forEachSnapshotEngineMappingLocked(
@@ -235,7 +310,7 @@ func (m *InMemoryIndex) confirmedRequestKeysLocked(
 ) ([]BlockHash, []CompactEntryRef) {
 	for _, requestKey := range requestKeys {
 		var found bool
-		refBuffer, found = m.mergedCompactEntriesLocked(requestKey, refBuffer[:0])
+		refBuffer, found = m.snapshotMergedEntries(requestKey, refBuffer[:0])
 		if found && hasConfirmedRef(refBuffer) {
 			dst = append(dst, requestKey)
 		}
