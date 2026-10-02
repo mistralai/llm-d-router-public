@@ -225,6 +225,7 @@ func (p *Pool) WriteCheckpoint(path, configurationFingerprint string) (Checkpoin
 	header := checkpointHeader{ConfigurationFingerprint: fingerprint}
 
 	p.checkpointMu.Lock()
+	defer p.checkpointMu.Unlock()
 	writeErr := func() error {
 		p.appliedSourcesMu.RLock()
 		invalidSourceCount := len(p.invalidSources)
@@ -262,7 +263,6 @@ func (p *Pool) WriteCheckpoint(path, configurationFingerprint string) (Checkpoin
 		header.Sections[checkpointSourcesSection] = writer.section(start, count)
 		return nil
 	}()
-	p.checkpointMu.Unlock()
 	if writeErr == nil {
 		writeErr = buffered.Flush()
 	}
@@ -281,6 +281,18 @@ func (p *Pool) WriteCheckpoint(path, configurationFingerprint string) (Checkpoin
 		temporary.Close()
 		return CheckpointResult{}, fmt.Errorf("sync checkpoint: %w", err)
 	}
+	var prepared kvblock.PreparedFileSnapshot
+	if fileSnapshotter, ok := p.index.(kvblock.FileSnapshotter); ok {
+		indexSection := header.Sections[checkpointIndexSection]
+		prepared, err = fileSnapshotter.PrepareSnapshotFile(
+			temporary, int64(indexSection.Offset), int64(indexSection.Length),
+		)
+		if err != nil {
+			temporary.Close()
+			return CheckpointResult{}, fmt.Errorf("validate index rebase: %w", err)
+		}
+		defer prepared.Close()
+	}
 	if err := temporary.Close(); err != nil {
 		return CheckpointResult{}, fmt.Errorf("close checkpoint: %w", err)
 	}
@@ -289,6 +301,11 @@ func (p *Pool) WriteCheckpoint(path, configurationFingerprint string) (Checkpoin
 	}
 	if err := syncDirectory(directoryPath); err != nil {
 		return CheckpointResult{}, err
+	}
+	if prepared != nil {
+		if err := prepared.Install(); err != nil {
+			return CheckpointResult{}, fmt.Errorf("install index rebase: %w", err)
+		}
 	}
 	return CheckpointResult{Path: path, CreatedAt: header.CreatedAt,
 		Sources: int(header.Sections[checkpointSourcesSection].Count), SizeBytes: int64(writer.offset)}, nil
@@ -355,8 +372,17 @@ func (p *Pool) RestoreCheckpoint(path, configurationFingerprint string) (bool, e
 	if !ok {
 		return false, errors.New("index backend does not support checkpoints")
 	}
-	if err := snapshotter.RestoreSnapshot(sectionReader(file, header.Sections[checkpointIndexSection])); err != nil {
-		return false, fmt.Errorf("restore index: %w", err)
+	indexSection := header.Sections[checkpointIndexSection]
+	var restoreErr error
+	if fileSnapshotter, ok := p.index.(kvblock.FileSnapshotter); ok {
+		restoreErr = fileSnapshotter.RestoreSnapshotFile(
+			file, int64(indexSection.Offset), int64(indexSection.Length),
+		)
+	} else {
+		restoreErr = snapshotter.RestoreSnapshot(sectionReader(file, indexSection))
+	}
+	if restoreErr != nil {
+		return false, fmt.Errorf("restore index: %w", restoreErr)
 	}
 	p.dedup = dedup
 	p.groupCatalog.Restore(groups)

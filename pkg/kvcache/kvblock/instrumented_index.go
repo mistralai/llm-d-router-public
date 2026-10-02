@@ -52,6 +52,21 @@ type instrumentedCompactSnapshotter struct {
 	snapshotterForwarder
 }
 
+type instrumentedFileSnapshotter struct {
+	*instrumentedIndex
+	fileSnapshotterForwarder
+}
+
+type instrumentedWalkerFileSnapshotter struct {
+	*instrumentedWalker
+	fileSnapshotterForwarder
+}
+
+type instrumentedCompactFileSnapshotter struct {
+	*instrumentedCompactWalker
+	fileSnapshotterForwarder
+}
+
 // NewInstrumentedIndex wraps an Index and emits metrics for Add, Evict,
 // Lookup, and WalkKeys. The wrapper is a KeyWalker exactly when next is one.
 // Read metrics count and time Lookup and WalkKeys calls; contiguous-chain
@@ -63,6 +78,12 @@ func NewInstrumentedIndex(next Index) Index {
 			instrumentedWalker: &instrumentedWalker{instrumentedIndex: m, walker: compact},
 			compact:            compact,
 		}
+		if snapshotter, ok := next.(FileSnapshotter); ok {
+			return &instrumentedCompactFileSnapshotter{
+				instrumentedCompactWalker: wrapped,
+				fileSnapshotterForwarder:  fileSnapshotterForwarder{FileSnapshotter: snapshotter},
+			}
+		}
 		if snapshotter, ok := next.(Snapshotter); ok {
 			return &instrumentedCompactSnapshotter{
 				instrumentedCompactWalker: wrapped,
@@ -73,6 +94,12 @@ func NewInstrumentedIndex(next Index) Index {
 	}
 	if walker, ok := next.(KeyWalker); ok {
 		wrapped := &instrumentedWalker{instrumentedIndex: m, walker: walker}
+		if snapshotter, ok := next.(FileSnapshotter); ok {
+			return &instrumentedWalkerFileSnapshotter{
+				instrumentedWalker:       wrapped,
+				fileSnapshotterForwarder: fileSnapshotterForwarder{FileSnapshotter: snapshotter},
+			}
+		}
 		if snapshotter, ok := next.(Snapshotter); ok {
 			return &instrumentedWalkerSnapshotter{
 				instrumentedWalker:   wrapped,
@@ -80,6 +107,12 @@ func NewInstrumentedIndex(next Index) Index {
 			}
 		}
 		return wrapped
+	}
+	if snapshotter, ok := next.(FileSnapshotter); ok {
+		return &instrumentedFileSnapshotter{
+			instrumentedIndex:        m,
+			fileSnapshotterForwarder: fileSnapshotterForwarder{FileSnapshotter: snapshotter},
+		}
 	}
 	if snapshotter, ok := next.(Snapshotter); ok {
 		return &instrumentedSnapshotter{

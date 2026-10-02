@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 )
 
 const (
@@ -38,14 +39,32 @@ type Snapshotter interface {
 	RestoreSnapshot(io.Reader) error
 }
 
+// FileSnapshotter can retain a file-backed snapshot instead of copying it.
+type FileSnapshotter interface {
+	Snapshotter
+	RestoreSnapshotFile(file *os.File, offset, length int64) error
+	PrepareSnapshotFile(file *os.File, offset, length int64) (PreparedFileSnapshot, error)
+}
+
+// PreparedFileSnapshot is validated state that can replace the live view.
+type PreparedFileSnapshot interface {
+	Install() error
+	Close()
+}
+
 type snapshotterForwarder struct{ Snapshotter }
 
+type fileSnapshotterForwarder struct{ FileSnapshotter }
+
 var _ Snapshotter = &InMemoryIndex{}
+var _ FileSnapshotter = &InMemoryIndex{}
 
 // WriteSnapshot writes confirmed entries and their engine-key mappings.
 func (m *InMemoryIndex) WriteSnapshot(dst io.Writer) error {
 	m.snapshotMu.Lock()
 	defer m.snapshotMu.Unlock()
+	m.viewMu.RLock()
+	defer m.viewMu.RUnlock()
 	w := bufio.NewWriterSize(dst, 1<<20)
 	encoder := snapshotEncoder{writer: w}
 	if err := encoder.writeUint32(indexSnapshotVersion); err != nil {
@@ -58,38 +77,27 @@ func (m *InMemoryIndex) WriteSnapshot(dst io.Writer) error {
 		return fmt.Errorf("write device-tier table: %w", err)
 	}
 
-	confirmedNodes := 0
-	nextNode := m.data.nextNode
-	for rawID := uint64(1); rawID < nextNode; rawID++ {
-		id := nodeID(rawID) // #nosec G115 -- the slab limits node identifiers to uint32.
-		node := m.data.node(id)
-		if node.runCap != 0 && hasConfirmedRef(m.data.refs(node.head, node.runCap)[:node.runLen]) {
-			confirmedNodes++
-		}
-	}
-	if err := encoder.writeUint64(uint64(confirmedNodes)); err != nil {
+	requestKeyCount := uint64(0)
+	if err := m.forEachSnapshotRequestLocked(func(BlockHash, []CompactEntryRef) error {
+		requestKeyCount++
+		return nil
+	}); err != nil {
 		return err
 	}
-	for rawID := uint64(1); rawID < nextNode; rawID++ {
-		id := nodeID(rawID) // #nosec G115 -- the slab limits node identifiers to uint32.
-		node := m.data.node(id)
-		if node.runCap == 0 {
-			continue
+	if err := encoder.writeUint64(requestKeyCount); err != nil {
+		return err
+	}
+	if err := m.forEachSnapshotRequestLocked(func(requestKey BlockHash, refs []CompactEntryRef) error {
+		if err := encoder.writeUint64(uint64(requestKey)); err != nil {
+			return err
 		}
-		refs := m.data.refs(node.head, node.runCap)[:node.runLen]
 		confirmed := 0
 		for _, ref := range refs {
 			if !ref.Speculative() {
 				confirmed++
 			}
 		}
-		if confirmed == 0 {
-			continue
-		}
-		if err := encoder.writeUint64(uint64(node.hash)); err != nil {
-			return err
-		}
-		if err := encoder.writeUint16(uint16(confirmed)); err != nil {
+		if err := encoder.writeUint16(uint16(confirmed)); err != nil { // #nosec G115 -- entryCap is uint16.
 			return err
 		}
 		for _, ref := range refs {
@@ -99,43 +107,215 @@ func (m *InMemoryIndex) WriteSnapshot(dst io.Writer) error {
 				}
 			}
 		}
-	}
-
-	engineKeys := m.engineToRequestKeys.Keys()
-	if err := encoder.writeUint64(uint64(len(engineKeys))); err != nil {
+		return nil
+	}); err != nil {
 		return err
 	}
-	for _, engineKey := range engineKeys {
-		requestKeys, found := m.engineToRequestKeys.Peek(engineKey)
+
+	engineMappingCount, err := m.countSnapshotEngineMappings()
+	if err != nil {
+		return err
+	}
+	if err := encoder.writeUint64(engineMappingCount); err != nil {
+		return err
+	}
+	if err := m.forEachSnapshotEngineMappingLocked(func(engineKey BlockHash, mappedRequestKeys []BlockHash) error {
 		if err := encoder.writeUint64(uint64(engineKey)); err != nil {
 			return err
 		}
-		valid := 0
-		if found {
-			for _, requestKey := range requestKeys {
-				if m.hasConfirmedRequestKey(requestKey) {
-					valid++
-				}
-			}
-		}
-		if uint64(valid) > math.MaxUint32 {
+		if uint64(len(mappedRequestKeys)) > math.MaxUint32 {
 			return errors.New("engine mapping is too large")
 		}
-		if err := encoder.writeUint32(uint32(valid)); err != nil { // #nosec G115 -- checked above.
+		if err := encoder.writeUint32(uint32(len(mappedRequestKeys))); err != nil { // #nosec G115 -- checked above.
 			return err
 		}
-		for _, requestKey := range requestKeys {
-			if m.hasConfirmedRequestKey(requestKey) {
-				if err := encoder.writeUint64(uint64(requestKey)); err != nil {
-					return err
-				}
+		for _, requestKey := range mappedRequestKeys {
+			if err := encoder.writeUint64(uint64(requestKey)); err != nil {
+				return err
 			}
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if err := w.Flush(); err != nil {
 		return fmt.Errorf("flush index checkpoint: %w", err)
 	}
 	return nil
+}
+
+// snapshotMergedEntries reads one generation without the slab or node locks.
+// WriteSnapshot holds snapshotMu, which every mutation path takes before it
+// touches the slab, the base maps, or baseClears, so all three are stable for
+// the whole write and reads need no locking. Concurrent lookups only read
+// node contents; their recency promotion touches the LRU links, which this
+// path never reads.
+func (m *InMemoryIndex) snapshotMergedEntries(key BlockHash, dst []CompactEntryRef) ([]CompactEntryRef, bool) {
+	dst = dst[:0]
+	if m.base != nil {
+		baseEntries, found := m.base.compactEntries(key, dst)
+		if found {
+			dst = baseEntries
+			write := 0
+			for _, ref := range dst {
+				if m.baseRefHiddenLocked(ref) {
+					continue
+				}
+				dst[write] = ref
+				write++
+			}
+			dst = dst[:write]
+			return dst, len(dst) > 0
+		}
+	}
+	return m.snapshotOverlayEntries(key, dst)
+}
+
+func (m *InMemoryIndex) snapshotOverlayEntries(key BlockHash, dst []CompactEntryRef) ([]CompactEntryRef, bool) {
+	id, found := m.data.items[key]
+	if !found {
+		return dst, false
+	}
+	node := m.data.node(id)
+	if node.runCap == 0 || node.hash != key {
+		return dst, false
+	}
+	return append(dst, m.data.refs(node.head, node.runCap)[:node.runLen]...), true
+}
+
+// snapshotAnyConfirmed reports whether any of the mapped request keys holds a
+// confirmed entry. It backs the engine-mapping count pass, which needs no
+// filtered key list.
+func (m *InMemoryIndex) snapshotAnyConfirmed(requestKeys []BlockHash, scratch []CompactEntryRef) bool {
+	for _, key := range requestKeys {
+		refs, found := m.snapshotMergedEntries(key, scratch[:0])
+		if found && hasConfirmedRef(refs) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *InMemoryIndex) forEachSnapshotRequestLocked(
+	visit func(BlockHash, []CompactEntryRef) error,
+) error {
+	refs := make([]CompactEntryRef, 0, int(m.data.entryCap))
+	if m.base != nil {
+		for key := range m.base.requestOffsets {
+			var found bool
+			refs, found = m.snapshotMergedEntries(key, refs)
+			if found && hasConfirmedRef(refs) {
+				if err := visit(key, refs); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	nextNode := m.data.nextNode
+	for rawID := uint64(1); rawID < nextNode; rawID++ {
+		id := nodeID(rawID) // #nosec G115 -- the slab limits node identifiers to uint32.
+		node := m.data.node(id)
+		if node.runCap == 0 {
+			continue
+		}
+		key := node.hash
+		if m.base != nil {
+			if _, duplicate := m.base.requestOffsets[key]; duplicate {
+				continue
+			}
+		}
+		nodeRefs := m.data.refs(node.head, node.runCap)[:node.runLen]
+		if hasConfirmedRef(nodeRefs) {
+			if err := visit(key, nodeRefs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// countSnapshotEngineMappings counts the engine keys whose mappings survive
+// the confirmed filter. It probes request keys instead of building filtered
+// lists, so the count prefix costs one pass of existence checks.
+func (m *InMemoryIndex) countSnapshotEngineMappings() (uint64, error) {
+	count := uint64(0)
+	requestKeys := make([]BlockHash, 0)
+	scratch := make([]CompactEntryRef, 0, int(m.data.entryCap))
+	if m.base != nil {
+		for engineKey := range m.base.engineOffsets {
+			if _, shadowed := m.engineToRequestKeys.Peek(engineKey); shadowed {
+				continue
+			}
+			requestKeys = requestKeys[:0]
+			requestKeys, _ = m.base.requestKeys(engineKey, requestKeys)
+			if m.snapshotAnyConfirmed(requestKeys, scratch) {
+				count++
+			}
+		}
+	}
+	for _, engineKey := range m.engineToRequestKeys.Keys() {
+		mapped, found := m.engineToRequestKeys.Peek(engineKey)
+		if !found {
+			continue
+		}
+		if m.snapshotAnyConfirmed(mapped, scratch) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (m *InMemoryIndex) forEachSnapshotEngineMappingLocked(
+	visit func(BlockHash, []BlockHash) error,
+) error {
+	requestKeys := make([]BlockHash, 0)
+	validRequestKeys := make([]BlockHash, 0)
+	refBuffer := make([]CompactEntryRef, 0, int(m.data.entryCap))
+	if m.base != nil {
+		for engineKey := range m.base.engineOffsets {
+			if _, shadowed := m.engineToRequestKeys.Peek(engineKey); shadowed {
+				continue
+			}
+			requestKeys = requestKeys[:0]
+			requestKeys, _ = m.base.requestKeys(engineKey, requestKeys)
+			validRequestKeys, refBuffer = m.confirmedRequestKeysLocked(
+				requestKeys, validRequestKeys[:0], refBuffer,
+			)
+			if len(validRequestKeys) != 0 {
+				if err := visit(engineKey, validRequestKeys); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for _, engineKey := range m.engineToRequestKeys.Keys() {
+		mapped, found := m.engineToRequestKeys.Peek(engineKey)
+		if !found {
+			continue
+		}
+		validRequestKeys, refBuffer = m.confirmedRequestKeysLocked(
+			mapped, validRequestKeys[:0], refBuffer,
+		)
+		if len(validRequestKeys) != 0 {
+			if err := visit(engineKey, validRequestKeys); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (m *InMemoryIndex) confirmedRequestKeysLocked(
+	requestKeys, dst []BlockHash, refBuffer []CompactEntryRef,
+) ([]BlockHash, []CompactEntryRef) {
+	for _, requestKey := range requestKeys {
+		var found bool
+		refBuffer, found = m.snapshotMergedEntries(requestKey, refBuffer[:0])
+		if found && hasConfirmedRef(refBuffer) {
+			dst = append(dst, requestKey)
+		}
+	}
+	return dst, refBuffer
 }
 
 func hasConfirmedRef(refs []CompactEntryRef) bool {
@@ -145,16 +325,6 @@ func hasConfirmedRef(refs []CompactEntryRef) bool {
 		}
 	}
 	return false
-}
-
-func (m *InMemoryIndex) hasConfirmedRequestKey(requestKey BlockHash) bool {
-	id, present := m.data.items[requestKey]
-	if !present {
-		return false
-	}
-	node := m.data.node(id)
-	confirmed := hasConfirmedRef(m.data.refs(node.head, node.runCap)[:node.runLen])
-	return confirmed
 }
 
 func writeInterner(w *snapshotEncoder, in *interner) error {
@@ -200,6 +370,8 @@ func writeCheckpointRef(w *snapshotEncoder, ref CompactEntryRef) error {
 
 // RestoreSnapshot builds a replacement index and swaps it in after validation.
 func (m *InMemoryIndex) RestoreSnapshot(src io.Reader) error {
+	m.snapshotMu.Lock()
+	defer m.snapshotMu.Unlock()
 	r := newSnapshotReader(src)
 	version, err := r.readUint32()
 	if err != nil {
@@ -308,15 +480,17 @@ func (m *InMemoryIndex) RestoreSnapshot(src io.Reader) error {
 	if err := requireEOF(r); err != nil {
 		return err
 	}
-	m.snapshotMu.Lock()
-	defer m.snapshotMu.Unlock()
 	if m.data == nil || m.engineToRequestKeys == nil {
 		return errors.New("index is not initialized")
 	}
-	m.mu.Lock()
+	m.viewMu.Lock()
+	oldBase := m.base
 	m.data, m.engineToRequestKeys = replacement.data, replacement.engineToRequestKeys
 	m.pods, m.tiers = replacement.pods, replacement.tiers
-	m.mu.Unlock()
+	m.base = nil
+	m.baseClears = replacement.baseClears
+	m.viewMu.Unlock()
+	oldBase.close()
 	return nil
 }
 
