@@ -273,7 +273,7 @@ func BenchmarkInMemoryIndexRestoreSnapshotFile(b *testing.B) {
 		target, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 100_000, PodCacheSize: 4})
 		require.NoError(b, err)
 		require.NoError(b, target.RestoreSnapshotFile(file, 0, info.Size()))
-		target.base.close()
+		target.writerView().base.close()
 	}
 }
 

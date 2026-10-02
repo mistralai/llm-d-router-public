@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,7 +26,6 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
-	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -41,7 +39,7 @@ const (
 	defaultEventSourceDeviceTier = "gpu"
 	defaultPodSelector           = ""
 	resetRetryInterval           = 100 * time.Millisecond
-	// DefaultCheckpointQueueDepth bounds ingress while checkpoint I/O stops workers.
+	// DefaultCheckpointQueueDepth bounds ingress while checkpoint I/O stops the writer.
 	DefaultCheckpointQueueDepth = 65536
 )
 
@@ -203,13 +201,16 @@ func DefaultConfig() *Config {
 	}
 }
 
-// Pool is a sharded worker pool that processes events from ZMQ subscribers.
-// It ensures that events for the same PodIdentifier are processed in order.
-// Pool keeps transient event-stream state while durable key mappings are
-// delegated to the Index.
+// Pool applies events from ZMQ subscribers on a single writer goroutine.
+// All index mutations flow through that goroutine, which preserves per-source
+// order and gives checkpoint writes an exact message boundary without a
+// quiesce lock. Pool keeps transient event-stream state while durable key
+// mappings are delegated to the Index.
 type Pool struct {
-	queues         []workqueue.TypedRateLimitingInterface[*RawMessage]
-	concurrency    int // can replace use with len(queues)
+	tasks chan *RawMessage
+	// ops carries index mutations from outside the event stream and
+	// checkpoint requests; the writer executes them against p.index.
+	ops            chan func(ctx context.Context, index kvblock.Index)
 	index          kvblock.Index
 	tokenProcessor kvblock.TokenProcessor
 	adapter        EngineAdapter
@@ -219,9 +220,8 @@ type Pool struct {
 	// tier, KV-cache group, DP rank) and a store must be counted only after
 	// Index.Add succeeds — both of which only the Pool observes.
 	dedup *eventDedupFilter
-	// checkpointMu stops event application at a complete message boundary.
-	checkpointMu       sync.RWMutex
-	checkpointWriteMu  sync.Mutex
+	// appliedSourcesMu guards the appliedSources family; readers include the
+	// subscriber goroutines that resume restored sources.
 	appliedSourcesMu   sync.RWMutex
 	appliedSources     map[string]checkpointSource
 	invalidSources     map[string]map[uint64]struct{}
@@ -235,17 +235,16 @@ type Pool struct {
 	// span construction on the default path.
 	tracer trace.Tracer
 	wg     sync.WaitGroup
-	// queueDepth mirrors the number of tasks queued across all shards. It is
-	// tracked incrementally rather than by summing queue.Len() so that the
-	// depth gauge stays O(1) on the enqueue/dequeue hot path.
+	// queueDepth mirrors the number of messages waiting in tasks. It is
+	// tracked incrementally rather than by len(tasks) so that the depth gauge
+	// stays O(1) when Shutdown drops buffered messages.
 	queueDepth atomic.Int64
 	started    atomic.Bool
-	queueSlots chan struct{}
 	stopped    chan struct{}
 	stopOnce   sync.Once
 }
 
-// NewPool creates a Pool with a sharded worker setup.
+// NewPool creates a Pool with a single writer.
 // Subscribers are managed by SubscriberManager which is controlled by the pod
 // reconciler.
 //
@@ -264,9 +263,15 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 	if cfg.MaxQueueDepth < 0 {
 		return nil, fmt.Errorf("kvEventsConfig.maxQueueDepth must not be negative, got %d", cfg.MaxQueueDepth)
 	}
+	// Config.Concurrency is validated for compatibility; the pool applies
+	// every mutation on one writer goroutine regardless of its value.
+	depth := cfg.MaxQueueDepth
+	if depth <= 0 {
+		depth = DefaultCheckpointQueueDepth
+	}
 	p := &Pool{
-		queues:             make([]workqueue.TypedRateLimitingInterface[*RawMessage], cfg.Concurrency),
-		concurrency:        cfg.Concurrency,
+		tasks:              make(chan *RawMessage, depth),
+		ops:                make(chan func(context.Context, kvblock.Index), depth),
 		index:              index,
 		tokenProcessor:     tokenProcessor,
 		adapter:            adapter,
@@ -278,13 +283,6 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 		retiredGenerations: make(map[string]map[uint64]struct{}),
 		tracer:             newEventTracer(cfg.Tracing),
 		stopped:            make(chan struct{}),
-	}
-	if cfg.MaxQueueDepth > 0 {
-		p.queueSlots = make(chan struct{}, cfg.MaxQueueDepth)
-	}
-
-	for i := 0; i < p.concurrency; i++ {
-		p.queues[i] = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[*RawMessage]())
 	}
 
 	metrics.Register()
@@ -331,7 +329,7 @@ func (p *Pool) addQueueDepth(delta int64) {
 	metrics.PoolQueueDepth.Set(float64(p.queueDepth.Add(delta)))
 }
 
-// QueueDepth returns the number of messages that wait for a worker.
+// QueueDepth returns the number of messages waiting for the writer.
 func (p *Pool) QueueDepth() int64 {
 	return p.queueDepth.Load()
 }
@@ -341,20 +339,17 @@ func (p *Pool) GroupCatalog() *kvblock.GroupCatalog {
 	return p.groupCatalog
 }
 
-// Start begins the worker pool.
+// Start begins the writer goroutine.
 // It is non-blocking.
 func (p *Pool) Start(ctx context.Context) {
 	logger := log.FromContext(ctx)
-	logger.Info("Starting sharded event processing pool", "workers", p.concurrency)
+	logger.Info("Starting single-writer event processing pool")
 
-	metrics.PoolCapacity.Set(float64(p.concurrency))
+	metrics.PoolCapacity.Set(1)
 	p.started.Store(true)
 
-	p.wg.Add(p.concurrency)
-	for i := 0; i < p.concurrency; i++ {
-		// Each worker is given its own dedicated queue shard.
-		go p.worker(ctx, i)
-	}
+	p.wg.Add(1)
+	go p.writer(ctx)
 }
 
 // Shutdown gracefully stops the pool and its global subscriber if present.
@@ -363,55 +358,53 @@ func (p *Pool) Shutdown(ctx context.Context) {
 	logger.Info("Shutting down event processing pool...")
 
 	p.stopOnce.Do(func() { close(p.stopped) })
-	for _, queue := range p.queues {
-		queue.ShutDown()
-	}
 
 	p.wg.Wait()
 
-	// Tasks still queued at shutdown are dropped with the queues, so reset the
-	// depth rather than leaving the gauge pinned at the undrained count.
+	// Buffered messages are dropped with the channel, so reset the depth
+	// rather than leaving the gauge pinned at the undrained count.
 	p.queueDepth.Store(0)
 	metrics.PoolQueueDepth.Set(0)
 
 	logger.Info("event processing pool shut down.")
 }
 
-// AddTask is called by the subscriber to add a message to the processing queue.
-// It hashes the sharding key to select a queue, ensuring messages for the
-// same source endpoint always go to the same worker (ordered queue).
+// AddTask is called by the subscriber to queue a message for the writer. A
+// full channel blocks the caller, which applies backpressure to the event
+// stream; per-source order is preserved because each source has one sender.
 func (p *Pool) AddTask(task *RawMessage) {
-	key := task.SourceEndpoint
-	if key == "" {
-		key = task.EventSourceID
+	select {
+	case p.tasks <- task:
+		p.addQueueDepth(1)
+	case <-p.stopped:
 	}
-	if key == "" {
-		key = p.adapter.ShardingKey(task)
-	}
-	// Use an FNV-1a hash to deterministically select a queue.
-	h := fnv.New32a()
-	_, err := h.Write([]byte(key))
-	if err != nil {
-		return
-	}
+}
 
-	//nolint:gosec // if concurrency overflows then the world is in trouble anyway
-	queueIndex := h.Sum32() % uint32(p.concurrency)
-	if p.queueSlots != nil {
-		select {
-		case p.queueSlots <- struct{}{}:
-		case <-p.stopped:
-			return
-		}
+// Submit queues an index mutation for the writer. It blocks when the op
+// channel is full, which applies backpressure to background mutators;
+// request-serving paths should prefer TrySubmit. It reports whether the op
+// was queued; false means the pool is shutting down.
+func (p *Pool) Submit(op func(ctx context.Context, index kvblock.Index)) bool {
+	select {
+	case p.ops <- op:
+		return true
+	case <-p.stopped:
+		return false
 	}
-	if p.queues[queueIndex].ShuttingDown() {
-		if p.queueSlots != nil {
-			<-p.queueSlots
-		}
-		return
+}
+
+// TrySubmit queues an index mutation without blocking. It reports whether
+// the op was queued; dropped ops are best-effort mutations such as
+// speculative adds.
+func (p *Pool) TrySubmit(op func(ctx context.Context, index kvblock.Index)) bool {
+	select {
+	case p.ops <- op:
+		return true
+	case <-p.stopped:
+		return false
+	default:
+		return false
 	}
-	p.queues[queueIndex].Add(task)
-	p.addQueueDepth(1)
 }
 
 // resetForSource queues an engine reset on the same shard as its event stream.
@@ -441,52 +434,32 @@ func (p *Pool) resetSourceInvalidations(
 	})
 }
 
-// worker is the main processing loop for a single worker goroutine.
-// It processes messages from its dedicated queue using the workqueue pattern.
-func (p *Pool) worker(ctx context.Context, workerIndex int) {
+// writer is the single goroutine that applies every index mutation.
+func (p *Pool) writer(ctx context.Context) {
 	defer p.wg.Done()
-	queue := p.queues[workerIndex]
 	for {
-		task, shutdown := queue.Get()
-		if shutdown {
-			return
-		}
-		if p.queueSlots != nil {
-			<-p.queueSlots
-		}
-		p.addQueueDepth(-1)
-
-		// Use a nested func to ensure Done is always called.
-		func(task *RawMessage) {
-			defer queue.Done(task)
-			for !p.processRawMessage(ctx, task) {
-				if !task.reset {
-					break
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-p.stopped:
-					return
-				case <-time.After(resetRetryInterval):
-				}
-			}
-			// Remove the completed task from workqueue retry tracking.
-			queue.Forget(task)
-		}(task)
-		// Check if context was cancelled after processing a task.
 		select {
 		case <-ctx.Done():
 			return
-		default:
+		case <-p.stopped:
+			return
+		case msg := <-p.tasks:
+			p.addQueueDepth(-1)
+			if !p.processRawMessage(ctx, msg) {
+				// A failed reset is requeued at the back after a delay; the
+				// writer keeps applying other sources' messages meanwhile.
+				if msg.reset {
+					time.AfterFunc(resetRetryInterval, func() { p.AddTask(msg) })
+				}
+			}
+		case op := <-p.ops:
+			op(ctx, p.index)
 		}
 	}
 }
 
 // processRawMessage decodes the raw message payload using the adapter and processes the resulting event batch.
 func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) bool {
-	p.checkpointMu.RLock()
-	defer p.checkpointMu.RUnlock()
 	if !msg.reset && p.sourceGenerationIsRetired(msg.EventSourceID, msg.sourceGeneration) {
 		return true
 	}
@@ -637,12 +610,10 @@ func (p *Pool) sourceGenerationIsRetired(eventSourceID string, generation uint64
 }
 
 func (p *Pool) forgetSourceState(eventSourceID string) {
-	p.checkpointMu.Lock()
 	p.appliedSourcesMu.Lock()
 	delete(p.appliedSources, eventSourceID)
 	delete(p.invalidSources, eventSourceID)
 	p.appliedSourcesMu.Unlock()
-	p.checkpointMu.Unlock()
 }
 
 func (p *Pool) markSourceInvalid(eventSourceID string) uint64 {

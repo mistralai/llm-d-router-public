@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -124,11 +123,11 @@ func TestInMemoryAddIsAtomicOnReferenceExhaustion(t *testing.T) {
 	oldEntry := PodEntry{PodIdentifier: "pod-old", DeviceTier: "gpu"}
 	require.NoError(t, index.Add(context.Background(), []BlockHash{101}, []BlockHash{oldRequestKey}, []PodEntry{oldEntry}))
 
-	head, err := index.data.allocRun(1)
+	head, err := index.writerView().data.allocRun(1)
 	require.NoError(t, err)
-	index.data.freeRun(head, 1)
-	index.data.nextChunk = uint32(len(index.data.refChunks))
-	index.data.runBumps[1].offset = slabChunkSize
+	index.writerView().data.freeRun(head, 1)
+	index.writerView().data.nextChunk = uint32(len(index.writerView().data.refChunks))
+	index.writerView().data.runBumps[1].offset = slabChunkSize
 
 	engineKeys := []BlockHash{101, 102}
 	requestKeys := []BlockHash{1, 2}
@@ -137,15 +136,15 @@ func TestInMemoryAddIsAtomicOnReferenceExhaustion(t *testing.T) {
 	require.ErrorContains(t, err, "slab reference capacity exhausted")
 
 	for _, key := range requestKeys {
-		_, found := index.data.peek(key)
+		_, found := index.writerView().data.peek(key)
 		assert.False(t, found, "failed batch published request key %d", key)
 	}
 	requestKey, err := index.GetRequestKey(context.Background(), engineKeys[0])
 	require.NoError(t, err)
 	assert.Equal(t, oldRequestKey, requestKey)
-	_, found := index.engineToRequestKeys.Peek(engineKeys[1])
+	_, found := index.writerView().engineToRequestKeys.Peek(engineKeys[1])
 	assert.False(t, found, "failed batch published engine key %d", engineKeys[1])
-	_, found = index.pods.ids[entry.PodIdentifier]
+	_, found = index.writerView().pods.ids[entry.PodIdentifier]
 	assert.False(t, found, "failed batch interned its pod")
 }
 
@@ -155,11 +154,11 @@ func TestInMemoryAddPreflightsSameClassGrowth(t *testing.T) {
 	existing := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{1, 2}, []PodEntry{existing}))
 
-	head, err := index.data.allocRun(4)
+	head, err := index.writerView().data.allocRun(4)
 	require.NoError(t, err)
-	index.data.freeRun(head, 4)
-	index.data.nextChunk = uint32(len(index.data.refChunks))
-	index.data.runBumps[4].offset = slabChunkSize
+	index.writerView().data.freeRun(head, 4)
+	index.writerView().data.nextChunk = uint32(len(index.writerView().data.refChunks))
+	index.writerView().data.runBumps[4].offset = slabChunkSize
 
 	added := []PodEntry{
 		existing,
@@ -170,73 +169,14 @@ func TestInMemoryAddPreflightsSameClassGrowth(t *testing.T) {
 	require.ErrorContains(t, err, "slab reference capacity exhausted")
 
 	for _, key := range []BlockHash{1, 2} {
-		entries, found := index.data.filteredEntries(key, nil, false)
+		entries, found := index.writerView().data.filteredEntries(key, nil, false)
 		require.True(t, found)
 		assert.Equal(t, []PodEntry{existing}, entries)
 	}
 	for _, pod := range []string{"pod-b", "pod-c"} {
-		_, found := index.pods.ids[pod]
+		_, found := index.writerView().pods.ids[pod]
 		assert.False(t, found, "failed batch interned pod %q", pod)
 	}
-}
-
-func TestInMemoryAddAndEngineEvictDoNotDeadlock(t *testing.T) {
-	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 2, PodCacheSize: 1})
-	require.NoError(t, err)
-	engineKey := BlockHash(101)
-	oldRequestKey := BlockHash(1)
-	newRequestKey := BlockHash(2)
-	entry := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
-	require.NoError(t, index.Add(context.Background(), []BlockHash{engineKey}, []BlockHash{oldRequestKey}, []PodEntry{entry}))
-
-	n, found := index.data.peek(oldRequestKey)
-	require.True(t, found)
-	n.mu.Lock()
-	nodeLocked := true
-	defer func() {
-		if nodeLocked {
-			n.mu.Unlock()
-		}
-	}()
-
-	evictDone := make(chan error, 1)
-	go func() {
-		evictDone <- index.Evict(context.Background(), engineKey, EngineKey, []PodEntry{entry})
-	}()
-	require.Eventually(t, func() bool {
-		if index.data.mu.TryLock() {
-			index.data.mu.Unlock()
-			return false
-		}
-		return true
-	}, time.Second, time.Millisecond)
-
-	addDone := make(chan error, 1)
-	go func() {
-		addDone <- index.Add(context.Background(), []BlockHash{engineKey}, []BlockHash{newRequestKey}, []PodEntry{entry})
-	}()
-	require.Eventually(t, func() bool {
-		if index.mutationMu.TryLock() {
-			index.mutationMu.Unlock()
-			return false
-		}
-		return true
-	}, time.Second, time.Millisecond)
-
-	n.mu.Unlock()
-	nodeLocked = false
-	for operation, done := range map[string]<-chan error{"add": addDone, "evict": evictDone} {
-		select {
-		case err := <-done:
-			require.NoError(t, err, "%s returned an error", operation)
-		case <-time.After(time.Second):
-			t.Fatalf("%s did not complete", operation)
-		}
-	}
-
-	requestKey, err := index.GetRequestKey(context.Background(), engineKey)
-	require.NoError(t, err)
-	assert.Equal(t, newRequestKey, requestKey)
 }
 
 func TestInMemoryAddRefreshesWithoutReferenceCapacity(t *testing.T) {
@@ -245,8 +185,8 @@ func TestInMemoryAddRefreshesWithoutReferenceCapacity(t *testing.T) {
 	entry := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{1}, []PodEntry{entry}))
 
-	index.data.nextChunk = uint32(len(index.data.refChunks))
-	index.data.runBumps[1].offset = slabChunkSize
+	index.writerView().data.nextChunk = uint32(len(index.writerView().data.refChunks))
+	index.writerView().data.runBumps[1].offset = slabChunkSize
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{1}, []PodEntry{entry}))
 }
 
@@ -256,12 +196,12 @@ func TestInMemoryAddReplacesFullRunWithoutReferenceCapacity(t *testing.T) {
 	first := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{1}, []PodEntry{first}))
 
-	index.data.nextChunk = uint32(len(index.data.refChunks))
-	index.data.runBumps[1].offset = slabChunkSize
+	index.writerView().data.nextChunk = uint32(len(index.writerView().data.refChunks))
+	index.writerView().data.runBumps[1].offset = slabChunkSize
 	second := PodEntry{PodIdentifier: "pod-b", DeviceTier: "gpu"}
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{1}, []PodEntry{second}))
 
-	entries, found := index.data.filteredEntries(1, nil, false)
+	entries, found := index.writerView().data.filteredEntries(1, nil, false)
 	require.True(t, found)
 	assert.Equal(t, []PodEntry{second}, entries)
 }
@@ -269,11 +209,11 @@ func TestInMemoryAddReplacesFullRunWithoutReferenceCapacity(t *testing.T) {
 func TestInMemoryAddUsesFreeRunAtReferenceCapacity(t *testing.T) {
 	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1, PodCacheSize: 1})
 	require.NoError(t, err)
-	head, err := index.data.allocRun(1)
+	head, err := index.writerView().data.allocRun(1)
 	require.NoError(t, err)
-	index.data.freeRun(head, 1)
-	index.data.nextChunk = uint32(len(index.data.refChunks))
-	index.data.runBumps[1].offset = slabChunkSize
+	index.writerView().data.freeRun(head, 1)
+	index.writerView().data.nextChunk = uint32(len(index.writerView().data.refChunks))
+	index.writerView().data.runBumps[1].offset = slabChunkSize
 
 	entry := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{1}, []PodEntry{entry}))
@@ -282,11 +222,11 @@ func TestInMemoryAddUsesFreeRunAtReferenceCapacity(t *testing.T) {
 func TestInMemoryAddCountsDuplicateRequestKeyOnce(t *testing.T) {
 	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1, PodCacheSize: 1})
 	require.NoError(t, err)
-	head, err := index.data.allocRun(1)
+	head, err := index.writerView().data.allocRun(1)
 	require.NoError(t, err)
-	index.data.freeRun(head, 1)
-	index.data.nextChunk = uint32(len(index.data.refChunks))
-	index.data.runBumps[1].offset = slabChunkSize
+	index.writerView().data.freeRun(head, 1)
+	index.writerView().data.nextChunk = uint32(len(index.writerView().data.refChunks))
+	index.writerView().data.runBumps[1].offset = slabChunkSize
 
 	entry := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{1, 1}, []PodEntry{entry}))
@@ -298,11 +238,11 @@ func TestInMemoryAddDoesNotReserveRunForStableKey(t *testing.T) {
 	entry := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{1}, []PodEntry{entry}))
 
-	head, err := index.data.allocRun(1)
+	head, err := index.writerView().data.allocRun(1)
 	require.NoError(t, err)
-	index.data.freeRun(head, 1)
-	index.data.nextChunk = uint32(len(index.data.refChunks))
-	index.data.runBumps[1].offset = slabChunkSize
+	index.writerView().data.freeRun(head, 1)
+	index.writerView().data.nextChunk = uint32(len(index.writerView().data.refChunks))
+	index.writerView().data.runBumps[1].offset = slabChunkSize
 
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{1, 2}, []PodEntry{entry}))
 }
@@ -316,17 +256,17 @@ func TestInMemoryAddRejectsBeforeEvictingLaterBatchKey(t *testing.T) {
 	}
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{2}, entries))
 
-	head, err := index.data.allocRun(1)
+	head, err := index.writerView().data.allocRun(1)
 	require.NoError(t, err)
-	index.data.freeRun(head, 1)
-	index.data.nextChunk = uint32(len(index.data.refChunks))
-	index.data.runBumps[1].offset = slabChunkSize
+	index.writerView().data.freeRun(head, 1)
+	index.writerView().data.nextChunk = uint32(len(index.writerView().data.refChunks))
+	index.writerView().data.runBumps[1].offset = slabChunkSize
 
 	err = index.Add(context.Background(), nil, []BlockHash{1, 2}, entries[:1])
 	require.ErrorContains(t, err, "slab reference capacity exhausted")
-	_, found := index.data.peek(1)
+	_, found := index.writerView().data.peek(1)
 	assert.False(t, found)
-	n, found := index.data.peek(2)
+	n, found := index.writerView().data.peek(2)
 	require.True(t, found)
 	assert.Equal(t, uint16(8), n.runCap)
 	assert.Equal(t, uint16(8), n.runLen)
@@ -341,18 +281,18 @@ func TestInMemoryAddReservesRunForEvictedLaterBatchKey(t *testing.T) {
 	}
 	require.NoError(t, index.Add(context.Background(), nil, []BlockHash{2, 3}, entries))
 
-	head, err := index.data.allocRun(1)
+	head, err := index.writerView().data.allocRun(1)
 	require.NoError(t, err)
-	index.data.freeRun(head, 1)
-	index.data.nextChunk = uint32(len(index.data.refChunks))
-	index.data.runBumps[1].offset = slabChunkSize
+	index.writerView().data.freeRun(head, 1)
+	index.writerView().data.nextChunk = uint32(len(index.writerView().data.refChunks))
+	index.writerView().data.runBumps[1].offset = slabChunkSize
 
 	err = index.Add(context.Background(), nil, []BlockHash{1, 2}, entries[:1])
 	require.ErrorContains(t, err, "slab reference capacity exhausted")
-	_, found := index.data.peek(1)
+	_, found := index.writerView().data.peek(1)
 	assert.False(t, found)
 	for _, key := range []BlockHash{2, 3} {
-		n, found := index.data.peek(key)
+		n, found := index.writerView().data.peek(key)
 		require.True(t, found)
 		assert.Equal(t, uint16(8), n.runCap)
 		assert.Equal(t, uint16(8), n.runLen)

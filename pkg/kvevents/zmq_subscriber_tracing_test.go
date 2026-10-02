@@ -24,20 +24,16 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 )
 
-// drainOne pulls the single queued message off whichever shard received it.
+// drainOne pulls the single queued message off the writer channel.
 func drainOne(t *testing.T, pool *Pool) *RawMessage {
 	t.Helper()
-	for _, q := range pool.queues {
-		if q.Len() == 0 {
-			continue
-		}
-		msg, shutdown := q.Get()
-		require.False(t, shutdown)
-		q.Done(msg)
+	select {
+	case msg := <-pool.tasks:
 		return msg
+	default:
+		t.Fatal("no message was enqueued")
+		return nil
 	}
-	t.Fatal("no message was enqueued")
-	return nil
 }
 
 // addTask is the producing half of the receive-to-process trace link: it must

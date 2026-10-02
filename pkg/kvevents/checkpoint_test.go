@@ -755,15 +755,12 @@ func TestSubscriberClearsOnlyReusedDataParallelRank(t *testing.T) {
 	require.False(t, found)
 	_, found = pool.checkpointSource("vortex/vllm-a-rank-1")
 	require.True(t, found)
-	for _, queue := range pool.queues {
-		require.Zero(t, queue.Len())
-	}
+	require.Zero(t, len(pool.tasks))
 }
 
 func TestSharedRestoredEndpointClearsBeforeEitherSourceReplays(t *testing.T) {
 	pool, index, _ := newTestPool(t, 16)
 	pool.adapter = &sourceEndpointAdapter{}
-	pool.concurrency = 1
 	for id, payload := range map[string]byte{
 		"vortex/vllm-a": 11,
 		"vortex/vllm-b": 12,
@@ -785,7 +782,7 @@ func TestSharedRestoredEndpointClearsBeforeEitherSourceReplays(t *testing.T) {
 		"tcp://new-events-b", "tcp://new-replay-b", "kv@", nil, true,
 	)
 	require.False(t, second.hasResume)
-	require.Equal(t, 2, pool.queues[0].Len())
+	require.Equal(t, 2, len(pool.tasks))
 
 	for range 2 {
 		reset := drainOne(t, pool)
@@ -829,9 +826,7 @@ func TestCheckpointReplayValidatesBoundaryAndQueuesOnlyNewEvents(t *testing.T) {
 	replayed := drainOne(t, pool)
 	require.Equal(t, uint64(8), replayed.Sequence)
 	require.Equal(t, []byte("new-event"), replayed.Payload)
-	for _, queue := range pool.queues {
-		require.Zero(t, queue.Len())
-	}
+	require.Zero(t, len(pool.tasks))
 }
 
 func TestCheckpointReplayRejectsChangedBoundary(t *testing.T) {
@@ -872,9 +867,7 @@ func TestCheckpointReplayKeepsRestoredStateAfterTransientFailure(t *testing.T) {
 	require.True(t, subscriber.hasResume)
 	_, found := pool.checkpointSource("vortex/vllm-a")
 	require.True(t, found)
-	for _, queue := range pool.queues {
-		require.Zero(t, queue.Len())
-	}
+	require.Zero(t, len(pool.tasks))
 }
 
 type checkpointReplayMessage struct {

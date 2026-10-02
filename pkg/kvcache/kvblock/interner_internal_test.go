@@ -39,7 +39,7 @@ func TestAddRejectsTierCardinalityPastTheCap(t *testing.T) {
 		entry := []PodEntry{{PodIdentifier: "pod-a", DeviceTier: fmt.Sprintf("tier-%d", i)}}
 		require.NoError(t, index.Add(ctx, nil, []BlockHash{BlockHash(i + 1)}, entry))
 	}
-	podsBefore, tiersBefore := len(index.pods.ids), len(index.tiers.ids)
+	podsBefore, tiersBefore := len(index.writerView().pods.ids), len(index.writerView().tiers.ids)
 
 	overflow := []PodEntry{
 		{PodIdentifier: "pod-new", DeviceTier: "tier-0"},
@@ -48,11 +48,11 @@ func TestAddRejectsTierCardinalityPastTheCap(t *testing.T) {
 	const engineKey, requestKey = BlockHash(1 << 40), BlockHash(1<<40 + 1)
 	err = index.Add(ctx, []BlockHash{engineKey}, []BlockHash{requestKey}, overflow)
 	require.ErrorIs(t, err, errIndexCardinality)
-	_, found := index.data.peek(requestKey)
+	_, found := index.writerView().data.peek(requestKey)
 	assert.False(t, found, "a rejected Add must not create the key")
-	assert.False(t, index.engineToRequestKeys.Contains(engineKey), "a rejected Add must not map the engine key")
-	assert.Equal(t, podsBefore, len(index.pods.ids), "a rejected Add must not consume a pod ordinal")
-	assert.Equal(t, tiersBefore, len(index.tiers.ids), "a rejected Add must not consume a tier ordinal")
+	assert.False(t, index.writerView().engineToRequestKeys.Contains(engineKey), "a rejected Add must not map the engine key")
+	assert.Equal(t, podsBefore, len(index.writerView().pods.ids), "a rejected Add must not consume a pod ordinal")
+	assert.Equal(t, tiersBefore, len(index.writerView().tiers.ids), "a rejected Add must not consume a tier ordinal")
 
 	require.NoError(t, index.Add(ctx, nil, []BlockHash{1 << 41}, []PodEntry{{PodIdentifier: "pod-b", DeviceTier: "tier-0"}}))
 }

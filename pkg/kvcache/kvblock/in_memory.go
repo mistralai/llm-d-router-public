@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/go-logr/logr"
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -85,13 +86,16 @@ func NewInMemoryIndex(cfg *InMemoryIndexConfig) (*InMemoryIndex, error) {
 		return nil, fmt.Errorf("failed to initialize in-memory engine key map: %w", err)
 	}
 
-	return &InMemoryIndex{
+	index := &InMemoryIndex{
+		baseClears: make(map[uint32]baseClear),
+	}
+	index.view.Store(&indexView{
 		data:                cache,
 		engineToRequestKeys: engineToRequestKeys,
 		pods:                pods,
 		tiers:               tiers,
-		baseClears:          make(map[uint32]baseClear),
-	}, nil
+	})
+	return index, nil
 }
 
 // cancellationCheckMask paces context-cancellation checks in loops over
@@ -108,16 +112,9 @@ const (
 // errIndexCardinality reports an Add whose entries would exceed a cap.
 var errIndexCardinality = errors.New("index cardinality limit reached")
 
-// InMemoryIndex keeps new records in memory and can read a mapped snapshot base.
-type InMemoryIndex struct {
-	// snapshotMu keeps mutations out while a snapshot is encoded or installed.
-	snapshotMu sync.RWMutex
-	// mutationMu keeps engine mappings and their request entries consistent.
-	mutationMu sync.Mutex
-	// viewMu keeps mapped bytes valid while an operation uses them.
-	viewMu sync.RWMutex
-	// baseStateMu protects the masks applied to immutable mapped records.
-	baseStateMu sync.RWMutex
+// indexView is the immutable field set a restore or install swaps in one
+// atomic publish. Readers load it once per operation.
+type indexView struct {
 	// data holds the mapping of requestKeys to sets of pod identifiers.
 	data *slabStore
 	// engineToRequestKeys holds the mapping of engineKeys to requestKeys.
@@ -127,14 +124,95 @@ type InMemoryIndex struct {
 	// address:port values, bounded by the pod network's address space, and
 	// tiers are the engine-reported names. Each is capped, and an Add past
 	// a cap fails rather than admitting an entry that cannot be matched.
-	pods       *interner
-	tiers      *interner
-	base       *mappedSnapshot
+	pods  *interner
+	tiers *interner
+	base  *mappedSnapshot
+	// refs pins a view that carries a mapped base: it stays positive from a
+	// reader's acquire until its release, so a concurrent install cannot
+	// unmap the bytes mid-operation. Only the writer mutates retired, and a
+	// reader that observes retired reloads the current view instead.
+	refs    atomic.Int32
+	retired atomic.Bool
+}
+
+func (v *indexView) release() { v.refs.Add(-1) }
+
+// InMemoryIndex keeps new records in memory and can read a mapped snapshot base.
+//
+// Mutation contract: one goroutine performs every mutation (Add, Evict, Clear,
+// checkpoint writes, restores). The event pool supplies that goroutine.
+// Lookup and the walks serve any number of concurrent readers. The writer
+// needs no mutation lock. baseStateMu serializes the writer against whole
+// read operations, so a lookup runs without the writer interleaving slab
+// mutations through its key loop; readers share it without blocking.
+type InMemoryIndex struct {
+	// view publishes the current field set. Swaps happen on restore and
+	// install; a view with a mapped base is retired and closed once its
+	// in-flight readers release it.
+	view atomic.Pointer[indexView]
+	// baseStateMu pairs every writer mutation with one complete read
+	// operation at a time, and guards the base maps and baseClears while a
+	// mapped base exists.
+	baseStateMu sync.RWMutex
+	// baseClears masks entries of cleared pods inside the immutable mapped
+	// base. Guarded by baseStateMu; empty while no base is installed.
 	baseClears map[uint32]baseClear
+	// retiredViews are views whose replacement was published while readers
+	// still held them. Writer-owned; drained after each mutation.
+	retiredViews []*indexView
 }
 
 var _ Index = &InMemoryIndex{}
 var _ CompactKeyWalker = &InMemoryIndex{}
+
+// writerView returns the field set the single writer mutates. It never
+// retires the view it uses.
+func (m *InMemoryIndex) writerView() *indexView {
+	return m.view.Load()
+}
+
+// acquireView pins the current view for one read operation and releases
+// retired views instead of using them.
+func (m *InMemoryIndex) acquireView() *indexView {
+	for {
+		v := m.view.Load()
+		if v.base == nil {
+			return v
+		}
+		v.refs.Add(1)
+		if !v.retired.Load() {
+			return v
+		}
+		v.refs.Add(-1)
+	}
+}
+
+// publishView installs next on the writer goroutine and retires the view it
+// replaces. A retired view's mapped base closes once its readers release it.
+func (m *InMemoryIndex) publishView(next *indexView) {
+	old := m.view.Swap(next)
+	if old == nil || old.base == nil {
+		return
+	}
+	old.retired.Store(true)
+	if old.refs.Load() == 0 {
+		old.base.close()
+		return
+	}
+	m.retiredViews = append(m.retiredViews, old)
+}
+
+func (m *InMemoryIndex) drainRetiredViews() {
+	remaining := m.retiredViews[:0]
+	for _, v := range m.retiredViews {
+		if v.refs.Load() == 0 {
+			v.base.close()
+			continue
+		}
+		remaining = append(remaining, v)
+	}
+	m.retiredViews = remaining
+}
 
 // PodCache is an opaque compatibility type. In-memory indexes manage per-key
 // storage internally.
@@ -145,20 +223,20 @@ type PodCache struct{}
 // internRecords pairs each entry with its pod and tier ordinals. A batch is
 // assigned all or nothing: when its new pods or tiers would exceed a cap, no
 // ordinal is consumed and the error names the cap.
-func (m *InMemoryIndex) internRecords(entries []PodEntry) ([]slabRef, error) {
-	m.pods.mu.Lock()
-	defer m.pods.mu.Unlock()
-	m.tiers.mu.Lock()
-	defer m.tiers.mu.Unlock()
+func (m *InMemoryIndex) internRecords(v *indexView, entries []PodEntry) ([]slabRef, error) {
+	v.pods.mu.Lock()
+	defer v.pods.mu.Unlock()
+	v.tiers.mu.Lock()
+	defer v.tiers.mu.Unlock()
 
-	if !m.pods.fitsLocked(func(yield func(string)) {
+	if !v.pods.fitsLocked(func(yield func(string)) {
 		for i := range entries {
 			yield(entries[i].PodIdentifier)
 		}
 	}) {
 		return nil, fmt.Errorf("%w: %d pod identifiers", errIndexCardinality, maxInternedPods)
 	}
-	if !m.tiers.fitsLocked(func(yield func(string)) {
+	if !v.tiers.fitsLocked(func(yield func(string)) {
 		for i := range entries {
 			yield(entries[i].DeviceTier)
 		}
@@ -169,23 +247,23 @@ func (m *InMemoryIndex) internRecords(entries []PodEntry) ([]slabRef, error) {
 	records := make([]slabRef, len(entries))
 	for i, entry := range entries {
 		records[i] = newSlabRef(entry,
-			m.pods.internLocked(entry.PodIdentifier),
-			m.tiers.internLocked(entry.DeviceTier))
+			v.pods.internLocked(entry.PodIdentifier),
+			v.tiers.internLocked(entry.DeviceTier))
 	}
 	return records, nil
 }
 
 // knownRecords encodes entries already known to the interners. Unknown names
 // cannot match an indexed record and are omitted.
-func (m *InMemoryIndex) knownRecords(entries []PodEntry, records []slabRef) []slabRef {
-	m.pods.mu.Lock()
-	defer m.pods.mu.Unlock()
-	m.tiers.mu.Lock()
-	defer m.tiers.mu.Unlock()
+func (m *InMemoryIndex) knownRecords(v *indexView, entries []PodEntry, records []slabRef) []slabRef {
+	v.pods.mu.Lock()
+	defer v.pods.mu.Unlock()
+	v.tiers.mu.Lock()
+	defer v.tiers.mu.Unlock()
 
 	for _, entry := range entries {
-		pod, podFound := m.pods.ids[entry.PodIdentifier]
-		tier, tierFound := m.tiers.ids[entry.DeviceTier]
+		pod, podFound := v.pods.ids[entry.PodIdentifier]
+		tier, tierFound := v.tiers.ids[entry.DeviceTier]
 		if podFound && tierFound {
 			records = append(records, newSlabRef(entry, pod, tier))
 		}
@@ -212,8 +290,11 @@ func (m *InMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHash,
 	}
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Lookup")
-	m.viewMu.RLock()
-	defer m.viewMu.RUnlock()
+	v := m.acquireView()
+	defer v.release()
+	// baseStateMu gives lookups priority over the writer: a lookup holds the
+	// read lock for its whole duration, so the writer cannot interleave slab
+	// mutations through the key loop.
 	m.baseStateMu.RLock()
 	defer m.baseStateMu.RUnlock()
 
@@ -222,25 +303,25 @@ func (m *InMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHash,
 	var allowed map[uint32]struct{}
 	if filtered {
 		allowed = make(map[uint32]struct{}, podIdentifierSet.Len())
-		m.pods.mu.Lock()
+		v.pods.mu.Lock()
 		for pod := range podIdentifierSet {
-			if ordinal, found := m.pods.ids[pod]; found {
+			if ordinal, found := v.pods.ids[pod]; found {
 				allowed[ordinal] = struct{}{}
 			}
 		}
-		m.pods.mu.Unlock()
+		v.pods.mu.Unlock()
 	}
 	highestHitIdx := 0
 	visited := 0
-	refs := make([]CompactEntryRef, 0, int(m.data.entryCap))
+	refs := make([]CompactEntryRef, 0, int(v.data.entryCap))
 	// Every exit, cancellation included, refreshes what was read.
-	defer func() { m.data.promote(requestKeys[:visited]) }()
+	defer func() { v.data.promote(requestKeys[:visited]) }()
 
 	for idx, requestKey := range requestKeys {
 		if idx&cancellationCheckMask == 0 && ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		refs, found := m.mergedCompactEntriesLocked(requestKey, refs)
+		refs, found := m.mergedCompactEntriesLocked(v, requestKey, refs)
 		if !found {
 			if traceLogger.Enabled() {
 				traceLogger.Info("key not found in index", "key", requestKey)
@@ -256,7 +337,7 @@ func (m *InMemoryIndex) Lookup(ctx context.Context, requestKeys []BlockHash,
 					continue
 				}
 			}
-			entries = append(entries, ref.entry(m.pods, m.tiers).PodEntry)
+			entries = append(entries, ref.entry(v.pods, v.tiers).PodEntry)
 		}
 		if len(entries) != 0 {
 			podsPerKey[requestKey] = entries
@@ -285,35 +366,30 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	}
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Add")
-	m.snapshotMu.RLock()
-	defer m.snapshotMu.RUnlock()
-	m.viewMu.RLock()
-	defer m.viewMu.RUnlock()
-	m.mutationMu.Lock()
-	defer m.mutationMu.Unlock()
+	v := m.writerView()
 	m.baseStateMu.Lock()
 	defer m.baseStateMu.Unlock()
 
-	storeLocked := !m.data.hasWorstCaseAddCapacity(len(requestKeys))
+	storeLocked := !v.data.hasWorstCaseAddCapacity(len(requestKeys))
 	if storeLocked {
-		m.data.mu.Lock()
-		if err := m.data.ensureAddCapacityLocked(requestKeys, entries); err != nil {
-			m.data.mu.Unlock()
+		v.data.mu.Lock()
+		if err := v.data.ensureAddCapacityLocked(requestKeys, entries); err != nil {
+			v.data.mu.Unlock()
 			return fmt.Errorf("index cannot add request keys: %w", err)
 		}
-		m.data.mu.Unlock()
+		v.data.mu.Unlock()
 	}
 
 	// Intern once per call, before anything is written: a rejected batch
 	// leaves no mapping and no ordinal behind. The same records apply to
 	// every request key.
-	records, err := m.internRecords(entries)
+	records, err := m.internRecords(v, entries)
 	if err != nil {
 		return err
 	}
 
 	for _, requestKey := range requestKeys {
-		if err := m.addRequestRecordsLocked(requestKey, records); err != nil {
+		if err := m.addRequestRecordsLocked(v, requestKey, records); err != nil {
 			return fmt.Errorf("failed to add request key: %w", err)
 		}
 
@@ -324,9 +400,10 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	if engineKeys != nil {
 		mappings := engineToRequestMapping(engineKeys, requestKeys)
 		for ek, rks := range mappings {
-			m.addEngineMappingLocked(ek, rks)
+			m.addEngineMappingLocked(v, ek, rks)
 		}
 	}
+	m.drainRetiredViews()
 
 	return nil
 }
@@ -340,12 +417,7 @@ func (m *InMemoryIndex) Evict(ctx context.Context, key BlockHash, keyType KeyTyp
 	}
 
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Evict")
-	m.snapshotMu.RLock()
-	defer m.snapshotMu.RUnlock()
-	m.viewMu.RLock()
-	defer m.viewMu.RUnlock()
-	m.mutationMu.Lock()
-	defer m.mutationMu.Unlock()
+	v := m.writerView()
 	m.baseStateMu.Lock()
 	defer m.baseStateMu.Unlock()
 	var recordBuffer [1]slabRef // KV removal events contain one pod entry.
@@ -353,34 +425,34 @@ func (m *InMemoryIndex) Evict(ctx context.Context, key BlockHash, keyType KeyTyp
 	if len(entries) > len(recordBuffer) {
 		records = make([]slabRef, 0, len(entries))
 	}
-	records = m.knownRecords(entries, records)
+	records = m.knownRecords(v, entries, records)
 
 	switch keyType {
 	case EngineKey:
-		rks, found := m.requestKeysLocked(key, nil)
+		rks, found := m.requestKeysLocked(v, key, nil)
 		if !found {
 			traceLogger.Info("engineKey not found in mapping, nothing to evict", "engineKey", key)
 			return nil
 		}
 
 		for _, rk := range rks {
-			if err := m.evictPodsFromRequestKey(rk, key, records, entries, traceLogger); err != nil {
+			if err := m.evictPodsFromRequestKey(v, rk, key, records, entries, traceLogger); err != nil {
 				return err
 			}
 		}
 
 		allEmpty := true
-		if m.base == nil {
+		if v.base == nil {
 			for _, rk := range rks {
-				if m.data.size(rk) > 0 {
+				if v.data.size(rk) > 0 {
 					allEmpty = false
 					break
 				}
 			}
 		} else {
-			refs := make([]CompactEntryRef, 0, int(m.data.entryCap))
+			refs := make([]CompactEntryRef, 0, int(v.data.entryCap))
 			for _, rk := range rks {
-				refs, _ = m.mergedCompactEntriesLocked(rk, refs[:0])
+				refs, _ = m.mergedCompactEntriesLocked(v, rk, refs[:0])
 				if len(refs) > 0 {
 					allEmpty = false
 					break
@@ -388,14 +460,17 @@ func (m *InMemoryIndex) Evict(ctx context.Context, key BlockHash, keyType KeyTyp
 			}
 		}
 		if allEmpty {
-			m.engineToRequestKeys.Remove(key)
-			if m.base != nil {
-				delete(m.base.engineOffsets, key)
+			v.engineToRequestKeys.Remove(key)
+			if v.base != nil {
+				delete(v.base.engineOffsets, key)
 			}
 		}
+		m.drainRetiredViews()
 		return nil
 	case RequestKey:
-		return m.evictPodsFromRequestKey(key, EmptyBlockHash, records, entries, traceLogger)
+		err := m.evictPodsFromRequestKey(v, key, EmptyBlockHash, records, entries, traceLogger)
+		m.drainRetiredViews()
+		return err
 	default:
 		return fmt.Errorf("unknown key type: %d", keyType)
 	}
@@ -403,22 +478,23 @@ func (m *InMemoryIndex) Evict(ctx context.Context, key BlockHash, keyType KeyTyp
 
 // evictPodsFromRequestKey removes the given pod entries from a single request key's cache.
 // If the cache becomes empty, the request key is removed from the index.
-func (m *InMemoryIndex) evictPodsFromRequestKey(requestKey, engineKey BlockHash, records []slabRef,
+func (m *InMemoryIndex) evictPodsFromRequestKey(
+	v *indexView, requestKey, engineKey BlockHash, records []slabRef,
 	entries []PodEntry, traceLogger logr.Logger,
 ) error {
 	baseFound := false
-	if m.base != nil {
-		_, baseFound = m.base.requestOffsets[requestKey]
+	if v.base != nil {
+		_, baseFound = v.base.requestOffsets[requestKey]
 	}
 	if !baseFound {
-		if !m.data.remove(requestKey, records) {
+		if !v.data.remove(requestKey, records) {
 			traceLogger.Info("requestKey not found in index, nothing to evict", "requestKey", requestKey, "engineKey", engineKey)
 			return nil
 		}
 		traceLogger.Info("evicted pods from key", "requestKey", requestKey, "engineKey", engineKey, "pods", entries)
 		return nil
 	}
-	merged, found := m.mergedCompactEntriesLocked(requestKey, nil)
+	merged, found := m.mergedCompactEntriesLocked(v, requestKey, nil)
 	if !found {
 		traceLogger.Info("requestKey not found in index, nothing to evict", "requestKey", requestKey, "engineKey", engineKey)
 		return nil
@@ -442,15 +518,15 @@ func (m *InMemoryIndex) evictPodsFromRequestKey(requestKey, engineKey BlockHash,
 		return nil
 	}
 	if len(remaining) != 0 {
-		evicted, didEvict, err := m.data.addTracked(requestKey, remaining)
+		evicted, didEvict, err := v.data.addTracked(requestKey, remaining)
 		if err != nil {
 			return fmt.Errorf("materialize request key %s after eviction: %w", requestKey.String(), err)
 		}
 		if didEvict {
-			m.removeBaseRequestKeyLocked(evicted)
+			m.removeBaseRequestKeyLocked(v, evicted)
 		}
 	}
-	m.removeBaseRequestKeyLocked(requestKey)
+	m.removeBaseRequestKeyLocked(v, requestKey)
 
 	traceLogger.Info("evicted pods from key", "requestKey", requestKey, "engineKey", engineKey, "pods", entries)
 	return nil
@@ -475,23 +551,19 @@ func (m *InMemoryIndex) ClearRank(ctx context.Context, podIdentifier string, dat
 }
 
 func (m *InMemoryIndex) clear(ctx context.Context, podIdentifier string, dataParallelRank *int) error {
-	m.snapshotMu.RLock()
-	defer m.snapshotMu.RUnlock()
-	m.viewMu.RLock()
-	defer m.viewMu.RUnlock()
-	m.mutationMu.Lock()
-	defer m.mutationMu.Unlock()
+	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Clear")
+	v := m.writerView()
 	m.baseStateMu.Lock()
 	defer m.baseStateMu.Unlock()
-	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Clear")
 
-	m.pods.mu.Lock()
-	pod, found := m.pods.ids[podIdentifier]
-	m.pods.mu.Unlock()
+	v.pods.mu.Lock()
+	pod, found := v.pods.ids[podIdentifier]
+	v.pods.mu.Unlock()
 	if found {
-		m.data.clearPod(pod, dataParallelRank)
-		m.clearBasePodLocked(pod, dataParallelRank)
+		v.data.clearPod(pod, dataParallelRank)
+		m.clearBasePodLocked(v, pod, dataParallelRank)
 	}
+	m.drainRetiredViews()
 
 	traceLogger.Info("cleared pod from index", "pod", podIdentifier, "dataParallelRank", dataParallelRank)
 	return nil
@@ -501,11 +573,14 @@ func (m *InMemoryIndex) clear(ctx context.Context, podIdentifier string, dataPar
 // This is what Pool uses for parent hash resolution.
 // Returns an error if the engineKey mapping is missing (e.g., already evicted).
 func (m *InMemoryIndex) GetRequestKey(ctx context.Context, engineKey BlockHash) (BlockHash, error) {
-	m.viewMu.RLock()
-	defer m.viewMu.RUnlock()
+	v := m.acquireView()
+	defer v.release()
+	// baseStateMu gives lookups priority over the writer: a lookup holds the
+	// read lock for its whole duration, so the writer cannot interleave slab
+	// mutations through the key loop.
 	m.baseStateMu.RLock()
 	defer m.baseStateMu.RUnlock()
-	rks, found := m.requestKeysLocked(engineKey, nil)
+	rks, found := m.requestKeysLocked(v, engineKey, nil)
 	if !found || len(rks) == 0 {
 		return EmptyBlockHash, fmt.Errorf("engine key not found: %s", engineKey.String())
 	}

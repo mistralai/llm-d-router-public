@@ -17,6 +17,7 @@ package kvevents
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -186,6 +187,8 @@ func (p *Pool) RestoreLatestCheckpoint(
 }
 
 // WriteCheckpoint atomically replaces path with a consistent pool snapshot.
+// While the pool runs, the write executes on the writer goroutine, so it
+// lands at an exact message boundary without blocking other sources.
 func (p *Pool) WriteCheckpoint(path, configurationFingerprint string) (CheckpointResult, error) {
 	if path == "" {
 		return CheckpointResult{}, errors.New("checkpoint path is not configured")
@@ -198,9 +201,35 @@ func (p *Pool) WriteCheckpoint(path, configurationFingerprint string) (Checkpoin
 	if !ok {
 		return CheckpointResult{}, errors.New("index backend does not support checkpoints")
 	}
-	p.checkpointWriteMu.Lock()
-	defer p.checkpointWriteMu.Unlock()
+	_ = snapshotter // re-asserted by writeCheckpoint on the writer goroutine
+	if p.started.Load() {
+		type writeResult struct {
+			result CheckpointResult
+			err    error
+		}
+		done := make(chan writeResult, 1)
+		delivered := p.Submit(func(ctx context.Context, index kvblock.Index) {
+			result, err := p.writeCheckpoint(path, fingerprint)
+			done <- writeResult{result, err}
+		})
+		if !delivered {
+			return CheckpointResult{}, errors.New("pool is shutting down")
+		}
+		select {
+		case r := <-done:
+			return r.result, r.err
+		case <-p.stopped:
+			return CheckpointResult{}, errors.New("pool shut down before the checkpoint write")
+		}
+	}
+	return p.writeCheckpoint(path, fingerprint)
+}
 
+func (p *Pool) writeCheckpoint(path string, fingerprint [sha256.Size]byte) (CheckpointResult, error) {
+	snapshotter, ok := p.index.(kvblock.Snapshotter)
+	if !ok {
+		return CheckpointResult{}, errors.New("index backend does not support checkpoints")
+	}
 	directoryPath := filepath.Dir(path)
 	temporary, err := os.CreateTemp(directoryPath, ".checkpoint-*")
 	if err != nil {
@@ -224,8 +253,6 @@ func (p *Pool) WriteCheckpoint(path, configurationFingerprint string) (Checkpoin
 	}
 	header := checkpointHeader{ConfigurationFingerprint: fingerprint}
 
-	p.checkpointMu.Lock()
-	defer p.checkpointMu.Unlock()
 	writeErr := func() error {
 		p.appliedSourcesMu.RLock()
 		invalidSourceCount := len(p.invalidSources)
