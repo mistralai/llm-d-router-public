@@ -26,21 +26,33 @@ import (
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 )
 
-func TestLocalSyncerAggregatesOnSet(t *testing.T) {
-	syncer := NewLocalSyncer("test", "replica-a")
-	aggregateCalls := 0
-	aggregate := func(values []any) any {
-		aggregateCalls++
-		return values[0].(int) * 2
-	}
+type cloneableInt int
 
-	require.NoError(t, syncer.Set(context.Background(), "load", "default/backend-0", 21, aggregate))
-	value, ok, err := syncer.Get(context.Background(), fwkdl.StateKey("load"), "default/backend-0")
+func (v cloneableInt) Clone() fwkdl.Cloneable { return v }
+
+func TestLocalSyncerAggregatesLiveLocalValue(t *testing.T) {
+	syncer := NewLocalSyncer("test", "replica-a")
+	aggregate := func(values []any) any {
+		return values[0].(cloneableInt) * 2
+	}
+	local := 21
+	state := syncer.Bind(
+		"load",
+		"default/backend-0",
+		func() fwkdl.Cloneable { return cloneableInt(local) },
+		aggregate,
+	)
+
+	require.NoError(t, state.Set(context.Background()))
+	value, err := state.Get(context.Background())
 
 	require.NoError(t, err)
-	require.True(t, ok)
-	assert.Equal(t, 42, value)
-	assert.Equal(t, 1, aggregateCalls)
+	assert.Equal(t, cloneableInt(42), value)
+
+	local = 22
+	value, err = state.Get(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, cloneableInt(44), value)
 }
 
 func TestLocalSyncerGetOrSet(t *testing.T) {

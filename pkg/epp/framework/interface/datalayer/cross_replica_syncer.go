@@ -25,24 +25,29 @@ import (
 // StateKey namespaces cross-EPP shared state.
 type StateKey string
 
+// BoundCrossReplicaState synchronizes one contributor's state for one endpoint.
+type BoundCrossReplicaState interface {
+	// Set publishes the live local value and refreshes the peer aggregate used by
+	// Get.
+	Set(ctx context.Context) error
+
+	// Get reads the live local value and combines it with the prepared peer
+	// aggregate.
+	Get(ctx context.Context) (any, error)
+
+	// Delete removes this replica's value.
+	Delete(ctx context.Context) error
+}
+
 // CrossReplicaSyncer synchronizes shared state across EPP replicas.
 // Implementations own the storage mechanism and must provide the atomic
 // consistency required by GetOrSet.
 type CrossReplicaSyncer interface {
 	fwkplugin.Plugin
 
-	// Set writes a value for the given key and endpoint and prepares the
-	// aggregate returned by Get. The runtime calls this periodically, once per
-	// live endpoint, with a fresh local snapshot.
-	Set(ctx context.Context, key StateKey, endpointID string, value any, aggregate func([]any) any) error
-
-	// Get returns the prepared aggregate for the given key and endpoint across
-	// all replicas. Returns (value, true, nil) on hit, (nil, false, nil) on
-	// miss, or (nil, false, err) on failure.
-	Get(ctx context.Context, key StateKey, endpointID string) (any, bool, error)
-
-	// Delete removes the value for the given key and endpoint.
-	Delete(ctx context.Context, key StateKey, endpointID string) error
+	// Bind creates a state handle that retains the contributor's key, endpoint,
+	// live local value supplier, and aggregation function.
+	Bind(key StateKey, endpointID string, local func() Cloneable, aggregate func([]any) any) BoundCrossReplicaState
 
 	// GetOrSet atomically returns the value already stored for key and id, or
 	// stores candidate and returns it. This is global request-level state shared
@@ -72,12 +77,13 @@ type CrossReplicaSpec struct {
 	AttributeKey fwkplugin.DataKey
 
 	// Supply returns a closure that reads the live local value for the given
-	// endpoint. The runtime calls this closure after Produce to snapshot
-	// the current local state and Set it into the store.
+	// endpoint. The runtime uses it to publish snapshots and passes it to Get for
+	// request-time reads.
 	Supply func(endpointID string) func() Cloneable
 
-	// Aggregate combines per-replica values into a single aggregate.
-	// Called by the store's Set to fold values from all replicas.
+	// Aggregate combines per-replica values into a single aggregate. Its output
+	// must have the same type and may be passed back as an input when Get combines
+	// the cached peer aggregate with the live local value.
 	Aggregate func(values []any) any
 
 	// SyncDisabled opts this contributor out of cross-replica synchronization
