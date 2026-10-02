@@ -187,7 +187,6 @@ func TestSubscriberManager_RemoveSubscriberResetsQueuedPodState(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 	pool, idx, tokenProcessor := newTestPool(t, 16)
 	pool.adapter = &sourceEndpointAdapter{}
-	pool.concurrency = 1
 	defer pool.Shutdown(ctx)
 
 	const (
@@ -221,16 +220,14 @@ func TestSubscriberManager_RemoveSubscriberResetsQueuedPodState(t *testing.T) {
 	subscriber.addTask(ctx, "kv@10.0.0.1:8000@test-model", 2, []byte{2})
 	close(done)
 
-	require.Equal(t, 2, pool.queues[0].Len())
+	require.Equal(t, 2, len(pool.tasks))
 	for _, wantReset := range []bool{false, true} {
-		msg, shutdown := pool.queues[0].Get()
-		require.False(t, shutdown)
+		msg := <-pool.tasks
 		assert.Equal(t, wantReset, msg.reset)
 		if !wantReset {
 			assert.Equal(t, uint64(1), msg.Sequence)
 		}
 		pool.processRawMessage(ctx, msg)
-		pool.queues[0].Done(msg)
 	}
 
 	keys, err := tokenProcessor.TokensToKVBlockKeys(
@@ -250,7 +247,6 @@ func TestSubscriberManager_RemoveSubscriberKeepsSharedSourceUntilLastSubscriber(
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 	pool, _, _ := newTestPool(t, 16)
 	pool.adapter = &sourceEndpointAdapter{}
-	pool.concurrency = 1
 	defer pool.Shutdown(ctx)
 
 	const sourceEndpoint = "10.0.0.1:8000"
@@ -273,19 +269,17 @@ func TestSubscriberManager_RemoveSubscriberKeepsSharedSourceUntilLastSubscriber(
 	manager.RemoveSubscriber(ctx, "ns/pod-copy-0")
 	subscribers[0].addTask(ctx, "kv@", 2, []byte{2})
 	subscribers[1].addTask(ctx, "kv@", 3, []byte{3})
-	require.Equal(t, 2, pool.queues[0].Len(), "removing one subscriber must not reset a source still in use")
+	require.Equal(t, 2, len(pool.tasks), "removing one subscriber must not reset a source still in use")
 
 	manager.RemoveSubscriber(ctx, "ns/pod-copy-1")
-	require.Equal(t, 3, pool.queues[0].Len(), "removing the last subscriber must queue one source reset")
+	require.Equal(t, 3, len(pool.tasks), "removing the last subscriber must queue one source reset")
 	for _, want := range []struct {
 		reset    bool
 		sequence uint64
 	}{{false, 1}, {false, 3}, {true, 0}} {
-		msg, shutdown := pool.queues[0].Get()
-		require.False(t, shutdown)
+		msg := <-pool.tasks
 		assert.Equal(t, want.reset, msg.reset)
 		assert.Equal(t, want.sequence, msg.Sequence)
-		pool.queues[0].Done(msg)
 	}
 	for _, done := range dones {
 		close(done)
@@ -296,7 +290,6 @@ func TestSubscriberManager_RemoveSubscriberResetsOnlyRetiredDataParallelRank(t *
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 	pool, _, _ := newTestPool(t, 16)
 	pool.adapter = &sourceEndpointAdapter{}
-	pool.concurrency = 1
 	defer pool.Shutdown(ctx)
 
 	const sourceEndpoint = "10.0.0.1:8000"
@@ -318,13 +311,11 @@ func TestSubscriberManager_RemoveSubscriberResetsOnlyRetiredDataParallelRank(t *
 	}
 
 	manager.RemoveSubscriber(ctx, "ns/pod-rank-0")
-	require.Equal(t, 1, pool.queues[0].Len())
-	msg, shutdown := pool.queues[0].Get()
-	require.False(t, shutdown)
+	require.Equal(t, 1, len(pool.tasks))
+	msg := <-pool.tasks
 	require.True(t, msg.reset)
 	require.NotNil(t, msg.ResetDataParallelRank)
 	assert.Equal(t, rank0, *msg.ResetDataParallelRank)
-	pool.queues[0].Done(msg)
 
 	for _, done := range dones {
 		close(done)
@@ -335,7 +326,6 @@ func TestZMQSubscriber_RetireDropsMessagesWithoutSourceEndpoint(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 	pool, _, _ := newTestPool(t, 16)
 	pool.adapter = &sourceEndpointAdapter{}
-	pool.concurrency = 1
 	defer pool.Shutdown(ctx)
 
 	subscriber := newZMQSubscriber(pool, "local-subscriber", "", "", "", "kv@", nil, false)
@@ -343,11 +333,9 @@ func TestZMQSubscriber_RetireDropsMessagesWithoutSourceEndpoint(t *testing.T) {
 	subscriber.retire(false)
 	subscriber.addTask(ctx, "kv@10.0.0.1:8000@test-model", 2, []byte{2})
 
-	require.Equal(t, 1, pool.queues[0].Len())
-	msg, shutdown := pool.queues[0].Get()
-	require.False(t, shutdown)
+	require.Equal(t, 1, len(pool.tasks))
+	msg := <-pool.tasks
 	assert.Equal(t, uint64(1), msg.Sequence)
-	pool.queues[0].Done(msg)
 }
 
 func TestProcessRawMessage_FallsBackToTopicEndpoint(t *testing.T) {
@@ -1643,7 +1631,7 @@ func TestPool_QueueDepthAccounting(t *testing.T) {
 	pool.Shutdown(ctx)
 	assert.Equal(t, int64(0), pool.queueDepth.Load())
 	assert.InDelta(t, 0.0, gaugeValue(t, metrics.PoolQueueDepth), 0.001)
-	assert.InDelta(t, float64(cfg.Concurrency), gaugeValue(t, metrics.PoolCapacity), 0.001)
+	assert.InDelta(t, 1.0, gaugeValue(t, metrics.PoolCapacity), 0.001)
 }
 
 // gaugeValue reads the current value of a prometheus.Gauge without touching the

@@ -265,7 +265,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		}
 	}
 
-	speculativeCache, speculativeTTL, err := buildSpeculativeCache(ctx, config, indexer.KVBlockIndex())
+	speculativeCache, speculativeTTL, err := buildSpeculativeCache(ctx, config, pool)
 	if err != nil {
 		return nil, err
 	}

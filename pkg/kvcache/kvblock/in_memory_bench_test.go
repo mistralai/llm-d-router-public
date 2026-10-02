@@ -223,26 +223,24 @@ func BenchmarkInMemoryIndexMixed(b *testing.B) {
 
 	stop := make(chan struct{})
 	defer close(stop)
-	for w := 0; w < 4; w++ {
-		go func(w int) {
-			entries := []kvblock.PodEntry{{PodIdentifier: fmt.Sprintf("10.1.0.%d:8000", w), DeviceTier: "gpu"}}
-			engineKeys := make([]kvblock.BlockHash, 64)
-			requestKeys := make([]kvblock.BlockHash, 64)
-			for i := uint64(0); ; i++ {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				base := (uint64(w)<<32 | i*64) + 1
-				for j := range engineKeys {
-					engineKeys[j] = kvblock.BlockHash(base + uint64(j))
-					requestKeys[j] = kvblock.BlockHash(base + uint64(j))
-				}
-				_ = idx.Add(ctx, engineKeys, requestKeys, entries)
+	go func() {
+		entries := []kvblock.PodEntry{{PodIdentifier: "10.1.0.0:8000", DeviceTier: "gpu"}}
+		engineKeys := make([]kvblock.BlockHash, 64)
+		requestKeys := make([]kvblock.BlockHash, 64)
+		for i := uint64(0); ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
 			}
-		}(w)
-	}
+			base := i*64 + 1
+			for j := range engineKeys {
+				engineKeys[j] = kvblock.BlockHash(base + uint64(j))
+				requestKeys[j] = kvblock.BlockHash(base + uint64(j))
+			}
+			_ = idx.Add(ctx, engineKeys, requestKeys, entries)
+		}
+	}()
 
 	podSet := sets.New[string]()
 	b.ReportAllocs()

@@ -39,7 +39,7 @@ func TestFileBackedIndexMergesSnapshotAndMutations(t *testing.T) {
 	target, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 8, PodCacheSize: 2})
 	require.NoError(t, err)
 	require.NoError(t, target.RestoreSnapshotFile(file, 0, info.Size()))
-	require.Zero(t, target.data.len)
+	require.Zero(t, target.writerView().data.len)
 
 	overlayEntry := PodEntry{PodIdentifier: "overlay", DeviceTier: "gpu"}
 	require.NoError(t, target.Add(ctx, []BlockHash{12}, []BlockHash{101}, []PodEntry{overlayEntry}))
@@ -164,7 +164,7 @@ func TestFileBackedIndexEnforcesCombinedRequestCapacity(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, view.RestoreSnapshotFile(file, 0, info.Size()))
 	require.NoError(t, view.Add(ctx, nil, []BlockHash{103}, []PodEntry{entry}))
-	require.LessOrEqual(t, len(view.base.requestOffsets)+view.data.len, 2)
+	require.LessOrEqual(t, len(view.writerView().base.requestOffsets)+view.writerView().data.len, 2)
 
 	var compacted bytes.Buffer
 	require.NoError(t, view.WriteSnapshot(&compacted))
@@ -221,7 +221,7 @@ func TestFileBackedOverlayEvictionDoesNotRevealOldEngineMapping(t *testing.T) {
 
 	_, err = view.GetRequestKey(ctx, 11)
 	require.ErrorContains(t, err, "engine key not found")
-	require.LessOrEqual(t, len(view.base.engineOffsets)+view.engineToRequestKeys.Len(), 2)
+	require.LessOrEqual(t, len(view.writerView().base.engineOffsets)+view.writerView().engineToRequestKeys.Len(), 2)
 }
 
 func TestFileBackedEvictionFailureKeepsBaseGeneration(t *testing.T) {
@@ -242,7 +242,7 @@ func TestFileBackedEvictionFailureKeepsBaseGeneration(t *testing.T) {
 	view, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1, PodCacheSize: 2})
 	require.NoError(t, err)
 	require.NoError(t, view.RestoreSnapshotFile(file, 0, info.Size()))
-	view.data.nextChunk = uint32(len(view.data.refChunks))
+	view.writerView().data.nextChunk = uint32(len(view.writerView().data.refChunks))
 
 	err = view.Evict(ctx, 101, RequestKey, []PodEntry{first})
 	require.ErrorContains(t, err, "slab reference capacity exhausted")

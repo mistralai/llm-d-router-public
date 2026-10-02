@@ -158,23 +158,26 @@ type CompactKeyWalker interface {
 func (m *InMemoryIndex) WalkKeys(ctx context.Context, requestKeys []BlockHash,
 	visit func(pos int, found bool, entries []EntryRef) bool,
 ) error {
-	m.viewMu.RLock()
-	defer m.viewMu.RUnlock()
+	v := m.acquireView()
+	defer v.release()
+	// baseStateMu gives lookups priority over the writer: a lookup holds the
+	// read lock for its whole duration, so the writer cannot interleave slab
+	// mutations through the key loop.
 	m.baseStateMu.RLock()
 	defer m.baseStateMu.RUnlock()
 	visited := 0
-	compact := make([]CompactEntryRef, 0, int(m.data.entryCap))
-	entries := make([]EntryRef, 0, int(m.data.entryCap))
+	compact := make([]CompactEntryRef, 0, int(v.data.entryCap))
+	entries := make([]EntryRef, 0, int(v.data.entryCap))
 	// Every exit, cancellation included, refreshes what was read.
-	defer func() { m.data.promote(requestKeys[:visited]) }()
+	defer func() { v.data.promote(requestKeys[:visited]) }()
 	for pos, key := range requestKeys {
 		if pos&cancellationCheckMask == 0 && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		compact, found := m.mergedCompactEntriesLocked(key, compact)
+		compact, found := m.mergedCompactEntriesLocked(v, key, compact)
 		entries = entries[:0]
 		for _, ref := range compact {
-			entries = append(entries, ref.entry(m.pods, m.tiers))
+			entries = append(entries, ref.entry(v.pods, v.tiers))
 		}
 		keepGoing := visit(pos, found, entries)
 		if found {
@@ -191,16 +194,16 @@ func (m *InMemoryIndex) WalkKeys(ctx context.Context, requestKeys []BlockHash,
 func (m *InMemoryIndex) WalkCompactKeys(ctx context.Context, requestKeys []BlockHash,
 	visit func(pos int, found bool, entries []CompactEntryRef) bool,
 ) error {
-	m.viewMu.RLock()
-	defer m.viewMu.RUnlock()
-	if m.base == nil {
+	v := m.acquireView()
+	defer v.release()
+	if v.base == nil {
 		visited := 0
-		defer func() { m.data.promote(requestKeys[:visited]) }()
+		defer func() { v.data.promote(requestKeys[:visited]) }()
 		for pos, key := range requestKeys {
 			if pos&cancellationCheckMask == 0 && ctx.Err() != nil {
 				return ctx.Err()
 			}
-			found, keepGoing := m.data.visitCompact(key, pos, visit)
+			found, keepGoing := v.data.visitCompact(key, pos, visit)
 			if found {
 				visited = pos + 1
 			}
@@ -213,13 +216,13 @@ func (m *InMemoryIndex) WalkCompactKeys(ctx context.Context, requestKeys []Block
 	m.baseStateMu.RLock()
 	defer m.baseStateMu.RUnlock()
 	visited := 0
-	entries := make([]CompactEntryRef, 0, int(m.data.entryCap))
-	defer func() { m.data.promote(requestKeys[:visited]) }()
+	entries := make([]CompactEntryRef, 0, int(v.data.entryCap))
+	defer func() { v.data.promote(requestKeys[:visited]) }()
 	for pos, key := range requestKeys {
 		if pos&cancellationCheckMask == 0 && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		entries, found := m.mergedCompactEntriesLocked(key, entries)
+		entries, found := m.mergedCompactEntriesLocked(v, key, entries)
 		keepGoing := visit(pos, found, entries)
 		if found {
 			visited = pos + 1
@@ -232,10 +235,10 @@ func (m *InMemoryIndex) WalkCompactKeys(ctx context.Context, requestKeys []Block
 }
 
 // PodName resolves an ordinal produced by this index.
-func (m *InMemoryIndex) PodName(ordinal uint32) string { return m.pods.name(ordinal) }
+func (m *InMemoryIndex) PodName(ordinal uint32) string { return m.writerView().pods.name(ordinal) }
 
 // TierName resolves an ordinal produced by this index.
-func (m *InMemoryIndex) TierName(ordinal uint32) string { return m.tiers.name(ordinal) }
+func (m *InMemoryIndex) TierName(ordinal uint32) string { return m.writerView().tiers.name(ordinal) }
 
 // interner assigns dense uint32 ordinals to strings, stable for its lifetime
 // and never reused, up to a fixed number of distinct strings. Callers hold mu
