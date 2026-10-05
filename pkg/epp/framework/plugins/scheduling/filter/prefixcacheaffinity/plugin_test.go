@@ -34,12 +34,21 @@ import (
 // makeEndpoint creates a test endpoint with the given prefix cache match ratio
 // (prefixMatch out of 100 total blocks), predicted TTFT, and in-flight tokens.
 func makeEndpoint(name string, prefixMatch int, ttft float64, tokens int64) fwksched.Endpoint {
+	return makeEndpointWithPrefixInfo(name, prefixMatch, 100, 16, ttft, tokens)
+}
+
+func makeEndpointWithPrefixInfo(
+	name string,
+	prefixMatch, totalBlocks, blockSizeTokens int,
+	ttft float64,
+	tokens int64,
+) fwksched.Endpoint {
 	meta := &fwkdl.EndpointMetadata{
 		ID: types.NamespacedName{Name: name, Namespace: "default"},
 	}
 	ep := fwksched.NewEndpoint(meta, &fwkdl.Metrics{}, fwkdl.NewAttributes())
 	if prefixMatch >= 0 {
-		ep.Put(attrprefix.PrefixCacheMatchInfoDataKey, attrprefix.NewPrefixCacheMatchInfo(prefixMatch, 100, 16))
+		ep.Put(attrprefix.PrefixCacheMatchInfoDataKey, attrprefix.NewPrefixCacheMatchInfo(prefixMatch, totalBlocks, blockSizeTokens))
 	}
 	if ttft >= 0 {
 		ep.Put(attrlatency.LatencyPredictionInfoDataKey, attrlatency.NewLatencyPredictionInfo(true, true, 0, 0, ttft, 0, 0))
@@ -97,6 +106,42 @@ func TestFilter_NarrowToSticky(t *testing.T) {
 	}
 	result := p.Filter(context.Background(), nil, endpoints)
 	assert.Equal(t, 2, len(result), "should narrow to sticky endpoints")
+}
+
+func TestFilter_MinCachedTokensRequiresRatioAndMinimum(t *testing.T) {
+	p := newTestPlugin(Config{
+		AffinityThreshold:      0.80,
+		MinCachedTokens:        1600,
+		ExplorationProbability: 0,
+		MaxTTFTPenaltyMs:       0,
+	})
+	endpoints := []fwksched.Endpoint{
+		makeEndpointWithPrefixInfo("high-ratio-small", 90, 100, 16, 0, 0),
+		makeEndpointWithPrefixInfo("large-low-ratio", 79, 100, 32, 0, 0),
+	}
+
+	result := p.Filter(context.Background(), nil, endpoints)
+
+	assert.Equal(t, endpoints, result, "both affinity conditions must pass")
+}
+
+func TestFilter_MinCachedTokensNarrowsToLargeHighRatioMatch(t *testing.T) {
+	p := newTestPlugin(Config{
+		AffinityThreshold:      0.80,
+		MinCachedTokens:        1600,
+		ExplorationProbability: 0,
+		MaxTTFTPenaltyMs:       0,
+	})
+	endpoints := []fwksched.Endpoint{
+		makeEndpointWithPrefixInfo("high-ratio-small", 90, 100, 16, 0, 0),
+		makeEndpointWithPrefixInfo("large-low-ratio", 79, 100, 32, 0, 0),
+		makeEndpointWithPrefixInfo("large-high-ratio", 90, 100, 32, 0, 0),
+	}
+
+	result := p.Filter(context.Background(), nil, endpoints)
+
+	assert.Len(t, result, 1)
+	assert.Equal(t, "large-high-ratio", result[0].GetMetadata().ID.Name)
 }
 
 func TestFilter_TTFTPenaltyBreaksStickiness(t *testing.T) {
@@ -194,6 +239,16 @@ func TestFactory_PartialConfigPreservesDefaults(t *testing.T) {
 	assert.Equal(t, 0.95, p.config.AffinityThreshold)
 	assert.Equal(t, DefaultConfig.ExplorationProbability, p.config.ExplorationProbability)
 	assert.Equal(t, DefaultConfig.MaxTTFTPenaltyMs, p.config.MaxTTFTPenaltyMs)
+	assert.Equal(t, DefaultConfig.MinCachedTokens, p.config.MinCachedTokens)
+
+	// Setting only minCachedTokens should preserve defaults for other params.
+	plugin, err = Factory("test", fwkplugin.StrictDecoder([]byte(`{"minCachedTokens": 16384}`)), nil)
+	assert.NoError(t, err)
+	p = plugin.(*Plugin)
+	assert.Equal(t, DefaultConfig.AffinityThreshold, p.config.AffinityThreshold)
+	assert.Equal(t, int64(16384), p.config.MinCachedTokens)
+	assert.Equal(t, DefaultConfig.ExplorationProbability, p.config.ExplorationProbability)
+	assert.Equal(t, DefaultConfig.MaxTTFTPenaltyMs, p.config.MaxTTFTPenaltyMs)
 
 	// Setting only explorationProbability should preserve defaults for other params.
 	plugin, err = Factory("test", fwkplugin.StrictDecoder([]byte(`{"explorationProbability": 0.05}`)), nil)
@@ -234,6 +289,12 @@ func TestFactory_InvalidAffinityThreshold(t *testing.T) {
 			assert.Contains(t, err.Error(), "affinityThreshold must be in [0, 1]")
 		})
 	}
+}
+
+func TestFactory_InvalidMinCachedTokens(t *testing.T) {
+	_, err := Factory("test", fwkplugin.StrictDecoder([]byte(`{"minCachedTokens": -1}`)), nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "minCachedTokens must be >= 0")
 }
 
 func TestFactory_InvalidExplorationProbability(t *testing.T) {

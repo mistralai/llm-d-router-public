@@ -54,7 +54,8 @@ Can be instantiated multiple times with different thresholds (e.g., 0.99 for glo
 
 ## Behavior
 
-- Keep only endpoints with prefix cache score >= `affinityThreshold`
+- Keep only endpoints with prefix cache score >= `affinityThreshold` and at
+  least `minCachedTokens` cached prompt tokens
 - If no endpoints pass, all are kept (no-op)
 - With probability `explorationProbability` (default 0, disabled), skip the gate entirely for exploration
 - TTFT load gate: if best sticky endpoint's TTFT exceeds best non-sticky by more than
@@ -112,6 +113,7 @@ documents the strategy and its calibration.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `affinityThreshold` | `float64` | No | `0.80` | Prefix cache score threshold for stickiness |
+| `minCachedTokens` | `int64` | No | `0` | Minimum cached prompt tokens required for stickiness |
 | `explorationProbability` | `float64` | No | `0` | Probability of skipping the gate |
 | `maxTTFTPenaltyMs` | `float64` | No | `18000` | Max TTFT penalty (ms) before breaking stickiness. 0 = always stick |
 | `ttftSource` | `string` | No | `prefillThroughput` | TTFT source for the load gate: `prefillThroughput` or `latencyPredictor` |
@@ -136,6 +138,7 @@ plugins:
     name: prefix-affinity
     parameters:
       affinityThreshold: 0.80
+      minCachedTokens: 16384
       explorationProbability: 0.01
       maxTTFTPenaltyMs: 5000
       ttftSource: prefillThroughput
