@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -111,4 +112,53 @@ func TestExportClusterPrefixSnapshotRejectsCorruptCheckpoint(t *testing.T) {
 	contents, err := os.ReadFile(output)
 	require.NoError(t, err)
 	require.Equal(t, []byte("keep"), contents)
+}
+
+func TestExportLatestClusterPrefixSnapshotFallsBackToValidWriter(t *testing.T) {
+	directory := t.TempDir()
+	first, firstIndex, _ := newTestPool(t, 16)
+	require.NoError(t, firstIndex.Add(t.Context(), nil, []kvblock.BlockHash{101},
+		[]kvblock.PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}))
+	firstResult, err := first.WriteCheckpointForWriter(directory, "writer-a", testFingerprint)
+	require.NoError(t, err)
+	second, secondIndex, _ := newTestPool(t, 16)
+	require.NoError(t, secondIndex.Add(t.Context(), nil, []kvblock.BlockHash{102},
+		[]kvblock.PodEntry{{PodIdentifier: "pod-b", DeviceTier: "gpu"}}))
+	secondResult, err := second.WriteCheckpointForWriter(directory, "writer-b", testFingerprint)
+	require.NoError(t, err)
+	now := time.Now()
+	require.NoError(t, os.Chtimes(firstResult.Path, now.Add(-time.Minute), now.Add(-time.Minute)))
+	require.NoError(t, os.Chtimes(secondResult.Path, now, now))
+	output := filepath.Join(t.TempDir(), "prefix.bin")
+	meta := kvblock.ClusterPrefixSnapshotMetadata{Cluster: "c1", Model: "m1", BlockSizeTokens: 16}
+
+	selected, result, err := ExportLatestClusterPrefixSnapshot(directory, output, testFingerprint, meta)
+	require.NoError(t, err)
+	require.Equal(t, secondResult.Path, selected)
+	require.Equal(t, kvblock.ClusterPrefixSnapshotResult{Backends: 1, Keys: 1}, result)
+	data, err := os.ReadFile(output)
+	require.NoError(t, err)
+	require.Equal(t, uint64(102), binary.LittleEndian.Uint64(data[len(data)-8:]))
+
+	checkpoint, err := os.ReadFile(secondResult.Path)
+	require.NoError(t, err)
+	checkpoint[len(checkpoint)-1] ^= 1
+	require.NoError(t, os.WriteFile(secondResult.Path, checkpoint, 0o600))
+	selected, result, err = ExportLatestClusterPrefixSnapshot(directory, output, testFingerprint, meta)
+	require.NoError(t, err)
+	require.Equal(t, firstResult.Path, selected)
+	require.Equal(t, kvblock.ClusterPrefixSnapshotResult{Backends: 1, Keys: 1}, result)
+	data, err = os.ReadFile(output)
+	require.NoError(t, err)
+	require.Equal(t, uint64(101), binary.LittleEndian.Uint64(data[len(data)-8:]))
+
+	checkpoint, err = os.ReadFile(firstResult.Path)
+	require.NoError(t, err)
+	checkpoint[len(checkpoint)-1] ^= 1
+	require.NoError(t, os.WriteFile(firstResult.Path, checkpoint, 0o600))
+	_, _, err = ExportLatestClusterPrefixSnapshot(directory, output, testFingerprint, meta)
+	require.Error(t, err)
+	unchanged, err := os.ReadFile(output)
+	require.NoError(t, err)
+	require.Equal(t, data, unchanged)
 }

@@ -20,6 +20,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 )
@@ -100,4 +102,47 @@ func ExportClusterPrefixSnapshot(checkpointPath, outputPath, configurationFinger
 		return kvblock.ClusterPrefixSnapshotResult{}, err
 	}
 	return result, nil
+}
+
+// ExportLatestClusterPrefixSnapshot uses the newest valid writer checkpoint.
+// A failed candidate does not replace the current output.
+func ExportLatestClusterPrefixSnapshot(directory, outputPath, configurationFingerprint string,
+	meta kvblock.ClusterPrefixSnapshotMetadata,
+) (string, kvblock.ClusterPrefixSnapshotResult, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return "", kvblock.ClusterPrefixSnapshotResult{}, fmt.Errorf("read checkpoint directory: %w", err)
+	}
+	candidates := make([]checkpointCandidate, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, checkpointFilePrefix) || !strings.HasSuffix(name, checkpointFileSuffix) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		candidates = append(candidates, checkpointCandidate{
+			path: filepath.Join(directory, name), modifiedAt: info.ModTime(),
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].modifiedAt.Equal(candidates[j].modifiedAt) {
+			return candidates[i].path > candidates[j].path
+		}
+		return candidates[i].modifiedAt.After(candidates[j].modifiedAt)
+	})
+	var failures []error
+	for _, candidate := range candidates {
+		result, err := ExportClusterPrefixSnapshot(candidate.path, outputPath, configurationFingerprint, meta)
+		if err == nil {
+			return candidate.path, result, nil
+		}
+		failures = append(failures, fmt.Errorf("export %s: %w", candidate.path, err))
+	}
+	if len(failures) != 0 {
+		return "", kvblock.ClusterPrefixSnapshotResult{}, errors.Join(failures...)
+	}
+	return "", kvblock.ClusterPrefixSnapshotResult{}, errors.New("checkpoint directory has no writer checkpoints")
 }

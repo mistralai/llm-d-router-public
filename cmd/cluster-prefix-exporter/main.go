@@ -34,6 +34,7 @@ func main() {
 func run(args []string) error {
 	flags := flag.NewFlagSet("cluster-prefix-exporter", flag.ContinueOnError)
 	checkpoint := flags.String("checkpoint", "", "input KV index checkpoint")
+	checkpointDirectory := flags.String("checkpoint-directory", "", "directory of per-writer checkpoints")
 	output := flags.String("output", "", "output cluster prefix snapshot")
 	fingerprint := flags.String("fingerprint", "", "checkpoint configuration fingerprint")
 	cluster := flags.String("cluster", "", "cluster name")
@@ -44,18 +45,28 @@ func run(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *checkpoint == "" || *output == "" || *fingerprint == "" ||
+	if flags.NArg() != 0 || (*checkpoint == "") == (*checkpointDirectory == "") ||
+		*output == "" || *fingerprint == "" ||
 		*cluster == "" || *model == "" || *blockSize <= 0 {
-		return errors.New("checkpoint, output, fingerprint, cluster, model, and positive block-size are required")
+		return errors.New("one checkpoint source, output, fingerprint, cluster, model, and positive block-size are required")
 	}
-	result, err := kvevents.ExportClusterPrefixSnapshot(*checkpoint, *output, *fingerprint,
-		kvblock.ClusterPrefixSnapshotMetadata{
-			Cluster: *cluster, Model: *model, BlockSizeTokens: *blockSize,
-			HashSeed: *hashSeed, HashAlgorithm: *hashAlgorithm,
-		})
+	meta := kvblock.ClusterPrefixSnapshotMetadata{
+		Cluster: *cluster, Model: *model, BlockSizeTokens: *blockSize,
+		HashSeed: *hashSeed, HashAlgorithm: *hashAlgorithm,
+	}
+	var result kvblock.ClusterPrefixSnapshotResult
+	var err error
+	selected := *checkpoint
+	if *checkpointDirectory != "" {
+		selected, result, err = kvevents.ExportLatestClusterPrefixSnapshot(
+			*checkpointDirectory, *output, *fingerprint, meta)
+	} else {
+		result, err = kvevents.ExportClusterPrefixSnapshot(*checkpoint, *output, *fingerprint, meta)
+	}
 	if err != nil {
 		return err
 	}
-	fmt.Printf("exported %d backends and %d keys to %s\n", result.Backends, result.Keys, *output)
+	fmt.Printf("exported %d backends and %d keys from %s to %s\n",
+		result.Backends, result.Keys, selected, *output)
 	return nil
 }
