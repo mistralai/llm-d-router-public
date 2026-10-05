@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -67,6 +68,10 @@ type PluginConfig struct {
 	// CheckpointInterval sets the time between writes when checkpointDirectory is set.
 	// It must contain a positive Go duration because each write walks the full index.
 	CheckpointInterval string `json:"checkpointInterval,omitempty"`
+	// Configure these fields on one EPP replica that publishes the cluster snapshot.
+	ClusterSnapshotOutput  string `json:"clusterSnapshotOutput,omitempty"`
+	ClusterSnapshotCluster string `json:"clusterSnapshotCluster,omitempty"`
+	ClusterSnapshotModel   string `json:"clusterSnapshotModel,omitempty"`
 	// SpeculativeIndexing seeds predicted cache entries for the selected
 	// endpoint(s) immediately after a routing decision, so the next
 	// same-prefix request hits without waiting for engine confirmation.
@@ -223,6 +228,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	}
 	checkpointID := ""
 	checkpointPath := ""
+	var export *checkpointExport
 	if config.CheckpointDirectory != "" {
 		checkpointID = checkpointFingerprint(
 			config.TokenProcessorConfig, tokenProcessor.BlockSize(),
@@ -242,6 +248,34 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		if err := os.MkdirAll(config.CheckpointDirectory, 0o700); err != nil {
 			return nil, fmt.Errorf("create checkpoint directory: %w", err)
 		}
+		if config.ClusterSnapshotOutput != "" {
+			checkpointAbsolute, err := filepath.Abs(checkpointPath)
+			if err != nil {
+				return nil, fmt.Errorf("resolve checkpoint path: %w", err)
+			}
+			outputAbsolute, err := filepath.Abs(config.ClusterSnapshotOutput)
+			if err != nil {
+				return nil, fmt.Errorf("resolve cluster snapshot path: %w", err)
+			}
+			if outputAbsolute == checkpointAbsolute {
+				return nil, errors.New("clusterSnapshotOutput must differ from the checkpoint path")
+			}
+			if err := os.MkdirAll(filepath.Dir(outputAbsolute), 0o700); err != nil {
+				return nil, fmt.Errorf("create cluster snapshot directory: %w", err)
+			}
+			algorithm := config.TokenProcessorConfig.HashAlgorithm
+			if algorithm == "" {
+				algorithm = kvblock.HashAlgorithmCBORFNV
+			}
+			export = &checkpointExport{
+				path: config.ClusterSnapshotOutput,
+				meta: kvblock.ClusterPrefixSnapshotMetadata{
+					Cluster: config.ClusterSnapshotCluster, Model: config.ClusterSnapshotModel,
+					BlockSizeTokens: tokenProcessor.BlockSize(),
+					HashSeed:        config.TokenProcessorConfig.HashSeed, HashAlgorithm: algorithm,
+				},
+			}
+		}
 		restoredPath, restored, restoreErr := pool.RestoreLatestCheckpoint(
 			config.CheckpointDirectory, checkpointID,
 		)
@@ -254,7 +288,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	}
 	pool.Start(ctx)
 	if checkpointPath != "" {
-		go runCheckpointWriter(ctx, pool, checkpointPath, checkpointID, checkpointInterval)
+		go runCheckpointWriter(ctx, pool, checkpointPath, checkpointID, checkpointInterval, export)
 	}
 
 	subscribersManager := kvevents.NewSubscriberManager(pool)
@@ -289,7 +323,17 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 }
 
 func validateCheckpointConfig(config PluginConfig) (time.Duration, error) {
+	if config.ClusterSnapshotOutput == "" {
+		if config.ClusterSnapshotCluster != "" || config.ClusterSnapshotModel != "" {
+			return 0, errors.New("clusterSnapshotCluster and clusterSnapshotModel require clusterSnapshotOutput")
+		}
+	} else if config.ClusterSnapshotCluster == "" || config.ClusterSnapshotModel == "" {
+		return 0, errors.New("clusterSnapshotOutput requires clusterSnapshotCluster and clusterSnapshotModel")
+	}
 	if config.CheckpointDirectory == "" {
+		if config.ClusterSnapshotOutput != "" {
+			return 0, errors.New("clusterSnapshotOutput requires checkpointDirectory")
+		}
 		if config.CheckpointWriterID != "" {
 			return 0, errors.New("checkpointWriterID requires checkpointDirectory")
 		}
@@ -371,11 +415,17 @@ func checkpointFingerprint(
 	return hex.EncodeToString(digest[:])
 }
 
+type checkpointExport struct {
+	path string
+	meta kvblock.ClusterPrefixSnapshotMetadata
+}
+
 func runCheckpointWriter(
 	ctx context.Context,
 	pool *kvevents.Pool,
 	path, configurationFingerprint string,
 	interval time.Duration,
+	export *checkpointExport,
 ) {
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
@@ -397,6 +447,17 @@ func runCheckpointWriter(
 					"sources", result.Sources,
 					"duration", duration,
 					"queueDepth", pool.QueueDepth())
+				if export != nil {
+					snapshot, exportErr := kvevents.ExportClusterPrefixSnapshot(
+						path, export.path, configurationFingerprint, export.meta)
+					if exportErr != nil {
+						log.FromContext(ctx).Error(exportErr, "Failed to export cluster prefix snapshot",
+							"path", export.path)
+					} else {
+						log.FromContext(ctx).Info("Exported cluster prefix snapshot",
+							"path", export.path, "backends", snapshot.Backends, "keys", snapshot.Keys)
+					}
+				}
 			}
 			timer.Reset(interval)
 		}

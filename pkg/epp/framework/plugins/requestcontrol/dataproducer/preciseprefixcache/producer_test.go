@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -339,6 +341,13 @@ func TestCheckpointConfigRequiresReplayAndInMemoryIndex(t *testing.T) {
 	eventsConfig := kvevents.DefaultConfig()
 	_, err = validateCheckpointConfig(PluginConfig{CheckpointWriterID: "epp-a"})
 	require.ErrorContains(t, err, "checkpointWriterID requires checkpointDirectory")
+	_, err = validateCheckpointConfig(PluginConfig{ClusterSnapshotOutput: "/tmp/prefix.bin",
+		ClusterSnapshotCluster: "c1", ClusterSnapshotModel: "m1"})
+	require.ErrorContains(t, err, "clusterSnapshotOutput requires checkpointDirectory")
+	_, err = validateCheckpointConfig(PluginConfig{ClusterSnapshotCluster: "c1"})
+	require.ErrorContains(t, err, "require clusterSnapshotOutput")
+	_, err = validateCheckpointConfig(PluginConfig{ClusterSnapshotOutput: "/tmp/prefix.bin"})
+	require.ErrorContains(t, err, "requires clusterSnapshotCluster and clusterSnapshotModel")
 
 	_, err = validateCheckpointConfig(PluginConfig{
 		IndexerConfig: indexerConfig, KVEventsConfig: eventsConfig,
@@ -366,6 +375,36 @@ func TestCheckpointConfigRequiresReplayAndInMemoryIndex(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, 5*time.Minute, interval)
+}
+
+func TestCheckpointWriterExportsClusterPrefixSnapshot(t *testing.T) {
+	directory := t.TempDir()
+	output := filepath.Join(directory, "prefix.bin")
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	indexerConfig, err := kvcache.NewDefaultConfig()
+	require.NoError(t, err)
+	eventsConfig := kvevents.DefaultConfig()
+	eventsConfig.PodDiscoveryConfig.ReplaySocketPort = 5657
+	producer, err := New(ctx, "precise", PluginConfig{
+		TokenProcessorConfig: &kvblock.TokenProcessorConfig{BlockSizeTokens: 16, HashSeed: "test"},
+		IndexerConfig:        indexerConfig, KVEventsConfig: eventsConfig,
+		CheckpointDirectory: directory, CheckpointWriterID: "epp-a", CheckpointInterval: "20ms",
+		ClusterSnapshotOutput: output, ClusterSnapshotCluster: "c1", ClusterSnapshotModel: "m1",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { producer.kvEventsPool.Shutdown(context.Background()) })
+	require.NoError(t, producer.kvCacheIndexer.KVBlockIndex().Add(ctx, nil, []kvblock.BlockHash{101},
+		[]kvblock.PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}))
+	require.Eventually(t, func() bool {
+		data, err := os.ReadFile(output)
+		return err == nil && len(data) >= 8 && binary.LittleEndian.Uint32(data[:4]) == 2 &&
+			binary.LittleEndian.Uint64(data[len(data)-8:]) == 101
+	}, 3*time.Second, 10*time.Millisecond)
+	checkpoint, err := kvevents.CheckpointPathForWriter(directory, "epp-a")
+	require.NoError(t, err)
+	_, err = os.Stat(checkpoint)
+	require.NoError(t, err)
 }
 
 func TestCheckpointFingerprintIncludesEventSelection(t *testing.T) {

@@ -36,6 +36,9 @@ upstream. No-op otherwise.
 | `checkpointDirectory` | string | empty | Shared persistent directory for KV-event index checkpoints. |
 | `checkpointWriterID` | string | pod hostname | Identity used for this EPP's checkpoint file. |
 | `checkpointInterval` | duration | empty | Required interval between writes when `checkpointDirectory` is set. |
+| `clusterSnapshotOutput` | string | empty | Output path for the binary cluster prefix snapshot. Requires checkpointing. |
+| `clusterSnapshotCluster` | string | empty | Cluster name in the exported snapshot. |
+| `clusterSnapshotModel` | string | empty | Model name in the exported snapshot. |
 | `speculativeIndexing` | bool | `false` | Seed predicted entries on routing decisions. |
 | `speculativeTTL` | duration | `2s` | TTL for speculative entries. |
 
@@ -62,6 +65,14 @@ source order after the write. `maxQueueDepth` limits the combined waiting
 backlog to 65,536 messages by default. A full queue applies backpressure to the
 subscribers. Monitor `llm_d_epp_kv_cache_events_pool_queue_depth`. Checkpoint
 files are limited to 64 GiB.
+
+Configure the cluster snapshot fields on one EPP replica per cluster and model.
+After each successful checkpoint, that replica exports confirmed keys from the
+checkpoint and atomically replaces the output file. The export uses the block
+size, hash seed, and hash algorithm from `tokenProcessorConfig`. A failed export
+leaves the last valid output file in place. The output directory must be
+available to the EPP, and the snapshot file must be delivered to the
+federated EPP.
 
 Restore preserves cache membership but starts with new LRU recency. Replay
 validates the saved topic and payload at each source boundary. The wire protocol
