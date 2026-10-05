@@ -157,6 +157,25 @@ func TestFilter_TTFTPenaltyBreaksStickiness(t *testing.T) {
 	assert.Equal(t, 2, len(result), "TTFT penalty should break stickiness")
 }
 
+func TestFilter_TTFTPenaltyBreaksAbsoluteMatchStickiness(t *testing.T) {
+	p := newTestPlugin(Config{
+		AffinityThreshold:       0.80,
+		MinCachedTokensFraction: 0.5,
+		ExplorationProbability:  0,
+		MaxTTFTPenaltyMs:        100,
+		TTFTSource:              TTFTSourceLatencyPredictor,
+		PeakPrefillThroughput:   3200,
+	})
+	endpoints := []fwksched.Endpoint{
+		makeEndpointWithPrefixInfo("large-low-ratio", 79, 100, 32, 500, 0),
+		makeEndpointWithPrefixInfo("small-low-ratio", 20, 100, 16, 50, 0),
+	}
+
+	result := p.Filter(context.Background(), nil, endpoints)
+
+	assert.Equal(t, endpoints, result, "TTFT penalty should break absolute-match stickiness")
+}
+
 // With PeakPrefillThroughput=1000 tokens/sec, in-flight tokens map to TTFT as
 // tokens/1000*1000 = tokens ms: endpoint "a" -> 500ms, "b" -> 50ms.
 func TestFilter_ThroughputTTFTBreaksStickiness(t *testing.T) {
