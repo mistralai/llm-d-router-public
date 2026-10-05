@@ -112,10 +112,7 @@ func (m *InMemoryIndex) WriteSnapshot(dst io.Writer) error {
 		return err
 	}
 
-	engineMappingCount, err := m.countSnapshotEngineMappings()
-	if err != nil {
-		return err
-	}
+	engineMappingCount := m.countSnapshotEngineMappings()
 	if err := encoder.writeUint64(engineMappingCount); err != nil {
 		return err
 	}
@@ -237,7 +234,7 @@ func (m *InMemoryIndex) forEachSnapshotRequestLocked(
 // countSnapshotEngineMappings counts the engine keys whose mappings survive
 // the confirmed filter. It probes request keys instead of building filtered
 // lists, so the count prefix costs one pass of existence checks.
-func (m *InMemoryIndex) countSnapshotEngineMappings() (uint64, error) {
+func (m *InMemoryIndex) countSnapshotEngineMappings() uint64 {
 	count := uint64(0)
 	requestKeys := make([]BlockHash, 0)
 	scratch := make([]CompactEntryRef, 0, int(m.data.entryCap))
@@ -262,7 +259,7 @@ func (m *InMemoryIndex) countSnapshotEngineMappings() (uint64, error) {
 			count++
 		}
 	}
-	return count, nil
+	return count
 }
 
 func (m *InMemoryIndex) forEachSnapshotEngineMappingLocked(
