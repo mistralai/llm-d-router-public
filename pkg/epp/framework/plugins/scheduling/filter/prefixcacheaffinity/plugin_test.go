@@ -108,40 +108,43 @@ func TestFilter_NarrowToSticky(t *testing.T) {
 	assert.Equal(t, 2, len(result), "should narrow to sticky endpoints")
 }
 
-func TestFilter_MinCachedTokensRequiresRatioAndMinimum(t *testing.T) {
+func TestFilter_CacheInertiaUsesRatioOrAbsoluteMatch(t *testing.T) {
 	p := newTestPlugin(Config{
-		AffinityThreshold:      0.80,
-		MinCachedTokens:        1600,
-		ExplorationProbability: 0,
-		MaxTTFTPenaltyMs:       0,
+		AffinityThreshold:       0.80,
+		MinCachedTokensFraction: 0.5,
+		PeakPrefillThroughput:   3200,
+		ExplorationProbability:  0,
+		MaxTTFTPenaltyMs:        0,
 	})
 	endpoints := []fwksched.Endpoint{
 		makeEndpointWithPrefixInfo("high-ratio-small", 90, 100, 16, 0, 0),
 		makeEndpointWithPrefixInfo("large-low-ratio", 79, 100, 32, 0, 0),
+		makeEndpointWithPrefixInfo("small-low-ratio", 20, 100, 16, 0, 0),
 	}
 
 	result := p.Filter(context.Background(), nil, endpoints)
 
-	assert.Equal(t, endpoints, result, "both affinity conditions must pass")
+	assert.Len(t, result, 2)
+	assert.Equal(t, "high-ratio-small", result[0].GetMetadata().ID.Name)
+	assert.Equal(t, "large-low-ratio", result[1].GetMetadata().ID.Name)
 }
 
-func TestFilter_MinCachedTokensNarrowsToLargeHighRatioMatch(t *testing.T) {
+func TestFilter_CacheInertiaFallsThroughForSmallLowRatioMatches(t *testing.T) {
 	p := newTestPlugin(Config{
-		AffinityThreshold:      0.80,
-		MinCachedTokens:        1600,
-		ExplorationProbability: 0,
-		MaxTTFTPenaltyMs:       0,
+		AffinityThreshold:       0.80,
+		MinCachedTokensFraction: 0.5,
+		PeakPrefillThroughput:   3200,
+		ExplorationProbability:  0,
+		MaxTTFTPenaltyMs:        0,
 	})
 	endpoints := []fwksched.Endpoint{
-		makeEndpointWithPrefixInfo("high-ratio-small", 90, 100, 16, 0, 0),
-		makeEndpointWithPrefixInfo("large-low-ratio", 79, 100, 32, 0, 0),
-		makeEndpointWithPrefixInfo("large-high-ratio", 90, 100, 32, 0, 0),
+		makeEndpointWithPrefixInfo("small-low-ratio-a", 20, 100, 16, 0, 0),
+		makeEndpointWithPrefixInfo("small-low-ratio-b", 40, 100, 16, 0, 0),
 	}
 
 	result := p.Filter(context.Background(), nil, endpoints)
 
-	assert.Len(t, result, 1)
-	assert.Equal(t, "large-high-ratio", result[0].GetMetadata().ID.Name)
+	assert.Equal(t, endpoints, result)
 }
 
 func TestFilter_TTFTPenaltyBreaksStickiness(t *testing.T) {
@@ -239,14 +242,14 @@ func TestFactory_PartialConfigPreservesDefaults(t *testing.T) {
 	assert.Equal(t, 0.95, p.config.AffinityThreshold)
 	assert.Equal(t, DefaultConfig.ExplorationProbability, p.config.ExplorationProbability)
 	assert.Equal(t, DefaultConfig.MaxTTFTPenaltyMs, p.config.MaxTTFTPenaltyMs)
-	assert.Equal(t, DefaultConfig.MinCachedTokens, p.config.MinCachedTokens)
+	assert.Equal(t, DefaultConfig.MinCachedTokensFraction, p.config.MinCachedTokensFraction)
 
-	// Setting only minCachedTokens should preserve defaults for other params.
-	plugin, err = Factory("test", fwkplugin.StrictDecoder([]byte(`{"minCachedTokens": 16384}`)), nil)
+	// Setting only minCachedTokensFraction should preserve defaults for other params.
+	plugin, err = Factory("test", fwkplugin.StrictDecoder([]byte(`{"minCachedTokensFraction": 0.5}`)), nil)
 	assert.NoError(t, err)
 	p = plugin.(*Plugin)
 	assert.Equal(t, DefaultConfig.AffinityThreshold, p.config.AffinityThreshold)
-	assert.Equal(t, int64(16384), p.config.MinCachedTokens)
+	assert.Equal(t, 0.5, p.config.MinCachedTokensFraction)
 	assert.Equal(t, DefaultConfig.ExplorationProbability, p.config.ExplorationProbability)
 	assert.Equal(t, DefaultConfig.MaxTTFTPenaltyMs, p.config.MaxTTFTPenaltyMs)
 
@@ -291,10 +294,18 @@ func TestFactory_InvalidAffinityThreshold(t *testing.T) {
 	}
 }
 
-func TestFactory_InvalidMinCachedTokens(t *testing.T) {
-	_, err := Factory("test", fwkplugin.StrictDecoder([]byte(`{"minCachedTokens": -1}`)), nil)
+func TestFactory_InvalidMinCachedTokensFraction(t *testing.T) {
+	for _, value := range []string{"-0.1", "1.1"} {
+		_, err := Factory("test", fwkplugin.StrictDecoder([]byte(`{"minCachedTokensFraction":`+value+`}`)), nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "minCachedTokensFraction must be in [0, 1]")
+	}
+}
+
+func TestFactory_CacheInertiaRequiresPeakPrefillThroughput(t *testing.T) {
+	_, err := Factory("test", fwkplugin.StrictDecoder([]byte(`{"minCachedTokensFraction":0.5,"peakPrefillThroughput":0,"maxTTFTPenaltyMs":0}`)), nil)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "minCachedTokens must be >= 0")
+	assert.Contains(t, err.Error(), "peakPrefillThroughput must be > 0 when minCachedTokensFraction is enabled")
 }
 
 func TestFactory_InvalidExplorationProbability(t *testing.T) {

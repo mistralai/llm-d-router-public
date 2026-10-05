@@ -67,9 +67,10 @@ type Config struct {
 	// score >= this value are considered "sticky" (prompt is cached). Default: 0.80.
 	AffinityThreshold float64 `json:"affinityThreshold,omitempty"`
 
-	// MinCachedTokens is the minimum absolute prefix cache match required for
-	// an endpoint to be considered sticky. Default: 0.
-	MinCachedTokens int64 `json:"minCachedTokens,omitempty"`
+	// MinCachedTokensFraction is the fraction of peak prefill throughput that
+	// an absolute prefix cache match must reach to make an endpoint sticky.
+	// Set to 0 to disable this condition. Default: 0.
+	MinCachedTokensFraction float64 `json:"minCachedTokensFraction,omitempty"`
 
 	// ExplorationProbability is the probability of skipping the gate entirely,
 	// keeping all endpoints for exploration. Range: [0, 1]. Default: 0.
@@ -99,11 +100,11 @@ type Config struct {
 }
 
 var DefaultConfig = Config{
-	AffinityThreshold:      0.80,
-	MinCachedTokens:        0,
-	ExplorationProbability: 0,
-	MaxTTFTPenaltyMs:       18000,
-	TTFTSource:             TTFTSourcePrefillThroughput,
+	AffinityThreshold:       0.80,
+	MinCachedTokensFraction: 0,
+	ExplorationProbability:  0,
+	MaxTTFTPenaltyMs:        18000,
+	TTFTSource:              TTFTSourcePrefillThroughput,
 
 	// Calibrated for Qwen 32B on 2x H100 80GB (TP=2), vLLM 0.19; see README.
 	PeakPrefillThroughput: 15928,
@@ -145,8 +146,8 @@ func (c *Config) validate() error {
 	if c.AffinityThreshold < 0 || c.AffinityThreshold > 1.0 {
 		return fmt.Errorf("affinityThreshold must be in [0, 1], got %f", c.AffinityThreshold)
 	}
-	if c.MinCachedTokens < 0 {
-		return fmt.Errorf("minCachedTokens must be >= 0, got %d", c.MinCachedTokens)
+	if c.MinCachedTokensFraction < 0 || c.MinCachedTokensFraction > 1.0 {
+		return fmt.Errorf("minCachedTokensFraction must be in [0, 1], got %f", c.MinCachedTokensFraction)
 	}
 	if c.ExplorationProbability < 0 || c.ExplorationProbability > 1.0 {
 		return fmt.Errorf("explorationProbability must be in [0, 1], got %f", c.ExplorationProbability)
@@ -156,6 +157,9 @@ func (c *Config) validate() error {
 	}
 	if c.PeakPrefillThroughput < 0 {
 		return fmt.Errorf("peakPrefillThroughput must be >= 0, got %f", c.PeakPrefillThroughput)
+	}
+	if c.MinCachedTokensFraction > 0 && c.PeakPrefillThroughput == 0 {
+		return errors.New("peakPrefillThroughput must be > 0 when minCachedTokensFraction is enabled")
 	}
 	switch c.TTFTSource {
 	case TTFTSourceLatencyPredictor, TTFTSourcePrefillThroughput:
@@ -210,7 +214,8 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 	if rand.Float64() < p.config.ExplorationProbability {
 		logger.V(logutil.DEBUG).Info("PrefixCacheAffinityFilter: exploration skip, keeping all",
 			"affinityThreshold", p.config.AffinityThreshold,
-			"minCachedTokens", p.config.MinCachedTokens, "total", len(endpoints))
+			"minCachedTokensFraction", p.config.MinCachedTokensFraction,
+			"total", len(endpoints))
 		recordDecision(p.typedName.Name, outcomeExploration)
 		span.SetAttributes(semconv.LLMDEPPFilterDecision(outcomeExploration))
 		return endpoints
@@ -218,9 +223,13 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 
 	// Find sticky and non-sticky endpoints.
 	var sticky, nonSticky []fwksched.Endpoint
+	minCachedTokens := p.config.PeakPrefillThroughput * p.config.MinCachedTokensFraction
 	for _, ep := range endpoints {
 		matchRatio, cachedTokens := p.prefixCacheMatch(ep)
-		if matchRatio >= p.config.AffinityThreshold && cachedTokens >= p.config.MinCachedTokens {
+		ratioSticky := matchRatio >= p.config.AffinityThreshold
+		absoluteMatchSticky := p.config.MinCachedTokensFraction > 0 &&
+			float64(cachedTokens) >= minCachedTokens
+		if ratioSticky || absoluteMatchSticky {
 			sticky = append(sticky, ep)
 		} else {
 			nonSticky = append(nonSticky, ep)
@@ -233,7 +242,8 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 	if len(sticky) == 0 {
 		logger.V(logutil.DEBUG).Info("PrefixCacheAffinityFilter: no sticky endpoints",
 			"affinityThreshold", p.config.AffinityThreshold,
-			"minCachedTokens", p.config.MinCachedTokens, "total", len(endpoints))
+			"minCachedTokensFraction", p.config.MinCachedTokensFraction,
+			"minCachedTokens", minCachedTokens, "total", len(endpoints))
 		recordDecision(p.typedName.Name, outcomeNoMatch)
 		span.SetAttributes(semconv.LLMDEPPFilterDecision(outcomeNoMatch))
 		return endpoints
@@ -257,7 +267,8 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 
 	logger.V(logutil.DEBUG).Info("PrefixCacheAffinityFilter: narrowed to sticky",
 		"affinityThreshold", p.config.AffinityThreshold,
-		"minCachedTokens", p.config.MinCachedTokens,
+		"minCachedTokensFraction", p.config.MinCachedTokensFraction,
+		"minCachedTokens", minCachedTokens,
 		"sticky", len(sticky), "total", len(endpoints))
 	recordDecision(p.typedName.Name, outcomeSticky)
 	span.SetAttributes(semconv.LLMDEPPFilterDecision(outcomeSticky))
