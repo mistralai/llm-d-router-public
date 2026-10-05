@@ -34,12 +34,21 @@ import (
 // makeEndpoint creates a test endpoint with the given prefix cache match ratio
 // (prefixMatch out of 100 total blocks), predicted TTFT, and in-flight tokens.
 func makeEndpoint(name string, prefixMatch int, ttft float64, tokens int64) fwksched.Endpoint {
+	return makeEndpointWithPrefixInfo(name, prefixMatch, 100, 16, ttft, tokens)
+}
+
+func makeEndpointWithPrefixInfo(
+	name string,
+	prefixMatch, totalBlocks, blockSizeTokens int,
+	ttft float64,
+	tokens int64,
+) fwksched.Endpoint {
 	meta := &fwkdl.EndpointMetadata{
 		ID: types.NamespacedName{Name: name, Namespace: "default"},
 	}
 	ep := fwksched.NewEndpoint(meta, &fwkdl.Metrics{}, fwkdl.NewAttributes())
 	if prefixMatch >= 0 {
-		ep.Put(attrprefix.PrefixCacheMatchInfoDataKey, attrprefix.NewPrefixCacheMatchInfo(prefixMatch, 100, 16))
+		ep.Put(attrprefix.PrefixCacheMatchInfoDataKey, attrprefix.NewPrefixCacheMatchInfo(prefixMatch, totalBlocks, blockSizeTokens))
 	}
 	if ttft >= 0 {
 		ep.Put(attrlatency.LatencyPredictionInfoDataKey, attrlatency.NewLatencyPredictionInfo(true, true, 0, 0, ttft, 0, 0))
@@ -99,6 +108,45 @@ func TestFilter_NarrowToSticky(t *testing.T) {
 	assert.Equal(t, 2, len(result), "should narrow to sticky endpoints")
 }
 
+func TestFilter_CacheInertiaUsesRatioOrAbsoluteMatch(t *testing.T) {
+	p := newTestPlugin(Config{
+		AffinityThreshold:       0.80,
+		MinCachedTokensFraction: 0.5,
+		PeakPrefillThroughput:   3200,
+		ExplorationProbability:  0,
+		MaxTTFTPenaltyMs:        0,
+	})
+	endpoints := []fwksched.Endpoint{
+		makeEndpointWithPrefixInfo("high-ratio-small", 90, 100, 16, 0, 0),
+		makeEndpointWithPrefixInfo("large-low-ratio", 79, 100, 32, 0, 0),
+		makeEndpointWithPrefixInfo("small-low-ratio", 20, 100, 16, 0, 0),
+	}
+
+	result := p.Filter(context.Background(), nil, endpoints)
+
+	assert.Len(t, result, 2)
+	assert.Equal(t, "high-ratio-small", result[0].GetMetadata().ID.Name)
+	assert.Equal(t, "large-low-ratio", result[1].GetMetadata().ID.Name)
+}
+
+func TestFilter_CacheInertiaFallsThroughForSmallLowRatioMatches(t *testing.T) {
+	p := newTestPlugin(Config{
+		AffinityThreshold:       0.80,
+		MinCachedTokensFraction: 0.5,
+		PeakPrefillThroughput:   3200,
+		ExplorationProbability:  0,
+		MaxTTFTPenaltyMs:        0,
+	})
+	endpoints := []fwksched.Endpoint{
+		makeEndpointWithPrefixInfo("small-low-ratio-a", 20, 100, 16, 0, 0),
+		makeEndpointWithPrefixInfo("small-low-ratio-b", 40, 100, 16, 0, 0),
+	}
+
+	result := p.Filter(context.Background(), nil, endpoints)
+
+	assert.Equal(t, endpoints, result)
+}
+
 func TestFilter_TTFTPenaltyBreaksStickiness(t *testing.T) {
 	p := newTestPlugin(Config{AffinityThreshold: 0.80, ExplorationProbability: 0, MaxTTFTPenaltyMs: 100, TTFTSource: TTFTSourceLatencyPredictor})
 	endpoints := []fwksched.Endpoint{
@@ -107,6 +155,25 @@ func TestFilter_TTFTPenaltyBreaksStickiness(t *testing.T) {
 	}
 	result := p.Filter(context.Background(), nil, endpoints)
 	assert.Equal(t, 2, len(result), "TTFT penalty should break stickiness")
+}
+
+func TestFilter_TTFTPenaltyBreaksAbsoluteMatchStickiness(t *testing.T) {
+	p := newTestPlugin(Config{
+		AffinityThreshold:       0.80,
+		MinCachedTokensFraction: 0.5,
+		ExplorationProbability:  0,
+		MaxTTFTPenaltyMs:        100,
+		TTFTSource:              TTFTSourceLatencyPredictor,
+		PeakPrefillThroughput:   3200,
+	})
+	endpoints := []fwksched.Endpoint{
+		makeEndpointWithPrefixInfo("large-low-ratio", 79, 100, 32, 500, 0),
+		makeEndpointWithPrefixInfo("small-low-ratio", 20, 100, 16, 50, 0),
+	}
+
+	result := p.Filter(context.Background(), nil, endpoints)
+
+	assert.Equal(t, endpoints, result, "TTFT penalty should break absolute-match stickiness")
 }
 
 // With PeakPrefillThroughput=1000 tokens/sec, in-flight tokens map to TTFT as
@@ -194,6 +261,16 @@ func TestFactory_PartialConfigPreservesDefaults(t *testing.T) {
 	assert.Equal(t, 0.95, p.config.AffinityThreshold)
 	assert.Equal(t, DefaultConfig.ExplorationProbability, p.config.ExplorationProbability)
 	assert.Equal(t, DefaultConfig.MaxTTFTPenaltyMs, p.config.MaxTTFTPenaltyMs)
+	assert.Equal(t, DefaultConfig.MinCachedTokensFraction, p.config.MinCachedTokensFraction)
+
+	// Setting only minCachedTokensFraction should preserve defaults for other params.
+	plugin, err = Factory("test", fwkplugin.StrictDecoder([]byte(`{"minCachedTokensFraction": 0.5}`)), nil)
+	assert.NoError(t, err)
+	p = plugin.(*Plugin)
+	assert.Equal(t, DefaultConfig.AffinityThreshold, p.config.AffinityThreshold)
+	assert.Equal(t, 0.5, p.config.MinCachedTokensFraction)
+	assert.Equal(t, DefaultConfig.ExplorationProbability, p.config.ExplorationProbability)
+	assert.Equal(t, DefaultConfig.MaxTTFTPenaltyMs, p.config.MaxTTFTPenaltyMs)
 
 	// Setting only explorationProbability should preserve defaults for other params.
 	plugin, err = Factory("test", fwkplugin.StrictDecoder([]byte(`{"explorationProbability": 0.05}`)), nil)
@@ -234,6 +311,20 @@ func TestFactory_InvalidAffinityThreshold(t *testing.T) {
 			assert.Contains(t, err.Error(), "affinityThreshold must be in [0, 1]")
 		})
 	}
+}
+
+func TestFactory_InvalidMinCachedTokensFraction(t *testing.T) {
+	for _, value := range []string{"-0.1", "1.1"} {
+		_, err := Factory("test", fwkplugin.StrictDecoder([]byte(`{"minCachedTokensFraction":`+value+`}`)), nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "minCachedTokensFraction must be in [0, 1]")
+	}
+}
+
+func TestFactory_CacheInertiaRequiresPeakPrefillThroughput(t *testing.T) {
+	_, err := Factory("test", fwkplugin.StrictDecoder([]byte(`{"minCachedTokensFraction":0.5,"peakPrefillThroughput":0,"maxTTFTPenaltyMs":0}`)), nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "peakPrefillThroughput must be > 0 when minCachedTokensFraction is enabled")
 }
 
 func TestFactory_InvalidExplorationProbability(t *testing.T) {

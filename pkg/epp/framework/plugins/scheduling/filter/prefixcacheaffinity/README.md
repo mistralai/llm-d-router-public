@@ -44,17 +44,19 @@ endpoints over time, preventing permanent stickiness to a fixed subset.
 ## Overview
 
 Probabilistic filter that narrows candidates to "sticky" endpoints. An endpoint is sticky
-when it has a high prefix cache score for the current request, meaning the request's prompt
-(or most of it) is already cached on that endpoint from a previous request with the same or
-similar prompt. Routing to a sticky endpoint avoids redundant prefill computation, reducing
-TTFT.
+when either its prefix cache score reaches `affinityThreshold` or its absolute cached-token
+match reaches `peakPrefillThroughput * minCachedTokensFraction`. This keeps high-ratio cache
+hits sticky regardless of request size, while also preserving large absolute cache hits that
+fall below the ratio threshold. Routing to a sticky endpoint avoids redundant prefill
+computation, reducing TTFT.
 
 Can be instantiated multiple times with different thresholds (e.g., 0.99 for global gate,
 0.80 for within-tier gate).
 
 ## Behavior
 
-- Keep only endpoints with prefix cache score >= `affinityThreshold`
+- Keep only endpoints where prefix cache score >= `affinityThreshold` or cached prompt
+  tokens >= `peakPrefillThroughput * minCachedTokensFraction`
 - If no endpoints pass, all are kept (no-op)
 - With probability `explorationProbability` (default 0, disabled), skip the gate entirely for exploration
 - TTFT load gate: if best sticky endpoint's TTFT exceeds best non-sticky by more than
@@ -112,6 +114,7 @@ documents the strategy and its calibration.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `affinityThreshold` | `float64` | No | `0.80` | Prefix cache score threshold for stickiness |
+| `minCachedTokensFraction` | `float64` | No | `0` | Fraction of `peakPrefillThroughput` used as the absolute cached-token threshold; 0 disables this condition |
 | `explorationProbability` | `float64` | No | `0` | Probability of skipping the gate |
 | `maxTTFTPenaltyMs` | `float64` | No | `18000` | Max TTFT penalty (ms) before breaking stickiness. 0 = always stick |
 | `ttftSource` | `string` | No | `prefillThroughput` | TTFT source for the load gate: `prefillThroughput` or `latencyPredictor` |
@@ -135,7 +138,8 @@ plugins:
   - type: prefix-cache-affinity-filter
     name: prefix-affinity
     parameters:
-      affinityThreshold: 0.80
+      affinityThreshold: 0.85
+      minCachedTokensFraction: 0.5
       explorationProbability: 0.01
       maxTTFTPenaltyMs: 5000
       ttftSource: prefillThroughput
