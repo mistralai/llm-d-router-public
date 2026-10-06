@@ -78,6 +78,10 @@ func GetBlockHashesWithPromptTokens(ctx context.Context, request *scheduling.Inf
 		return nil, nil
 	}
 
+	if request.Body.SkipPrefixCacheMatching {
+		return nil, nil
+	}
+
 	tp := request.Body.TokenizedRequest
 	if tp == nil || tp.TokenCount() == 0 {
 		loggerDebug.Info("TokenizedRequest is empty, skipping hashing")
