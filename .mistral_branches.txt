@@ -18,7 +18,9 @@
 # de2e3e11fc038f53d9a1aa8cdc51a1aa07917501. Branches are replayed in this order.
 
 nzt/v1.0.2-pinned-reconstruction                      # adds pinned-base rebuilds on top of lfm/v1.0.2-rebased-upstream-build-tooling
-nzt/v1.0.2-vllm-typed-decoder                         # adds compact KV storage and typed decoding on top of lfm/v1.0.2-rebased-upstream-dp-kvevents
+lfm/v1.0.2-rebased-upstream-dp-kvevents               # shared-port multi-DP routing with ordered KV-event cleanup
 lfm/v1.0.2-rebased-upstream-objective-key             # resolve inference objectives after request-header plugins
 lfm/v1.0.2-rebased-upstream-coordinator-revision      # revision forwarding across coordinator phases
 lfm/v1.0.2-rebased-upstream-rawbody-release           # release request RawBody after Envoy forwarding
+
+nzt/multimodal-accounting                           # preserve multimodal input load and disable unsafe cache matches (https://github.com/mistralai/llm-d-router-public/pull/39)
