@@ -105,6 +105,12 @@ func TestInFlightLoadProducer_PrefixMatchInfoProducerName(t *testing.T) {
 	hit := newStubSchedulingEndpoint("ep-hit")
 	hit.Put(preciseKey, attrprefix.NewPrefixCacheMatchInfo(1, 2, 4))
 	require.Equal(t, int64(4), producer.estimateRequestTokens(hit, nil, 5))
+	count := int64(5)
+	countOnly := makeTokenRequest("count-only-cache", 0)
+	countOnly.Body.InputTokenCountHint = &count
+	require.Equal(t, int64(4), producer.estimateRequestTokens(hit, countOnly, count))
+	countOnly.Body.SkipPrefixCacheMatching = true
+	require.Equal(t, count, producer.estimateRequestTokens(hit, countOnly, count))
 
 	// Data under the approx (default) key is ignored, so it falls back to inputTokens.
 	miss := newStubSchedulingEndpoint("ep-miss")
@@ -1512,4 +1518,40 @@ func TestInFlightLoadProducer_WarnsOnceOnMissingOutlenBucket(t *testing.T) {
 	require.NoError(t, producer.PreRequest(ctx, makeTokenRequest("w3", 4), res))
 
 	require.Equal(t, 1, warnings, "missing-outlen-bucket warning must fire exactly once")
+}
+
+func TestCountOnlyInputLifecycle(t *testing.T) {
+	for _, estimatedOutput := range []bool{false, true} {
+		for _, startOfStream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("output=%t/start=%t", estimatedOutput, startOfStream), func(t *testing.T) {
+				producer := newTestProducer(t)
+				producer.addEstimatedOutputTokens = estimatedOutput
+				req := makeTokenRequest("count-only", 0)
+				count := int64(10000)
+				req.Body.InputTokenCountHint = &count
+				endpoint := "count-only-endpoint"
+				id := fullEndpointName(endpoint)
+				res := makeSchedulingResult(endpoint)
+				ctx := context.Background()
+				require.NoError(t, producer.PreRequest(ctx, req, res))
+				expected := count
+				if estimatedOutput {
+					expected += UnknownOutputTokens
+				}
+				require.Equal(t, expected, producer.tokenTracker.get(id))
+				require.Equal(t, int64(1), producer.requestTracker.get(id))
+				req.SchedulingResult = res
+				if startOfStream {
+					producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: true}, nil)
+					if !estimatedOutput {
+						require.Zero(t, producer.tokenTracker.get(id))
+					}
+					require.Equal(t, int64(1), producer.requestTracker.get(id))
+				}
+				producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
+				require.Zero(t, producer.tokenTracker.get(id))
+				require.Zero(t, producer.requestTracker.get(id))
+			})
+		}
+	}
 }
