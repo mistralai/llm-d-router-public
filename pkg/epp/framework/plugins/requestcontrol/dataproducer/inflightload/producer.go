@@ -507,7 +507,11 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 }
 
 func (p *InFlightLoadProducer) estimateRequestTokens(endpoint fwksched.Endpoint, request *fwksched.InferenceRequest, inputTokens int64) int64 {
-	adjustedInput := uncachedInputTokens(endpoint, inputTokens, p.prefixMatchInfoDK)
+	adjustedInput := inputTokens
+	// Requests without cache identity must not receive a prefix discount.
+	if request == nil || request.Body == nil || !request.Body.SkipPrefixCacheMatching {
+		adjustedInput = uncachedInputTokens(endpoint, inputTokens, p.prefixMatchInfoDK)
+	}
 
 	// In P/D disaggregation the load is role-specific:
 	//   prefill-only endpoint -> input tokens (it processes the prompt, not the output)

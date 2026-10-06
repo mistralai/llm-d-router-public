@@ -43,7 +43,7 @@ type kvCacheIndexer interface {
 func computeBlockKeys(ctx context.Context, idx kvCacheIndexer,
 	request *scheduling.InferenceRequest, blockSizeTokens int,
 ) ([][]kvblock.BlockHash, []int, error) {
-	if request == nil || request.Body == nil {
+	if request == nil || request.Body == nil || request.Body.SkipPrefixCacheMatching {
 		return nil, nil, nil
 	}
 	tp := request.Body.TokenizedRequest

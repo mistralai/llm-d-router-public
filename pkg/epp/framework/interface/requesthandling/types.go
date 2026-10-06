@@ -127,6 +127,13 @@ type InferenceRequestBody struct {
 	// It is nil when the request was not already tokenized.
 	TokenizedRequest *TokenizedRequest `json:"-"`
 
+	// InputTokenCountHint supplies an input count independently of cache token data.
+	// Parsers must supply a non-negative count.
+	InputTokenCountHint *int64 `json:"-"`
+
+	// SkipPrefixCacheMatching prevents hashes and discounts when image identity is unavailable.
+	SkipPrefixCacheMatching bool `json:"-"`
+
 	// Stream indicates whether the request specifies a streaming response (e.g., via a stream field).
 	// This typically implies the model server's response will be streamed.
 	Stream bool `json:"-"`
