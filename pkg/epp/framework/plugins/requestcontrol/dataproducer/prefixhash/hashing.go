@@ -64,6 +64,10 @@ func GetBlockHashes(ctx context.Context, request *scheduling.InferenceRequest, b
 		return nil
 	}
 
+	if request.Body.SkipPrefixCacheMatching {
+		return nil
+	}
+
 	tp := request.Body.TokenizedRequest
 	if tp == nil || tp.TokenCount() == 0 {
 		loggerDebug.Info("TokenizedRequest is empty, skipping hashing")

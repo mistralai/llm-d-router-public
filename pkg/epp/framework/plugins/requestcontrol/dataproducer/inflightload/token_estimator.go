@@ -63,11 +63,13 @@ func NewSimpleTokenEstimator(maxOutput *int64) TokenEstimator {
 	return &SimpleTokenEstimator{MaxEstimatedOutputTokens: maxOutput}
 }
 
-// EstimateInput returns the input token count read from the tokenized prompt,
-// or 0 when no tokenization is available.
+// EstimateInput uses the parser count when cache token data is unavailable.
 func (e *SimpleTokenEstimator) EstimateInput(request *fwksched.InferenceRequest) int64 {
-	if request == nil || request.Body == nil || request.Body.TokenizedRequest == nil {
+	if request == nil || request.Body == nil {
 		return 0
+	}
+	if request.Body.InputTokenCountHint != nil {
+		return max(int64(0), *request.Body.InputTokenCountHint)
 	}
 	return int64(request.Body.TokenizedRequest.TokenCount())
 }
