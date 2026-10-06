@@ -23,4 +23,4 @@ lfm/v1.0.2-rebased-upstream-objective-key             # resolve inference object
 lfm/v1.0.2-rebased-upstream-coordinator-revision      # revision forwarding across coordinator phases
 lfm/v1.0.2-rebased-upstream-rawbody-release           # release request RawBody after Envoy forwarding
 
-nzt/multimodal-accounting                           # preserve multimodal input load and disable unsafe cache matches (https://github.com/mistralai/llm-d-router-public/pull/39)
+lfm/multimodal-streaming-token-accounting            # preserve multimodal accounting and release prompt load at stream start (https://github.com/mistralai/llm-d-router-public/pull/39, https://github.com/mistralai/llm-d-router-public/pull/41)
