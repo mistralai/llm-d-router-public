@@ -947,3 +947,47 @@ func TestDumpStateCaps(t *testing.T) {
 	assert.Len(t, state.SpeculativeEntries, maxDumpSpeculativeEntries)
 	assert.Equal(t, maxDumpSpeculativeEntries+7, state.TotalSpeculativeEntries)
 }
+
+func TestProduce_CountOnlyInput_NoOp(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			t.Fatalf("ComputeBlockKeysFromTokens must not be called for empty TokenIDs")
+			return nil, nil
+		},
+		index: &fakeKVBlockIndex{},
+	}
+	p := newProducerWithIndexer(ctx, idx)
+
+	count := int64(10000)
+	req := &scheduling.InferenceRequest{
+		RequestID:   "req-3",
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			InputTokenCountHint: &count,
+			TokenizedRequest:    &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: []uint32{}}}},
+		},
+	}
+	require.NoError(t, p.Produce(ctx, req, testEndpoints))
+}
+
+func TestProduce_SkipPrefixCacheMatching(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(_ context.Context, _ []uint32, _ string, _ []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			t.Fatal("Cache hashing must not run when prefix matching is disabled")
+			return nil, nil
+		},
+		index: &fakeKVBlockIndex{},
+	}
+	p := newProducerWithIndexer(ctx, idx)
+	req := &scheduling.InferenceRequest{
+		RequestID:   "skip-cache",
+		TargetModel: "test-model",
+		Body: &fwkrh.InferenceRequestBody{
+			SkipPrefixCacheMatching: true,
+			TokenizedRequest:        &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: []uint32{1, 2, 3, 4}}}},
+		},
+	}
+	require.NoError(t, p.Produce(ctx, req, testEndpoints))
+}

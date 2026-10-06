@@ -168,3 +168,17 @@ func TestEstimateOutputFromRequest_OperatorCap(t *testing.T) {
 		require.Equal(t, int64(150), e.EstimateOutputFromRequest(req))
 	})
 }
+
+func TestInputTokenCountHint(t *testing.T) {
+	estimator := NewSimpleTokenEstimator(nil)
+	request := tokenizedRequest(0)
+	request.Body.InputTokenCountHint = ptr.To(int64(10000))
+	require.Equal(t, int64(10000), estimator.EstimateInput(request))
+	require.Empty(t, request.Body.TokenizedRequest.Prompts[0].TokenIDs)
+	request.Body.TokenizedRequest = nil
+	require.Equal(t, int64(10000), estimator.EstimateInput(request))
+	request.Body.InputTokenCountHint = ptr.To(int64(0))
+	require.Zero(t, estimator.EstimateInput(request))
+	request.Body.InputTokenCountHint = ptr.To(int64(-1))
+	require.Zero(t, estimator.EstimateInput(request))
+}

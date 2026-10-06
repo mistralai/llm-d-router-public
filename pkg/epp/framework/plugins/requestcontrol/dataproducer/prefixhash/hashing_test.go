@@ -281,3 +281,14 @@ func TestKVCacheBlock_Hash(t *testing.T) {
 		})
 	}
 }
+
+func TestGetBlockHashes_CountHintAndCacheEligibility(t *testing.T) {
+	count := int64(10000)
+	req := &fwksched.InferenceRequest{Body: &fwkrh.InferenceRequestBody{
+		InputTokenCountHint: &count,
+		TokenizedRequest:    &fwkrh.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: []uint32{1, 2, 3, 4}}}},
+	}}
+	assert.NotEmpty(t, GetBlockHashes(context.Background(), req, 4, testMaxPrefixBlocks))
+	req.Body.SkipPrefixCacheMatching = true
+	assert.Empty(t, GetBlockHashes(context.Background(), req, 4, testMaxPrefixBlocks))
+}
