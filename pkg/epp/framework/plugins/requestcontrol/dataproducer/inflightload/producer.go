@@ -161,7 +161,8 @@ type InFlightLoadProducer struct {
 // can race safely: whichever swaps first does the decrement, the other
 // sees 0 and is a no-op.
 type addedTokensEntry struct {
-	tokens atomic.Int64
+	promptTokens atomic.Int64
+	outputTokens atomic.Int64
 	// tokenCounter and requestCounter point at the exact tracker counter instances this request
 	// incremented in PreRequest. A release decrements these instances directly, so it always lands
 	// on the counter that received the increment. If the endpoint flaps (delete + recreate under the
@@ -196,13 +197,14 @@ func (e *addedTokensEntry) Clone() fwkplugin.StateData {
 		fairnessID:     e.fairnessID,
 		priority:       e.priority,
 	}
-	clone.tokens.Store(e.tokens.Load())
+	clone.promptTokens.Store(e.promptTokens.Load())
+	clone.outputTokens.Store(e.outputTokens.Load())
 	clone.requests.Store(e.requests.Load())
 	return clone
 }
 
 func (e *addedTokensEntry) OnEvicted(_ string, _ fwkplugin.StateKey) {
-	if t := e.tokens.Swap(0); t != 0 {
+	if t := e.promptTokens.Swap(0) + e.outputTokens.Swap(0); t != 0 {
 		decrementClamped(e.tokenCounter, t)
 		inflightTokens.WithLabelValues(e.endpointName, e.namespace, e.producerName, e.fairnessID, e.priority).Sub(float64(t))
 	}
@@ -393,9 +395,9 @@ func (p *InFlightLoadProducer) Produce(_ context.Context, request *fwksched.Infe
 			continue
 		}
 		if request != nil {
-			tokens := p.estimateRequestTokens(e, request, inputTokens)
+			promptTokens, outputTokens := p.estimateRequestTokens(e, request, inputTokens)
 			p.uncachedRequestTokensSlot.Put(e, &attrconcurrency.UncachedRequestTokens{
-				Tokens: tokens,
+				Tokens: promptTokens + outputTokens,
 			})
 		}
 	}
@@ -468,7 +470,8 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 		// Prefer the prefix producer's view (real tokens) when available so the
 		// match-length and the input length are in the same units; fall back to
 		// the (estimated) input tokens otherwise.
-		tokens := p.estimateRequestTokens(endpoint, request, inputTokens)
+		promptTokens, outputTokens := p.estimateRequestTokens(endpoint, request, inputTokens)
+		tokens := promptTokens + outputTokens
 
 		tokenCounter := p.tokenTracker.add(eid, tokens)
 
@@ -484,7 +487,8 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 			fairnessID:     fairnessID,
 			priority:       priority,
 		}
-		entry.tokens.Store(tokens)
+		entry.promptTokens.Store(promptTokens)
+		entry.outputTokens.Store(outputTokens)
 		entry.requests.Store(1)
 		p.PluginState.Write(
 			request.RequestID,
@@ -506,8 +510,12 @@ func (p *InFlightLoadProducer) PreRequest(ctx context.Context, request *fwksched
 	return nil
 }
 
-func (p *InFlightLoadProducer) estimateRequestTokens(endpoint fwksched.Endpoint, request *fwksched.InferenceRequest, inputTokens int64) int64 {
-	adjustedInput := uncachedInputTokens(endpoint, inputTokens, p.prefixMatchInfoDK)
+func (p *InFlightLoadProducer) estimateRequestTokens(endpoint fwksched.Endpoint, request *fwksched.InferenceRequest, inputTokens int64) (promptTokens, outputTokens int64) {
+	adjustedInput := inputTokens
+	// Requests without cache identity must not receive a prefix discount.
+	if request == nil || request.Body == nil || !request.Body.SkipPrefixCacheMatching {
+		adjustedInput = uncachedInputTokens(endpoint, inputTokens, p.prefixMatchInfoDK)
+	}
 
 	// In P/D disaggregation the load is role-specific:
 	//   prefill-only endpoint -> input tokens (it processes the prompt, not the output)
@@ -516,7 +524,7 @@ func (p *InFlightLoadProducer) estimateRequestTokens(endpoint fwksched.Endpoint,
 	//   monolithic / combined -> input + estimated output (existing behavior, no P/D split)
 	// The split is derived from the pod-role label and only activates with known roles.
 	if endpointHasPrefillOnlyRole(endpoint) {
-		return adjustedInput
+		return adjustedInput, 0
 	}
 
 	if p.addEstimatedOutputTokens {
@@ -526,12 +534,12 @@ func (p *InFlightLoadProducer) estimateRequestTokens(endpoint fwksched.Endpoint,
 		if endpointHasDecodeOnlyRole(endpoint) {
 			// Decode-only endpoint: the input tokens were already accounted for by
 			// the prefill worker, so charge only the estimated output it will generate.
-			return p.tokenEstimator.EstimateOutputFromRequest(request)
+			return 0, p.tokenEstimator.EstimateOutputFromRequest(request)
 		}
 		// Monolithic or combined-role: include both input and estimated output.
-		return adjustedInput + p.tokenEstimator.EstimateOutputFromRequest(request)
+		return adjustedInput, p.tokenEstimator.EstimateOutputFromRequest(request)
 	}
-	return adjustedInput
+	return adjustedInput, 0
 }
 
 // endpointHasPrefillOnlyRole reports whether the endpoint is labeled as a
@@ -582,15 +590,9 @@ func (p *InFlightLoadProducer) ResponseBody(
 		return
 	}
 
-	// When output tokens are excluded, the in-flight token estimate represents only
-	// the prompt cost, which is consumed by prefill. As soon as the first chunk
-	// arrives (StartOfStream), prefill is done across all profiles, so free the
-	// token counters for every targeted endpoint regardless of profile name.
-	// The prefill profile's entry is released in full (request counter included):
-	// the first chunk means the prefill worker has finished and handed off, so
-	// the request is no longer in flight on that endpoint. Other profiles'
-	// request counters are released on EndOfStream below via PluginState.Delete.
-	if !p.addEstimatedOutputTokens && resp.StartOfStream {
+	// The first response chunk completes prefill. The prefill profile releases
+	// its whole entry; other profiles retain their request and output charges.
+	if resp.StartOfStream {
 		for profileName, profileResult := range result.ProfileResults {
 			if profileResult == nil || len(profileResult.TargetEndpoints) == 0 {
 				continue
@@ -603,18 +605,6 @@ func (p *InFlightLoadProducer) ResponseBody(
 				p.release(endpoint, request, profileName)
 			} else {
 				p.releaseTokensEarly(endpoint, request, profileName)
-			}
-		}
-	}
-
-	// Early prefill release (on first chunk). Frees the primary profile's
-	// prefill contribution as soon as prefill completes, while other profiles'
-	// entries remain until EndOfStream.
-	if p.addEstimatedOutputTokens && resp.StartOfStream {
-		if prefillResult, ok := result.ProfileResults[profilePrefill]; ok && len(prefillResult.TargetEndpoints) > 0 {
-			endpoint := prefillResult.TargetEndpoints[0]
-			if endpoint != nil && endpoint.GetMetadata() != nil {
-				p.release(endpoint, request, profilePrefill)
 			}
 		}
 	}
@@ -659,10 +649,8 @@ func (p *InFlightLoadProducer) release(endpoint fwksched.Endpoint, request *fwks
 	p.PluginState.DeleteKey(request.RequestID, key)
 }
 
-// releaseTokensEarly frees only the token portion of a profile's entry
-// (request counter stays held), used at StartOfStream for the
-// addEstimatedOutputTokens=false path where prefill completion frees tokens
-// but the request remains in-flight until EndOfStream.
+// releaseTokensEarly frees the stored prompt charge while preserving the
+// estimated output and request count until completion.
 func (p *InFlightLoadProducer) releaseTokensEarly(endpoint fwksched.Endpoint, request *fwksched.InferenceRequest, profileName string) {
 	if endpoint == nil || request == nil || request.RequestID == "" || p.PluginState == nil {
 		return
@@ -675,7 +663,7 @@ func (p *InFlightLoadProducer) releaseTokensEarly(endpoint fwksched.Endpoint, re
 
 	key := fwkplugin.StateKey(addedTokensKey(eid, profileName))
 	if entry, err := fwkplugin.ReadPluginStateKey[*addedTokensEntry](p.PluginState, request.RequestID, key); err == nil {
-		if t := entry.tokens.Swap(0); t != 0 {
+		if t := entry.promptTokens.Swap(0); t != 0 {
 			decrementClamped(entry.tokenCounter, t)
 			inflightTokens.WithLabelValues(entry.endpointName, entry.namespace, entry.producerName, entry.fairnessID, entry.priority).Sub(float64(t))
 		}
