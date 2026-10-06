@@ -184,7 +184,7 @@ func TestSubscriberManager_RemoveSubscriberResetsQueuedPodState(t *testing.T) {
 		sourceEndpoint = "10.0.0.1:8000"
 	)
 	done := make(chan struct{})
-	subscriber := newZMQSubscriber(pool, podIdentifier, sourceEndpoint, "", "", "kv@", nil, false)
+	subscriber := newZMQSubscriber(pool, podIdentifier, sourceEndpoint, "", "", "", "kv@", nil, false)
 
 	manager := NewSubscriberManager(pool)
 	manager.subscribers[podIdentifier] = &subscriberEntry{
@@ -246,8 +246,8 @@ func TestSubscriberManager_RemoveSubscriberKeepsSharedSourceUntilLastSubscriber(
 	manager := NewSubscriberManager(pool)
 	dones := []chan struct{}{make(chan struct{}), make(chan struct{})}
 	subscribers := []*zmqSubscriber{
-		newZMQSubscriber(pool, "ns/pod-copy-0", sourceEndpoint, "", "", "kv@", nil, false),
-		newZMQSubscriber(pool, "ns/pod-copy-1", sourceEndpoint, "", "", "kv@", nil, false),
+		newZMQSubscriber(pool, "ns/pod-copy-0", sourceEndpoint, "", "", "", "kv@", nil, false),
+		newZMQSubscriber(pool, "ns/pod-copy-1", sourceEndpoint, "", "", "", "kv@", nil, false),
 	}
 	for i, podIdentifier := range []string{"ns/pod-copy-0", "ns/pod-copy-1"} {
 		manager.subscribers[podIdentifier] = &subscriberEntry{
@@ -293,8 +293,8 @@ func TestSubscriberManager_RemoveSubscriberResetsOnlyRetiredDataParallelRank(t *
 	manager := NewSubscriberManager(pool)
 	dones := []chan struct{}{make(chan struct{}), make(chan struct{})}
 	subscribers := []*zmqSubscriber{
-		newZMQSubscriber(pool, "ns/pod-rank-0", sourceEndpoint, "", "", "kv@", &rank0, false),
-		newZMQSubscriber(pool, "ns/pod-rank-1", sourceEndpoint, "", "", "kv@", &rank1, false),
+		newZMQSubscriber(pool, "ns/pod-rank-0", sourceEndpoint, "", "", "", "kv@", &rank0, false),
+		newZMQSubscriber(pool, "ns/pod-rank-1", sourceEndpoint, "", "", "", "kv@", &rank1, false),
 	}
 	for i, podIdentifier := range []string{"ns/pod-rank-0", "ns/pod-rank-1"} {
 		manager.subscribers[podIdentifier] = &subscriberEntry{
@@ -327,7 +327,7 @@ func TestZMQSubscriber_RetireDropsMessagesWithoutSourceEndpoint(t *testing.T) {
 	pool.concurrency = 1
 	defer pool.Shutdown(ctx)
 
-	subscriber := newZMQSubscriber(pool, "local-subscriber", "", "", "", "kv@", nil, false)
+	subscriber := newZMQSubscriber(pool, "local-subscriber", "", "", "", "", "kv@", nil, false)
 	subscriber.addTask(ctx, "kv@10.0.0.1:8000@test-model", 1, []byte{1})
 	subscriber.retire(false)
 	subscriber.addTask(ctx, "kv@10.0.0.1:8000@test-model", 2, []byte{2})

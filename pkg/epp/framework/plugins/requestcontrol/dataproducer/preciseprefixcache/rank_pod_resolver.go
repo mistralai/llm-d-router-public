@@ -70,6 +70,7 @@ type rankSubscription struct {
 	sourceEndpoint    string
 	transportEndpoint string
 	replayEndpoint    string
+	snapshotEndpoint  string
 	rank              int
 }
 
@@ -81,6 +82,7 @@ func (s *rankSubscription) equal(other *rankSubscription) bool {
 		s.sourceEndpoint == other.sourceEndpoint &&
 		s.transportEndpoint == other.transportEndpoint &&
 		s.replayEndpoint == other.replayEndpoint &&
+		s.snapshotEndpoint == other.snapshotEndpoint &&
 		s.rank == other.rank
 }
 
@@ -92,6 +94,7 @@ type rankPodResolver struct {
 	ranksPerPod   int
 	socketPort    int
 	replayPort    int
+	snapshotPort  int
 
 	mu              sync.Mutex
 	endpoints       map[types.NamespacedName]rankEndpointState
@@ -135,6 +138,7 @@ func newRankPodResolver(config *kvevents.PodDiscoveryConfig) (*rankPodResolver, 
 		ranksPerPod:     ranksPerPod,
 		socketPort:      config.SocketPort,
 		replayPort:      config.EffectiveReplayPort(),
+		snapshotPort:    config.SnapshotSocketPort,
 		endpoints:       make(map[types.NamespacedName]rankEndpointState),
 		endpointsByRank: make(map[rankPodKey]map[types.NamespacedName]struct{}),
 		workers:         make(map[rankPodKey]rankWorkerState),
@@ -296,11 +300,20 @@ func (r *rankPodResolver) desiredLocked(id types.NamespacedName) (*rankSubscript
 		}
 		replayEndpoint = "tcp://" + net.JoinHostPort(worker.ip, strconv.Itoa(replayPort))
 	}
+	snapshotEndpoint := ""
+	if r.snapshotPort > 0 {
+		snapshotPort := r.snapshotPort + rank
+		if snapshotPort > 65535 {
+			return nil, fmt.Errorf("KV-event snapshot port for global rank %d exceeds 65535", rank)
+		}
+		snapshotEndpoint = "tcp://" + net.JoinHostPort(worker.ip, strconv.Itoa(snapshotPort))
+	}
 	return &rankSubscription{
 		id:                id,
 		sourceEndpoint:    fmt.Sprintf("%s:%s", endpoint.metadata.Address, endpoint.metadata.Port),
 		transportEndpoint: "tcp://" + net.JoinHostPort(worker.ip, strconv.Itoa(transportPort)),
 		replayEndpoint:    replayEndpoint,
+		snapshotEndpoint:  snapshotEndpoint,
 		rank:              endpoint.key.rank,
 	}, nil
 }
@@ -408,6 +421,7 @@ func (p *Producer) reconcileRankEndpoint(ctx context.Context, endpointID types.N
 				desired.sourceEndpoint,
 				desired.transportEndpoint,
 				desired.replayEndpoint,
+				desired.snapshotEndpoint,
 				p.kvEventsConfig.TopicFilter,
 				&rank,
 				true,

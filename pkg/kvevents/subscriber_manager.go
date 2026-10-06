@@ -39,6 +39,7 @@ type subscriberEntry struct {
 	endpoint         string
 	sourceEndpoint   string
 	replayEndpoint   string
+	snapshotEndpoint string
 	dataParallelRank *int
 	// done is closed once the subscriber's goroutine has returned.
 	done chan struct{}
@@ -53,12 +54,12 @@ func NewSubscriberManager(pool *Pool) *SubscriberManager {
 }
 
 // EnsureSubscriber ensures a subscriber exists for the given pod.
-// If the subscriber already exists with the same transport, source, and replay
-// endpoints, it's a no-op. If an endpoint changed, the old subscriber is
+// If the subscriber already exists with the same transport, source, replay and
+// snapshot endpoints, it's a no-op. If an endpoint changed, the old subscriber is
 // removed and a new one is created.
 func (sm *SubscriberManager) EnsureSubscriber(
 	ctx context.Context,
-	podIdentifier, sourceEndpoint, endpoint, replayEndpoint, topicFilter string,
+	podIdentifier, sourceEndpoint, endpoint, replayEndpoint, snapshotEndpoint, topicFilter string,
 	dataParallelRank *int,
 	remoteSocket bool,
 ) error {
@@ -70,7 +71,8 @@ func (sm *SubscriberManager) EnsureSubscriber(
 	// Check if subscriber already exists
 	if entry, exists := sm.subscribers[podIdentifier]; exists {
 		if entry.endpoint == endpoint && entry.sourceEndpoint == sourceEndpoint &&
-			entry.replayEndpoint == replayEndpoint && equalOptionalInt(entry.dataParallelRank, dataParallelRank) {
+			entry.replayEndpoint == replayEndpoint && entry.snapshotEndpoint == snapshotEndpoint &&
+			equalOptionalInt(entry.dataParallelRank, dataParallelRank) {
 			// Subscriber already exists with the same endpoint, nothing to do
 			debugLogger.V(logging.TRACE).Info("Subscriber already exists", "podIdentifier", podIdentifier, "endpoint", endpoint)
 			return nil
@@ -83,7 +85,9 @@ func (sm *SubscriberManager) EnsureSubscriber(
 			"oldSourceEndpoint", entry.sourceEndpoint,
 			"newSourceEndpoint", sourceEndpoint,
 			"oldReplayEndpoint", entry.replayEndpoint,
-			"newReplayEndpoint", replayEndpoint)
+			"newReplayEndpoint", replayEndpoint,
+			"oldSnapshotEndpoint", entry.snapshotEndpoint,
+			"newSnapshotEndpoint", snapshotEndpoint)
 		sm.retireSubscriber(entry)
 		delete(sm.subscribers, podIdentifier)
 		if err := ctx.Err(); err != nil {
@@ -98,7 +102,7 @@ func (sm *SubscriberManager) EnsureSubscriber(
 	// Create new subscriber
 	debugLogger.Info("Creating new subscriber", "podIdentifier", podIdentifier, "endpoint", endpoint)
 	subscriber := newZMQSubscriber(
-		sm.pool, podIdentifier, sourceEndpoint, endpoint, replayEndpoint, topicFilter, dataParallelRank, remoteSocket)
+		sm.pool, podIdentifier, sourceEndpoint, endpoint, replayEndpoint, snapshotEndpoint, topicFilter, dataParallelRank, remoteSocket)
 
 	// Create a context and start subscriber
 	subCtx, cancel := context.WithCancel(ctx)
@@ -115,6 +119,7 @@ func (sm *SubscriberManager) EnsureSubscriber(
 		endpoint:         endpoint,
 		sourceEndpoint:   sourceEndpoint,
 		replayEndpoint:   replayEndpoint,
+		snapshotEndpoint: snapshotEndpoint,
 		dataParallelRank: dataParallelRank,
 		done:             done,
 	}

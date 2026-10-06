@@ -48,6 +48,13 @@ With pod KV-event discovery enabled, each logical endpoint subscribes to
 `socketPort + rank` and `replaySocketPort + rank`. Cache entries, replay resets,
 and endpoint deletion remain scoped to that rank.
 
+Set `snapshotSocketPort` to warm each rank's index from vLLM's current cache
+state. A subscriber that joins mid-stream or sees the publisher restart loads
+the snapshot, then follows live events after the snapshot's sequence number.
+Without `replaySocketPort`, a sequence gap also reloads the snapshot. A failed
+or unavailable snapshot is retried after the replay cooldown, and the rank does
+not contribute cache affinity until recovery succeeds.
+
 When the serving endpoint belongs to a leader pod but each data-parallel rank's
 KV-event socket belongs to a different pod, configure `rankPodMapping`. The
 group label joins the serving endpoint to its worker pods. The rank label is the
@@ -55,7 +62,8 @@ worker index, and `ranksPerPod` maps each worker to a consecutive range of
 global data-parallel ranks. Requests still target the leader endpoint and use
 `x-data-parallel-rank`; only the KV-event transport uses the worker pod IP.
 Each rank uses `socketPort + global rank` and
-`replaySocketPort + global rank` on its worker pod.
+`replaySocketPort + global rank` or `snapshotSocketPort + global rank` on its
+worker pod.
 
 ```yaml
 plugins:
@@ -66,6 +74,7 @@ plugins:
         podDiscoveryConfig:
           socketPort: 5557
           replaySocketPort: 5657
+          snapshotSocketPort: 5757
           podLabelSelector: app.kubernetes.io/instance=model-server
           podNamespace: default
           rankPodMapping:

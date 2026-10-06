@@ -267,6 +267,7 @@ func TestProducer_EnsureSubscriber_PassesDataParallelRank(t *testing.T) {
 	cfg.PodDiscoveryConfig = kvevents.DefaultPodReconcilerConfig()
 	cfg.PodDiscoveryConfig.SocketPort = 5557
 	cfg.PodDiscoveryConfig.ReplaySocketPort = 5657
+	cfg.PodDiscoveryConfig.SnapshotSocketPort = 5757
 
 	subscribers := &fakeSubscriberManager{}
 	p := &Producer{
@@ -286,6 +287,7 @@ func TestProducer_EnsureSubscriber_PassesDataParallelRank(t *testing.T) {
 
 	assert.Equal(t, []string{"tcp://10.0.0.1:5560"}, subscribers.endpoints)
 	assert.Equal(t, []string{"tcp://10.0.0.1:5660"}, subscribers.replayEndpoints)
+	assert.Equal(t, []string{"tcp://10.0.0.1:5760"}, subscribers.snapshotEndpoints)
 	require.Len(t, subscribers.dataParallelRanks, 1)
 	require.NotNil(t, subscribers.dataParallelRanks[0])
 	assert.Equal(t, rank, *subscribers.dataParallelRanks[0])
@@ -685,6 +687,7 @@ func newRankPodMappingProducerWithRanks(t *testing.T, subscribers subscriberMana
 	cfg.PodDiscoveryConfig.PodLabelSelector = "app.kubernetes.io/instance=model"
 	cfg.PodDiscoveryConfig.SocketPort = 5557
 	cfg.PodDiscoveryConfig.ReplaySocketPort = 5657
+	cfg.PodDiscoveryConfig.SnapshotSocketPort = 5757
 	cfg.PodDiscoveryConfig.RankPodMapping = &kvevents.RankPodMappingConfig{
 		GroupLabelKey: testRankPodGroupLabel,
 		RankLabelKey:  testRankPodRankLabel,
@@ -768,6 +771,7 @@ func TestProducer_RankPodMappingUsesWorkerTransportAndLeaderIdentity(t *testing.
 	assert.Equal(t, "10.0.0.10:8000", subscribers.sourceEndpoints[0])
 	assert.Equal(t, "tcp://10.0.0.21:5558", subscribers.endpoints[0])
 	assert.Equal(t, "tcp://10.0.0.21:5658", subscribers.replayEndpoints[0])
+	assert.Equal(t, "tcp://10.0.0.21:5758", subscribers.snapshotEndpoints[0])
 	require.NotNil(t, subscribers.dataParallelRanks[0])
 	assert.Equal(t, 1, *subscribers.dataParallelRanks[0])
 }
@@ -789,6 +793,7 @@ func TestProducer_RankPodMappingOffsetsPortsByGlobalRank(t *testing.T) {
 	require.Len(t, subscribers.endpoints, 1)
 	assert.Equal(t, "tcp://10.0.0.23:5560", subscribers.endpoints[0])
 	assert.Equal(t, "tcp://10.0.0.23:5660", subscribers.replayEndpoints[0])
+	assert.Equal(t, "tcp://10.0.0.23:5760", subscribers.snapshotEndpoints[0])
 }
 
 func TestProducer_RankPodMappingHandlesPodFirstOrdering(t *testing.T) {
@@ -1032,6 +1037,7 @@ func TestProducer_RankPodMappingSupportsMultipleRanksPerPod(t *testing.T) {
 
 	assert.ElementsMatch(t, []string{"tcp://10.0.0.21:5559", "tcp://10.0.0.21:5560"}, subscribers.endpoints)
 	assert.ElementsMatch(t, []string{"tcp://10.0.0.21:5659", "tcp://10.0.0.21:5660"}, subscribers.replayEndpoints)
+	assert.ElementsMatch(t, []string{"tcp://10.0.0.21:5759", "tcp://10.0.0.21:5760"}, subscribers.snapshotEndpoints)
 }
 
 type rankPodCaptureRegistrar struct {

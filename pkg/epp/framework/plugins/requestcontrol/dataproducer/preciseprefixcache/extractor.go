@@ -98,19 +98,23 @@ func (p *Producer) ensureSubscriber(ctx context.Context, meta *fwkdl.EndpointMet
 	if replayPort := p.kvEventsConfig.PodDiscoveryConfig.EffectiveReplayPort(); replayPort > 0 {
 		replayEndpoint = "tcp://" + net.JoinHostPort(meta.Address, strconv.Itoa(replayPort+rank))
 	}
+	snapshotEndpoint := ""
+	if snapshotPort := p.kvEventsConfig.PodDiscoveryConfig.SnapshotSocketPort; snapshotPort > 0 {
+		snapshotEndpoint = "tcp://" + net.JoinHostPort(meta.Address, strconv.Itoa(snapshotPort+rank))
+	}
 	sourceEndpoint := fmt.Sprintf("%s:%s", meta.Address, meta.Port)
 
 	logger := log.FromContext(ctx).WithName(p.typedName.String())
 	// subscriberCtx is plugin-lifetime; caller ctx would tear subscribers
 	// down on request completion.
 	if err := p.subscribersManager.EnsureSubscriber(p.subscriberCtx, endpointKey,
-		sourceEndpoint, zmqEndpoint, replayEndpoint, p.kvEventsConfig.TopicFilter,
+		sourceEndpoint, zmqEndpoint, replayEndpoint, snapshotEndpoint, p.kvEventsConfig.TopicFilter,
 		meta.DataParallelRank, true); err != nil {
 		logger.Error(err, "Failed to ensure KV-events subscriber for endpoint",
 			"endpoint", endpointKey, "address", meta.Address)
 		return fmt.Errorf("ensure subscriber for %s: %w", endpointKey, err)
 	}
 	logger.V(logging.DEBUG).Info("Ensured KV-events subscriber",
-		"endpoint", endpointKey, "zmq", zmqEndpoint, "replay", replayEndpoint)
+		"endpoint", endpointKey, "zmq", zmqEndpoint, "replay", replayEndpoint, "snapshot", snapshotEndpoint)
 	return nil
 }

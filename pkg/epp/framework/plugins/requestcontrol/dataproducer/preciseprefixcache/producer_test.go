@@ -906,13 +906,14 @@ type fakeSubscriberManager struct {
 	sourceEndpoints   []string
 	endpoints         []string
 	replayEndpoints   []string
+	snapshotEndpoints []string
 	dataParallelRanks []*int
 	removed           []string
 }
 
 func (f *fakeSubscriberManager) EnsureSubscriber(
 	_ context.Context,
-	id, sourceEndpoint, endpoint, replayEndpoint, _ string,
+	id, sourceEndpoint, endpoint, replayEndpoint, snapshotEndpoint, _ string,
 	dataParallelRank *int,
 	_ bool,
 ) error {
@@ -920,6 +921,7 @@ func (f *fakeSubscriberManager) EnsureSubscriber(
 	f.sourceEndpoints = append(f.sourceEndpoints, sourceEndpoint)
 	f.endpoints = append(f.endpoints, endpoint)
 	f.replayEndpoints = append(f.replayEndpoints, replayEndpoint)
+	f.snapshotEndpoints = append(f.snapshotEndpoints, snapshotEndpoint)
 	f.dataParallelRanks = append(f.dataParallelRanks, dataParallelRank)
 	return nil
 }
