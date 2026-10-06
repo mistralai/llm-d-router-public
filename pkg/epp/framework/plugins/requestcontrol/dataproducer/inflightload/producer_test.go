@@ -148,12 +148,16 @@ func TestInFlightLoadProducer_PrefixMatchInfoProducerName(t *testing.T) {
 	// (indexed 2*4=8, matched 1*4=4 -> uncached 4).
 	hit := newStubSchedulingEndpoint("ep-hit")
 	hit.Put(preciseKey, attrprefix.NewPrefixCacheMatchInfo(1, 2, 4))
-	require.Equal(t, int64(4), producer.estimateRequestTokens(hit, nil, 5))
+	promptTokens, outputTokens := producer.estimateRequestTokens(hit, nil, 5)
+	require.Equal(t, int64(4), promptTokens)
+	require.Zero(t, outputTokens)
 
 	// Data under the approx (default) key is ignored, so it falls back to inputTokens.
 	miss := newStubSchedulingEndpoint("ep-miss")
 	miss.Put(attrprefix.PrefixCacheMatchInfoDataKey, attrprefix.NewPrefixCacheMatchInfo(1, 2, 4))
-	require.Equal(t, int64(5), producer.estimateRequestTokens(miss, nil, 5))
+	promptTokens, outputTokens = producer.estimateRequestTokens(miss, nil, 5)
+	require.Equal(t, int64(5), promptTokens)
+	require.Zero(t, outputTokens)
 
 	// Exercise the real dependency sorter and current-request projection. The
 	// selected owner has 41,280 of 43,992 input tokens cached; charging the full
@@ -754,6 +758,68 @@ func makeTokenRequest(requestID string, inputTokens int) *fwksched.InferenceRequ
 	}
 }
 
+func TestInFlightLoadProducer_IncludeOutputTokens_StartOfStreamRelease(t *testing.T) {
+	cases := []struct {
+		name          string
+		role          string
+		matchedBlocks int
+		wantPrompt    int64
+		wantOutput    int64
+	}{
+		{name: "uncached", wantPrompt: 80, wantOutput: 2000},
+		{name: "partially-cached", matchedBlocks: 7, wantPrompt: 24, wantOutput: 2000},
+		{name: "fully-cached", matchedBlocks: 10, wantOutput: 2000},
+		{name: "decode-only", role: bylabel.RoleDecode, wantOutput: 2000},
+		{name: "prefill-only", role: bylabel.RolePrefill, wantPrompt: 80},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			producer := newTestProducer(t)
+			producer.tokenEstimator = NewSimpleTokenEstimator(ptr.To(int64(2000)))
+			ctx := context.Background()
+			endpointName := "stream-release-" + tc.name
+			endpointID := fullEndpointName(endpointName)
+			endpoint := newStubSchedulingEndpointWithRole(endpointName, tc.role)
+			endpoint.Put(attrprefix.PrefixCacheMatchInfoDataKey, attrprefix.NewPrefixCacheMatchInfo(tc.matchedBlocks, 10, 8))
+			req := makeTokenRequest(t.Name(), 80)
+			req.PutAttribute(outlenbucket.AttributeKey, outlenbucket.Long)
+			res := makeSchedulingResult(endpointName)
+			res.ProfileResults["default"].TargetEndpoints[0] = endpoint
+			req.SchedulingResult = res
+
+			expect := func(requests, tokens int64) {
+				t.Helper()
+				require.Equal(t, requests, producer.GetRequests(endpointID))
+				require.Equal(t, tokens, producer.GetTokens(endpointID))
+				require.Equal(t, float64(requests), promtestutil.ToFloat64(inflightRequests.WithLabelValues(endpointName, "default", producer.typedName.Name, "", "0")))
+				require.Equal(t, float64(tokens), promtestutil.ToFloat64(inflightTokens.WithLabelValues(endpointName, "default", producer.typedName.Name, "", "0")))
+			}
+
+			require.NoError(t, producer.PreRequest(ctx, req, res))
+			expect(1, tc.wantPrompt+tc.wantOutput)
+
+			// Release must use the admission-time charge even if cache state or request attributes change.
+			endpoint.Put(attrprefix.PrefixCacheMatchInfoDataKey, attrprefix.NewPrefixCacheMatchInfo(10, 10, 8))
+			req.PutAttribute(outlenbucket.AttributeKey, outlenbucket.Short)
+			req.Body.MaxOutputTokens = ptr.To(int64(1))
+			producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: true}, nil)
+			expect(1, tc.wantOutput)
+
+			producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: true}, nil)
+			producer.ResponseBody(ctx, req, &requestcontrol.Response{}, nil)
+			expect(1, tc.wantOutput)
+
+			shared := producer.CrossReplicaState().Supply(endpointID)().(*attrconcurrency.InFlightLoad)
+			require.Equal(t, &attrconcurrency.InFlightLoad{Requests: 1, Tokens: tc.wantOutput}, shared)
+
+			producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
+			producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: true, EndOfStream: true}, nil)
+			expect(0, 0)
+		})
+	}
+}
+
 // TestInFlightLoadProducer_ExcludeOutputTokens_StartOfStreamRelease verifies that when
 // AddEstimatedOutputTokens is false, token counters are released as soon as the first chunk
 // arrives (StartOfStream), while request counters are released only on EndOfStream.
@@ -959,11 +1025,11 @@ func TestInFlightLoadProducer_BalancedAddRelease_MultipleProfilesSameEndpoint(t 
 	require.Equal(t, int64(2), producer.requestTracker.get(endpointID))
 	require.Equal(t, 2*perProfile, producer.tokenTracker.get(endpointID))
 
-	// StartOfStream releases the prefill profile only (1 request, one profile's tokens).
+	// StartOfStream releases the prefill profile and the decode profile's prompt charge.
 	req.SchedulingResult = res
 	producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: true}, nil)
 	require.Equal(t, int64(1), producer.requestTracker.get(endpointID))
-	require.Equal(t, perProfile, producer.tokenTracker.get(endpointID))
+	require.Equal(t, UnknownOutputTokens, producer.tokenTracker.get(endpointID))
 
 	// EndOfStream releases the remaining (decode) profile.
 	producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
@@ -1103,6 +1169,60 @@ func newTestProducerWithFastJanitor(t testing.TB) *InFlightLoadProducer {
 	return producer
 }
 
+func TestInFlightLoadProducer_IncludeOutputTokens_Cleanup(t *testing.T) {
+	cases := []struct {
+		name        string
+		singleChunk bool
+		cancel      bool
+	}{
+		{name: "end-without-start"},
+		{name: "single-chunk", singleChunk: true},
+		{name: "cancel-after-start", cancel: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			producer := newTestProducerWithFastJanitor(t)
+			endpointName := "output-cleanup-" + tc.name
+			endpointID := fullEndpointName(endpointName)
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			res := makeSchedulingResult(endpointName)
+			req := makeTokenRequest("finishing-request", 4)
+			req.SchedulingResult = res
+			other := makeTokenRequest("remaining-request", 8)
+			other.SchedulingResult = res
+			require.NoError(t, producer.PreRequest(ctx, req, res))
+			require.NoError(t, producer.PreRequest(context.Background(), other, res))
+			require.Equal(t, int64(12)+2*UnknownOutputTokens, producer.GetTokens(endpointID))
+
+			if tc.cancel {
+				producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: true}, nil)
+				require.Equal(t, int64(8)+2*UnknownOutputTokens, producer.GetTokens(endpointID))
+				cancel()
+				require.Eventually(t, func() bool {
+					return producer.GetRequests(endpointID) == 1 && producer.GetTokens(endpointID) == 8+UnknownOutputTokens &&
+						promtestutil.ToFloat64(inflightRequests.WithLabelValues(endpointName, "default", producer.typedName.Name, "", "0")) == 1 &&
+						promtestutil.ToFloat64(inflightTokens.WithLabelValues(endpointName, "default", producer.typedName.Name, "", "0")) == float64(8+UnknownOutputTokens)
+				}, 2*time.Second, 10*time.Millisecond)
+			} else {
+				producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: tc.singleChunk, EndOfStream: true}, nil)
+			}
+
+			// Late callbacks must preserve the other request's contribution.
+			producer.ResponseBody(ctx, req, &requestcontrol.Response{StartOfStream: true, EndOfStream: true}, nil)
+			require.Equal(t, int64(1), producer.GetRequests(endpointID))
+			require.Equal(t, int64(8)+UnknownOutputTokens, producer.GetTokens(endpointID))
+			require.Equal(t, float64(1), promtestutil.ToFloat64(inflightRequests.WithLabelValues(endpointName, "default", producer.typedName.Name, "", "0")))
+			require.Equal(t, float64(8+UnknownOutputTokens), promtestutil.ToFloat64(inflightTokens.WithLabelValues(endpointName, "default", producer.typedName.Name, "", "0")))
+
+			producer.ResponseBody(context.Background(), other, &requestcontrol.Response{EndOfStream: true}, nil)
+			require.Equal(t, int64(0), producer.GetRequests(endpointID))
+			require.Equal(t, int64(0), producer.GetTokens(endpointID))
+		})
+	}
+}
+
 // TestInFlightLoadProducer_JanitorSkipsLiveRequest is the issue #2295
 // regression: a request that produces no response chunk past the staleness
 // threshold must keep its in-flight contribution while its stream ctx is
@@ -1177,8 +1297,10 @@ func TestInFlightLoadProducer_AtomicTokenRelease_Concurrent(t *testing.T) {
 	_ = producer.PreRequest(ctx, req, res)
 	require.Equal(t, int64(4)+UnknownOutputTokens, producer.tokenTracker.get(endpointID))
 
-	// Fire releaseTokensEarly and an explicit Delete concurrently. Whichever
-	// wins the Swap does the decrement; the other is a no-op. Net must be 0.
+	other := makeTokenRequest("req-race-remaining", 8)
+	require.NoError(t, producer.PreRequest(ctx, other, res))
+
+	// A second request exposes double subtraction that clamping to zero could hide.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -1191,6 +1313,11 @@ func TestInFlightLoadProducer_AtomicTokenRelease_Concurrent(t *testing.T) {
 	}()
 	wg.Wait()
 
+	require.Equal(t, int64(8)+UnknownOutputTokens, producer.tokenTracker.get(endpointID))
+	require.Equal(t, int64(1), producer.requestTracker.get(endpointID))
+	require.Equal(t, float64(8+UnknownOutputTokens), promtestutil.ToFloat64(inflightTokens.WithLabelValues(endpointName, "default", producer.typedName.Name, "", "0")))
+	require.Equal(t, float64(1), promtestutil.ToFloat64(inflightRequests.WithLabelValues(endpointName, "default", producer.typedName.Name, "", "0")))
+	producer.PluginState.Delete(other.RequestID)
 	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
 	require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
 }
@@ -1442,24 +1569,27 @@ func TestInFlightLoadProducer_PDRoleAwareLoad(t *testing.T) {
 		t.Parallel()
 		producer := newTestProducer(t)
 		ep := newStubSchedulingEndpointWithRole("prefill-pod", bylabel.RolePrefill)
-		got := producer.estimateRequestTokens(ep, makeReq(), inputTok)
-		require.Equal(t, int64(inputTok), got)
+		promptTokens, outputTokens := producer.estimateRequestTokens(ep, makeReq(), inputTok)
+		require.Equal(t, int64(inputTok), promptTokens)
+		require.Zero(t, outputTokens)
 	})
 
 	t.Run("encode-prefill role -> input tokens only", func(t *testing.T) {
 		t.Parallel()
 		producer := newTestProducer(t)
 		ep := newStubSchedulingEndpointWithRole("enc-prefill-pod", bylabel.RoleEncodePrefill)
-		got := producer.estimateRequestTokens(ep, makeReq(), inputTok)
-		require.Equal(t, int64(inputTok), got)
+		promptTokens, outputTokens := producer.estimateRequestTokens(ep, makeReq(), inputTok)
+		require.Equal(t, int64(inputTok), promptTokens)
+		require.Zero(t, outputTokens)
 	})
 
 	t.Run("decode-only role -> estimated output tokens only (addEstimatedOutputTokens=true)", func(t *testing.T) {
 		t.Parallel()
 		producer := newTestProducer(t)
 		ep := newStubSchedulingEndpointWithRole("decode-pod", bylabel.RoleDecode)
-		got := producer.estimateRequestTokens(ep, makeReq(), inputTok)
-		require.Equal(t, int64(outputTok), got)
+		promptTokens, outputTokens := producer.estimateRequestTokens(ep, makeReq(), inputTok)
+		require.Zero(t, promptTokens)
+		require.Equal(t, int64(outputTok), outputTokens)
 	})
 
 	t.Run("decode-only role -> input tokens only when addEstimatedOutputTokens=false", func(t *testing.T) {
@@ -1467,24 +1597,27 @@ func TestInFlightLoadProducer_PDRoleAwareLoad(t *testing.T) {
 		producer := newTestProducer(t)
 		producer.addEstimatedOutputTokens = false
 		ep := newStubSchedulingEndpointWithRole("decode-pod", bylabel.RoleDecode)
-		got := producer.estimateRequestTokens(ep, makeReq(), inputTok)
-		require.Equal(t, int64(inputTok), got, "without output estimation there is no output-length signal; input tokens are the only proxy")
+		promptTokens, outputTokens := producer.estimateRequestTokens(ep, makeReq(), inputTok)
+		require.Equal(t, int64(inputTok), promptTokens, "without output estimation there is no output-length signal; input tokens are the only proxy")
+		require.Zero(t, outputTokens)
 	})
 
 	t.Run("no role label -> input + estimated output tokens (monolithic)", func(t *testing.T) {
 		t.Parallel()
 		producer := newTestProducer(t)
 		ep := newStubSchedulingEndpoint("mono-pod") // no role label
-		got := producer.estimateRequestTokens(ep, makeReq(), inputTok)
-		require.Equal(t, int64(inputTok+outputTok), got)
+		promptTokens, outputTokens := producer.estimateRequestTokens(ep, makeReq(), inputTok)
+		require.Equal(t, int64(inputTok), promptTokens)
+		require.Equal(t, int64(outputTok), outputTokens)
 	})
 
 	t.Run("combined role (prefill-decode) -> input + estimated output tokens", func(t *testing.T) {
 		t.Parallel()
 		producer := newTestProducer(t)
 		ep := newStubSchedulingEndpointWithRole("combined-pod", "prefill-decode")
-		got := producer.estimateRequestTokens(ep, makeReq(), inputTok)
-		require.Equal(t, int64(inputTok+outputTok), got)
+		promptTokens, outputTokens := producer.estimateRequestTokens(ep, makeReq(), inputTok)
+		require.Equal(t, int64(inputTok), promptTokens)
+		require.Equal(t, int64(outputTok), outputTokens)
 	})
 }
 
