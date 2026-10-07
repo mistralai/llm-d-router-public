@@ -368,6 +368,82 @@ func TestGenerateRequestHeaderResponse_EndpointScores(t *testing.T) {
 	}
 }
 
+func TestIsWebSocketUpgrade(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    bool
+	}{
+		{
+			name: "single token per header",
+			headers: map[string]string{
+				"upgrade":    "websocket",
+				"connection": "upgrade",
+			},
+			want: true,
+		},
+		{
+			name: "multiple tokens per header",
+			headers: map[string]string{
+				"upgrade":    "websocket, sse, random",
+				"connection": "keep-alive, upgrade",
+			},
+			want: true,
+		},
+		{
+			name: "case-insensitive values",
+			headers: map[string]string{
+				"upgrade":    "WebSocket",
+				"connection": "Upgrade",
+			},
+			want: true,
+		},
+		{
+			name:    "empty headers",
+			headers: map[string]string{},
+			want:    false,
+		},
+		{
+			name: "upgrade without connection",
+			headers: map[string]string{
+				"upgrade": "websocket",
+			},
+			want: false,
+		},
+		{
+			name: "connection without upgrade",
+			headers: map[string]string{
+				"connection": "upgrade",
+			},
+			want: false,
+		},
+		{
+			name: "upgrade header present but connection lacks upgrade token",
+			headers: map[string]string{
+				"upgrade":    "websocket",
+				"connection": "keep-alive",
+			},
+			want: false,
+		},
+		{
+			name: "non-websocket upgrade",
+			headers: map[string]string{
+				"upgrade":    "h2c",
+				"connection": "upgrade",
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isWebsocketUpgrade(tc.headers))
+		})
+	}
+}
+
 func TestFallbackToRandomEndpoint(t *testing.T) {
 	t.Parallel()
 

@@ -56,7 +56,35 @@ func (s *StreamingServer) HandleRequestHeaders(ctx context.Context, reqCtx *Requ
 	reqCtx.ObjectiveKey, _ = metadata.GetLowerCaseHeaderValue(reqCtx.Request.Headers, metadata.ObjectiveKey)
 	reqCtx.TargetModelName, _ = metadata.GetLowerCaseHeaderValue(reqCtx.Request.Headers, metadata.ModelNameRewriteKey)
 
+	// A websocket upgrade is a bodyless request. Schedule it with RandomEndpoint.
+	if isWebsocketUpgrade(reqCtx.Request.Headers) {
+		return s.fallbackToRandomEndpoint(ctx, reqCtx, 0)
+	}
 	return nil
+}
+
+// isWebsocketUpgrade reports whether the request describes a websocket upgrade
+// (https://www.rfc-editor.org/info/rfc6455)
+func isWebsocketUpgrade(headers map[string]string) bool {
+	// The request must contain an |Upgrade| header field whose value must include the "websocket" keyword.
+	upgrade := false
+	for _, keyword := range strings.Split(headers["upgrade"], ",") {
+		if strings.EqualFold(strings.TrimSpace(keyword), "websocket") {
+			upgrade = true
+			break
+		}
+	}
+	if !upgrade {
+		return false
+	}
+
+	// The request must contain a |Connection| header field whose value must include the "Upgrade" token.
+	for _, token := range strings.Split(headers["connection"], ",") {
+		if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *StreamingServer) fallbackToRandomEndpoint(ctx context.Context, reqCtx *RequestContext, requestSize int) error {
