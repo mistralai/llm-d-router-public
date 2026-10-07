@@ -7,10 +7,14 @@ Stores cross-replica state in the EPP process. It is intended for tests and
 single-replica deployments that do not need synchronization between EPP
 instances.
 
+The runtime registers each contributor's state key, live local value reader,
+and aggregation function with the syncer. State operations identify the
+registered configuration by key.
+
 ## What It Does
 
-- Stores endpoint state in memory and applies the contributor's aggregation
-  function when state is set.
+- Reads the contributor's live local endpoint value and applies its aggregation
+  function.
 - Provides atomic `GetOrSet` coordination within one EPP process.
 - Uses the local hostname to isolate state associated with the EPP replica.
 
