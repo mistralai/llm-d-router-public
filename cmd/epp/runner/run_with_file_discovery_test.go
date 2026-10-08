@@ -24,6 +24,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,14 +41,57 @@ import (
 	runserver "github.com/llm-d/llm-d-router/pkg/epp/server"
 )
 
+const (
+	recordingSyncerType   = "recording-cross-replica-syncer"
+	recordingSyncerPlugin = "recording-syncer"
+)
+
+type recordingSyncer struct {
+	fwkdl.CrossReplicaSyncer
+	typedName fwkplugin.TypedName
+	mu        sync.RWMutex
+	sets      map[string]struct{}
+}
+
+func newRecordingSyncer(name string) *recordingSyncer {
+	return &recordingSyncer{
+		CrossReplicaSyncer: localsyncer.NewLocalSyncer(name, "test-replica"),
+		typedName:          fwkplugin.TypedName{Type: recordingSyncerType, Name: name},
+		sets:               make(map[string]struct{}),
+	}
+}
+
+func (s *recordingSyncer) TypedName() fwkplugin.TypedName {
+	return s.typedName
+}
+
+func (s *recordingSyncer) Set(ctx context.Context, spec fwkdl.CrossReplicaSpec, endpointID string) error {
+	if err := s.CrossReplicaSyncer.Set(ctx, spec, endpointID); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sets[string(spec.StateKey)+":"+endpointID] = struct{}{}
+	return nil
+}
+
+func (s *recordingSyncer) hasSet(key fwkdl.StateKey, endpointID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.sets[string(key)+":"+endpointID]
+	return ok
+}
+
 // TestRunWithFileDiscovery_Smoke is a wiring test for the file-discovery path.
 // It does not exercise ext_proc routing; that lives in the integration test.
-// The asserts here guard against regressions in: (a) phaseTwo + resolveDiscovery
-// agreeing on a single plugin instance (the bug elevran caught), (b) the
-// RunnableGroup's Ready() gate firing once the plugin loads its initial file,
-// and (c) the health and ext_proc gRPC servers binding their ports.
+// The assertions cover discovery plugin resolution, the RunnableGroup Ready
+// gate, server listener binding, and cross-replica publication for discovered
+// endpoints.
 func TestRunWithFileDiscovery_Smoke(t *testing.T) {
-	fwkplugin.Register(localsyncer.LocalSyncerType, fwkplugin.StabilityBeta, localsyncer.LocalSyncerFactory)
+	syncer := newRecordingSyncer(recordingSyncerPlugin)
+	fwkplugin.Register(recordingSyncerType, fwkplugin.StabilityBeta, func(_ string, _ *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+		return syncer, nil
+	})
 
 	dir := t.TempDir()
 	endpointsPath := filepath.Join(dir, "endpoints.yaml")
@@ -74,8 +118,8 @@ plugins:
     type: metrics-data-source
   - name: metrics-extractor
     type: core-metrics-extractor
-  - name: local-syncer
-    type: local-syncer
+  - name: recording-syncer
+    type: recording-cross-replica-syncer
   - name: inflight-load-producer
     type: inflight-load-producer
 schedulingProfiles:
@@ -84,7 +128,7 @@ schedulingProfiles:
       - pluginRef: random-picker
 dataLayer:
   injectDefaults: false
-  crossReplicaSyncerPluginRef: local-syncer
+  crossReplicaSyncerPluginRef: recording-syncer
   crossReplicaSyncInterval: 5ms
   discovery:
     pluginRef: file-discovery
@@ -195,8 +239,11 @@ dataLayer:
 	assert.Equal(t, "file-discovery", disc.TypedName().Type)
 	assert.Equal(t, "file-discovery", disc.TypedName().Name)
 
-	_, ok := r.PluginHandle.Plugin("local-syncer").(fwkdl.CrossReplicaSyncer)
+	_, ok := r.PluginHandle.Plugin(recordingSyncerPlugin).(fwkdl.CrossReplicaSyncer)
 	require.True(t, ok)
+	require.Eventually(t, func() bool {
+		return syncer.hasSet("inflight:inflight-load-producer", "test-ns/stub")
+	}, 2*time.Second, 10*time.Millisecond, "file-discovery endpoint should publish cross-replica state")
 
 	cancel()
 	select {
