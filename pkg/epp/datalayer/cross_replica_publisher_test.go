@@ -19,14 +19,17 @@ package datalayer
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
@@ -56,6 +59,7 @@ type fakeSyncer struct {
 	getValue any
 	getOK    bool
 	getErr   error
+	setErr   error
 }
 
 type fakeStateDefinition struct {
@@ -79,6 +83,9 @@ func (s *fakeSyncer) Bind(key fwkdl.StateKey, read func(string) fwkdl.Cloneable,
 func (s *fakeSyncer) Set(_ context.Context, key fwkdl.StateKey, endpointID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.setErr != nil {
+		return s.setErr
+	}
 	state, ok := s.bindings[key]
 	if !ok {
 		return fmt.Errorf("state key %q is not bound", key)
@@ -325,6 +332,29 @@ func TestCrossReplicaPublisher_PublishesForEndpoint(t *testing.T) {
 	assert.Equal(t, "ns/ep-a", syncer.sets[0].endpointID)
 	assert.Equal(t, fakeCloneable{id: "ns/ep-a"}, syncer.sets[0].value)
 	assert.Equal(t, 2, syncer.sets[0].aggregate([]any{"a", "b"}))
+}
+
+func TestCrossReplicaPublisher_RateLimitsVisiblePublishFailures(t *testing.T) {
+	syncer := &fakeSyncer{setErr: assert.AnError}
+	pub := testCrossReplicaPublisher(syncer, fakeContributor{key: "inflight:test"})
+	endpointID := types.NamespacedName{Namespace: "ns", Name: "ep-a"}
+	require.True(t, pub.registerEndpoint(endpointID))
+
+	var failures atomic.Int64
+	logger := funcr.New(func(_, args string) {
+		if strings.Contains(args, "cross-replica publish failed") {
+			failures.Add(1)
+		}
+	}, funcr.Options{})
+	ctx := log.IntoContext(context.Background(), logger)
+
+	pub.publish(ctx, endpointID)
+	pub.publish(ctx, endpointID)
+	require.Equal(t, int64(1), failures.Load())
+
+	pub.lastPublishFailureLogNanos.Store(time.Now().Add(-publishFailureLogInterval).UnixNano())
+	pub.publish(ctx, endpointID)
+	require.Equal(t, int64(2), failures.Load())
 }
 
 func TestCrossReplicaPublisher_CombinesLiveLocalWithCachedPeers(t *testing.T) {

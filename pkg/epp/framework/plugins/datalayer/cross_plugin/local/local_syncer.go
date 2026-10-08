@@ -37,6 +37,7 @@ type LocalSyncer struct {
 	typedName fwkplugin.TypedName
 	replicaID string
 	data      sync.Map
+	statesMu  sync.RWMutex
 	states    map[fwkdl.StateKey]stateDefinition
 }
 
@@ -66,6 +67,8 @@ func (s *LocalSyncer) TypedName() fwkplugin.TypedName {
 }
 
 func (s *LocalSyncer) Bind(key fwkdl.StateKey, read func(string) fwkdl.Cloneable, aggregate func([]any) any) {
+	s.statesMu.Lock()
+	defer s.statesMu.Unlock()
 	if s.states == nil {
 		s.states = make(map[fwkdl.StateKey]stateDefinition)
 	}
@@ -77,6 +80,8 @@ func (s *LocalSyncer) syncKey(key fwkdl.StateKey, id string) string {
 }
 
 func (s *LocalSyncer) state(key fwkdl.StateKey) (stateDefinition, error) {
+	s.statesMu.RLock()
+	defer s.statesMu.RUnlock()
 	state, ok := s.states[key]
 	if !ok {
 		return stateDefinition{}, fmt.Errorf("local-syncer: state key %q is not bound", key)

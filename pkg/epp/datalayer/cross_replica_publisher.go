@@ -21,13 +21,14 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 )
@@ -37,6 +38,7 @@ const (
 	// per-endpoint state is pushed to the syncer when none is configured.
 	defaultCrossReplicaSyncInterval   = 200 * time.Millisecond
 	defaultCrossReplicaPublishTimeout = time.Second
+	publishFailureLogInterval         = 30 * time.Second
 )
 
 // crossReplicaPublisher owns cross-replica publishing and endpoint lifecycle
@@ -50,6 +52,8 @@ type crossReplicaPublisher struct {
 	// mu guards endpoints and orders syncer operations with endpoint removal.
 	mu        sync.RWMutex
 	endpoints sets.Set[types.NamespacedName]
+
+	lastPublishFailureLogNanos atomic.Int64
 }
 
 // newCrossReplicaPublisher collects the opted-in CrossReplicaContributors, or
@@ -201,9 +205,21 @@ func (p *crossReplicaPublisher) publish(ctx context.Context, key types.Namespace
 		spec := c.CrossReplicaState()
 		wg.Go(func() {
 			if err := p.set(ctx, spec.StateKey, key); err != nil {
-				logger.V(logging.DEBUG).Info("cross-replica publish failed", "key", spec.StateKey, "err", err)
+				p.logPublishFailure(logger, spec.StateKey, err)
 			}
 		})
 	}
 	wg.Wait()
+}
+
+func (p *crossReplicaPublisher) logPublishFailure(logger logr.Logger, key fwkdl.StateKey, err error) {
+	now := time.Now().UnixNano()
+	last := p.lastPublishFailureLogNanos.Load()
+	if now-last < int64(publishFailureLogInterval) {
+		return
+	}
+	if !p.lastPublishFailureLogNanos.CompareAndSwap(last, now) {
+		return
+	}
+	logger.Error(err, "cross-replica publish failed", "key", key)
 }
