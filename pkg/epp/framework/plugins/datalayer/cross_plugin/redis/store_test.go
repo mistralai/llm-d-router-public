@@ -207,26 +207,26 @@ func TestSetPreparesPeerAggregateAndGetCombinesLiveLocal(t *testing.T) {
 		aggregateCalls.Add(1)
 		return sumCloneableInts(values)
 	}
-	store.Bind(
-		testStateKey,
-		func(string) fwkdl.Cloneable { return local },
-		aggregate,
-	)
+	spec := fwkdl.CrossReplicaSpec{
+		StateKey:  testStateKey,
+		Read:      func(string) fwkdl.Cloneable { return local },
+		Aggregate: aggregate,
+	}
 
-	require.NoError(t, store.Set(context.Background(), testStateKey, testEndpointID))
+	require.NoError(t, store.Set(context.Background(), spec, testEndpointID))
 	require.Equal(t, int64(1), counter.count.Load())
 	require.Equal(t, int64(1), aggregateCalls.Load())
 	cached, ok := store.cache.Load(store.hashKey(testStateKey, testEndpointID))
 	require.True(t, ok)
 	require.Equal(t, cloneableInt(7), cached.(*aggregateCacheEntry).value)
 
-	value, ok, err := store.Get(context.Background(), testStateKey, testEndpointID)
+	value, ok, err := store.Get(context.Background(), spec, testEndpointID)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, cloneableInt(11), value)
 
 	local = 5
-	value, ok, err = store.Get(context.Background(), testStateKey, testEndpointID)
+	value, ok, err = store.Get(context.Background(), spec, testEndpointID)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, cloneableInt(12), value)
@@ -248,23 +248,14 @@ func TestGetAggregatesLiveLocalWithoutPeers(t *testing.T) {
 	require.Equal(t, 5, total)
 }
 
-func TestStateOperationsRequireBinding(t *testing.T) {
+func TestSetAndGetConcurrent(t *testing.T) {
 	server := miniredis.RunT(t)
 	store, _ := newTestStore(t, server, testReplicaID)
-
-	assert.Error(t, store.Set(context.Background(), "missing", testEndpointID))
-	_, ok, err := store.Get(context.Background(), "missing", testEndpointID)
-	assert.False(t, ok)
-	assert.Error(t, err)
-	assert.Error(t, store.Delete(context.Background(), "missing", testEndpointID))
-}
-
-func TestSetAndGetConcurrentAfterBinding(t *testing.T) {
-	server := miniredis.RunT(t)
-	store, _ := newTestStore(t, server, testReplicaID)
-	read := func(string) fwkdl.Cloneable { return cloneableInt(1) }
-	aggregate := sumCloneableInts
-	store.Bind(testStateKey, read, aggregate)
+	spec := fwkdl.CrossReplicaSpec{
+		StateKey:  testStateKey,
+		Read:      func(string) fwkdl.Cloneable { return cloneableInt(1) },
+		Aggregate: sumCloneableInts,
+	}
 
 	const iterations = 50
 	errs := make(chan error, 4*iterations)
@@ -272,8 +263,8 @@ func TestSetAndGetConcurrentAfterBinding(t *testing.T) {
 	for range 2 {
 		wg.Go(func() {
 			for range iterations {
-				errs <- store.Set(context.Background(), testStateKey, testEndpointID)
-				_, _, err := store.Get(context.Background(), testStateKey, testEndpointID)
+				errs <- store.Set(context.Background(), spec, testEndpointID)
+				_, _, err := store.Get(context.Background(), spec, testEndpointID)
 				errs <- err
 			}
 		})
@@ -439,7 +430,7 @@ func TestDeleteInvalidatesAggregateAndReplicaField(t *testing.T) {
 	seedReplica(t, server, testStateKey, "epp-b", 7)
 	require.NoError(t, store.set(context.Background(), testStateKey, testEndpointID, 4, sumInts))
 
-	require.NoError(t, store.delete(context.Background(), testStateKey, testEndpointID))
+	require.NoError(t, store.Delete(context.Background(), testStateKey, testEndpointID))
 
 	_, ok := store.cache.Load(store.hashKey(testStateKey, testEndpointID))
 	require.False(t, ok)
@@ -457,7 +448,7 @@ func TestDeleteInvalidatesAggregateWhenRedisFails(t *testing.T) {
 	hashKey := store.hashKey(testStateKey, testEndpointID)
 	store.cache.Store(hashKey, &aggregateCacheEntry{value: 7, expiresAt: time.Now().Add(testStateTTL)})
 
-	err := store.delete(context.Background(), testStateKey, testEndpointID)
+	err := store.Delete(context.Background(), testStateKey, testEndpointID)
 
 	require.ErrorContains(t, err, "redis unavailable")
 	_, ok := store.cache.Load(hashKey)

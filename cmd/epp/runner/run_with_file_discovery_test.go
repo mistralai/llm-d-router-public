@@ -68,13 +68,13 @@ func (s *recordingSyncer) TypedName() fwkplugin.TypedName {
 	return s.typedName
 }
 
-func (s *recordingSyncer) Set(ctx context.Context, key fwkdl.StateKey, endpointID string) error {
-	if err := s.CrossReplicaSyncer.Set(ctx, key, endpointID); err != nil {
+func (s *recordingSyncer) Set(ctx context.Context, spec fwkdl.CrossReplicaSpec, endpointID string) error {
+	if err := s.CrossReplicaSyncer.Set(ctx, spec, endpointID); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sets[string(key)+":"+endpointID] = struct{}{}
+	s.sets[string(spec.StateKey)+":"+endpointID] = struct{}{}
 	return nil
 }
 

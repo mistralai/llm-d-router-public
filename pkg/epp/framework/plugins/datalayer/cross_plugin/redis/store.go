@@ -76,8 +76,6 @@ type redisTLSConfig struct {
 // state sharing. Set prepares each endpoint's peer aggregate, and Get combines
 // it with the live local value.
 type RedisStateStore struct {
-	fwkdl.StateBindings
-
 	typedName       fwkplugin.TypedName
 	replicaID       string
 	client          *goredis.Client
@@ -320,12 +318,8 @@ func (s *RedisStateStore) set(ctx context.Context, key fwkdl.StateKey, endpointI
 	return nil
 }
 
-func (s *RedisStateStore) Set(ctx context.Context, key fwkdl.StateKey, endpointID string) error {
-	state, err := s.Binding(key)
-	if err != nil {
-		return err
-	}
-	return s.set(ctx, key, endpointID, state.Read(endpointID), state.Aggregate)
+func (s *RedisStateStore) Set(ctx context.Context, spec fwkdl.CrossReplicaSpec, endpointID string) error {
+	return s.set(ctx, spec.StateKey, endpointID, spec.Read(endpointID), spec.Aggregate)
 }
 
 // get combines the live local value with the peer aggregate prepared by set.
@@ -343,12 +337,8 @@ func (s *RedisStateStore) get(_ context.Context, key fwkdl.StateKey, endpointID 
 	return aggregate([]any{local, entry.value})
 }
 
-func (s *RedisStateStore) Get(ctx context.Context, key fwkdl.StateKey, endpointID string) (any, bool, error) {
-	state, err := s.Binding(key)
-	if err != nil {
-		return nil, false, err
-	}
-	return s.get(ctx, key, endpointID, state.Read(endpointID), state.Aggregate), true, nil
+func (s *RedisStateStore) Get(ctx context.Context, spec fwkdl.CrossReplicaSpec, endpointID string) (any, bool, error) {
+	return s.get(ctx, spec.StateKey, endpointID, spec.Read(endpointID), spec.Aggregate), true, nil
 }
 
 func (s *RedisStateStore) delete(ctx context.Context, key fwkdl.StateKey, endpointID string) error {
@@ -358,9 +348,6 @@ func (s *RedisStateStore) delete(ctx context.Context, key fwkdl.StateKey, endpoi
 }
 
 func (s *RedisStateStore) Delete(ctx context.Context, key fwkdl.StateKey, endpointID string) error {
-	if _, err := s.Binding(key); err != nil {
-		return err
-	}
 	return s.delete(ctx, key, endpointID)
 }
 

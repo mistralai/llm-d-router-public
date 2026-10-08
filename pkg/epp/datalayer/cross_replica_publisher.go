@@ -67,9 +67,7 @@ func newCrossReplicaPublisher(syncer fwkdl.CrossReplicaSyncer, extractors *extra
 	extractors.Range(func(_ string, exts []fwkplugin.Plugin) bool {
 		for _, ext := range exts {
 			if c, ok := ext.(fwkdl.CrossReplicaContributor); ok && !c.CrossReplicaState().SyncDisabled {
-				spec := c.CrossReplicaState()
 				contributors = append(contributors, c)
-				syncer.Bind(spec.StateKey, spec.Read, spec.Aggregate)
 			}
 		}
 		return true
@@ -150,7 +148,7 @@ func (p *crossReplicaPublisher) handleEndpointEvent(ctx context.Context, event f
 	endpointID := event.Endpoint.GetMetadata().GetNamespacedName().String()
 	event.Endpoint.GetAttributes().Put(spec.AttributeKey, &fwkdl.DynamicAttribute{
 		Get: func() fwkdl.Cloneable {
-			value, ok, err := p.get(ctx, spec.StateKey, endpointID)
+			value, ok, err := p.get(ctx, spec, endpointID)
 			if err != nil || !ok {
 				return spec.Read(endpointID)
 			}
@@ -162,20 +160,20 @@ func (p *crossReplicaPublisher) handleEndpointEvent(ctx context.Context, event f
 	})
 }
 
-func (p *crossReplicaPublisher) set(ctx context.Context, stateKey fwkdl.StateKey, key types.NamespacedName) error {
+func (p *crossReplicaPublisher) set(ctx context.Context, spec fwkdl.CrossReplicaSpec, key types.NamespacedName) error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	// The endpoint may have been deleted after publishAll took its snapshot.
 	if !p.endpoints.Has(key) {
 		return nil
 	}
-	return p.syncer.Set(ctx, stateKey, key.String())
+	return p.syncer.Set(ctx, spec, key.String())
 }
 
-func (p *crossReplicaPublisher) get(ctx context.Context, stateKey fwkdl.StateKey, endpointID string) (any, bool, error) {
+func (p *crossReplicaPublisher) get(ctx context.Context, spec fwkdl.CrossReplicaSpec, endpointID string) (any, bool, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.syncer.Get(ctx, stateKey, endpointID)
+	return p.syncer.Get(ctx, spec, endpointID)
 }
 
 func (p *crossReplicaPublisher) delete(ctx context.Context, key types.NamespacedName) (bool, error) {
@@ -204,7 +202,7 @@ func (p *crossReplicaPublisher) publish(ctx context.Context, key types.Namespace
 	for _, c := range p.contributors {
 		spec := c.CrossReplicaState()
 		wg.Go(func() {
-			if err := p.set(ctx, spec.StateKey, key); err != nil {
+			if err := p.set(ctx, spec, key); err != nil {
 				p.logPublishFailure(logger, spec.StateKey, err)
 			}
 		})

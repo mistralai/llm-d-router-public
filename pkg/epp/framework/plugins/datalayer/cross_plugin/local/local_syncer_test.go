@@ -37,41 +37,33 @@ func TestLocalSyncerAggregatesLiveLocalValue(t *testing.T) {
 		return values[0].(cloneableInt) * 2
 	}
 	local := 21
-	syncer.Bind(
-		"load",
-		func(string) fwkdl.Cloneable { return cloneableInt(local) },
-		aggregate,
-	)
+	spec := fwkdl.CrossReplicaSpec{
+		StateKey:  "load",
+		Read:      func(string) fwkdl.Cloneable { return cloneableInt(local) },
+		Aggregate: aggregate,
+	}
 
-	require.NoError(t, syncer.Set(context.Background(), "load", "default/backend-0"))
-	value, ok, err := syncer.Get(context.Background(), "load", "default/backend-0")
+	require.NoError(t, syncer.Set(context.Background(), spec, "default/backend-0"))
+	value, ok, err := syncer.Get(context.Background(), spec, "default/backend-0")
 
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, cloneableInt(42), value)
 
 	local = 22
-	value, ok, err = syncer.Get(context.Background(), "load", "default/backend-0")
+	value, ok, err = syncer.Get(context.Background(), spec, "default/backend-0")
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, cloneableInt(44), value)
 }
 
-func TestLocalSyncerRequiresBinding(t *testing.T) {
+func TestLocalSyncerConcurrentStateOperations(t *testing.T) {
 	syncer := NewLocalSyncer("test", "replica-a")
-
-	assert.Error(t, syncer.Set(context.Background(), "missing", "default/backend-0"))
-	_, ok, err := syncer.Get(context.Background(), "missing", "default/backend-0")
-	assert.False(t, ok)
-	assert.Error(t, err)
-	assert.Error(t, syncer.Delete(context.Background(), "missing", "default/backend-0"))
-}
-
-func TestLocalSyncerConcurrentStateOperationsAfterBinding(t *testing.T) {
-	syncer := NewLocalSyncer("test", "replica-a")
-	read := func(string) fwkdl.Cloneable { return cloneableInt(1) }
-	aggregate := func(values []any) any { return values[0] }
-	syncer.Bind("load", read, aggregate)
+	spec := fwkdl.CrossReplicaSpec{
+		StateKey:  "load",
+		Read:      func(string) fwkdl.Cloneable { return cloneableInt(1) },
+		Aggregate: func(values []any) any { return values[0] },
+	}
 
 	const iterations = 100
 	errs := make(chan error, 4*iterations)
@@ -79,8 +71,8 @@ func TestLocalSyncerConcurrentStateOperationsAfterBinding(t *testing.T) {
 	for range 2 {
 		wg.Go(func() {
 			for range iterations {
-				errs <- syncer.Set(context.Background(), "load", "default/backend-0")
-				_, _, err := syncer.Get(context.Background(), "load", "default/backend-0")
+				errs <- syncer.Set(context.Background(), spec, "default/backend-0")
+				_, _, err := syncer.Get(context.Background(), spec, "default/backend-0")
 				errs <- err
 			}
 		})

@@ -33,8 +33,6 @@ var _ fwkdl.CrossReplicaSyncer = (*LocalSyncer)(nil)
 // LocalSyncer is an in-memory CrossReplicaSyncer for single-replica
 // deployments and testing. No cross-replica synchronization is performed.
 type LocalSyncer struct {
-	fwkdl.StateBindings
-
 	typedName fwkplugin.TypedName
 	replicaID string
 	data      sync.Map
@@ -63,22 +61,16 @@ func (s *LocalSyncer) syncKey(key fwkdl.StateKey, id string) string {
 	return s.replicaID + ":" + string(key) + ":" + id
 }
 
-func (s *LocalSyncer) Set(_ context.Context, key fwkdl.StateKey, _ string) error {
-	_, err := s.Binding(key)
-	return err
+func (s *LocalSyncer) Set(context.Context, fwkdl.CrossReplicaSpec, string) error {
+	return nil
 }
 
-func (s *LocalSyncer) Get(_ context.Context, key fwkdl.StateKey, endpointID string) (any, bool, error) {
-	state, err := s.Binding(key)
-	if err != nil {
-		return nil, false, err
-	}
-	return state.Aggregate([]any{state.Read(endpointID)}), true, nil
+func (s *LocalSyncer) Get(_ context.Context, spec fwkdl.CrossReplicaSpec, endpointID string) (any, bool, error) {
+	return spec.Aggregate([]any{spec.Read(endpointID)}), true, nil
 }
 
-func (s *LocalSyncer) Delete(_ context.Context, key fwkdl.StateKey, _ string) error {
-	_, err := s.Binding(key)
-	return err
+func (s *LocalSyncer) Delete(context.Context, fwkdl.StateKey, string) error {
+	return nil
 }
 
 func (s *LocalSyncer) GetOrSet(_ context.Context, key fwkdl.StateKey, id string, candidate any) (any, bool, error) {

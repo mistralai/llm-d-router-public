@@ -8,10 +8,6 @@ Redis. Each EPP publishes its local endpoint value. During `Set`, the plugin
 prepares a peer aggregate in its in-process cache. `Get` reads the contributor's
 live local value and combines it with the cached peer aggregate.
 
-The runtime registers each contributor's state key, live local value reader,
-and aggregation function with the syncer. State operations identify the
-registered configuration by key.
-
 ## Configuration
 
 ```yaml
