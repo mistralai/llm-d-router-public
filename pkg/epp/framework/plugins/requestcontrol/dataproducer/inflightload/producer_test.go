@@ -775,7 +775,7 @@ func TestInFlightLoadProducer_IncludeOutputTokens_StartOfStreamRelease(t *testin
 			producer.ResponseBody(ctx, req, &requestcontrol.Response{}, nil)
 			expect(1, tc.wantOutput)
 
-			shared := producer.CrossReplicaState().Supply(endpointID)().(*attrconcurrency.InFlightLoad)
+			shared := producer.CrossReplicaState().Read(endpointID).(*attrconcurrency.InFlightLoad)
 			require.Equal(t, &attrconcurrency.InFlightLoad{Requests: 1, Tokens: tc.wantOutput}, shared)
 
 			producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
