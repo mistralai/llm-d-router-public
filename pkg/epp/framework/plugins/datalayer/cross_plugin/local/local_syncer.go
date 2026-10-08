@@ -19,7 +19,6 @@ package local
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"sync"
 
@@ -34,23 +33,17 @@ var _ fwkdl.CrossReplicaSyncer = (*LocalSyncer)(nil)
 // LocalSyncer is an in-memory CrossReplicaSyncer for single-replica
 // deployments and testing. No cross-replica synchronization is performed.
 type LocalSyncer struct {
+	fwkdl.StateBindings
+
 	typedName fwkplugin.TypedName
 	replicaID string
 	data      sync.Map
-	statesMu  sync.RWMutex
-	states    map[fwkdl.StateKey]stateDefinition
-}
-
-type stateDefinition struct {
-	read      func(string) fwkdl.Cloneable
-	aggregate func([]any) any
 }
 
 func NewLocalSyncer(name, replicaID string) *LocalSyncer {
 	return &LocalSyncer{
 		typedName: fwkplugin.TypedName{Type: LocalSyncerType, Name: name},
 		replicaID: replicaID,
-		states:    make(map[fwkdl.StateKey]stateDefinition),
 	}
 }
 
@@ -66,44 +59,25 @@ func (s *LocalSyncer) TypedName() fwkplugin.TypedName {
 	return s.typedName
 }
 
-func (s *LocalSyncer) Bind(key fwkdl.StateKey, read func(string) fwkdl.Cloneable, aggregate func([]any) any) {
-	s.statesMu.Lock()
-	defer s.statesMu.Unlock()
-	if s.states == nil {
-		s.states = make(map[fwkdl.StateKey]stateDefinition)
-	}
-	s.states[key] = stateDefinition{read: read, aggregate: aggregate}
-}
-
 func (s *LocalSyncer) syncKey(key fwkdl.StateKey, id string) string {
 	return s.replicaID + ":" + string(key) + ":" + id
 }
 
-func (s *LocalSyncer) state(key fwkdl.StateKey) (stateDefinition, error) {
-	s.statesMu.RLock()
-	defer s.statesMu.RUnlock()
-	state, ok := s.states[key]
-	if !ok {
-		return stateDefinition{}, fmt.Errorf("local-syncer: state key %q is not bound", key)
-	}
-	return state, nil
-}
-
 func (s *LocalSyncer) Set(_ context.Context, key fwkdl.StateKey, _ string) error {
-	_, err := s.state(key)
+	_, err := s.Binding(key)
 	return err
 }
 
 func (s *LocalSyncer) Get(_ context.Context, key fwkdl.StateKey, endpointID string) (any, bool, error) {
-	state, err := s.state(key)
+	state, err := s.Binding(key)
 	if err != nil {
 		return nil, false, err
 	}
-	return state.aggregate([]any{state.read(endpointID)}), true, nil
+	return state.Aggregate([]any{state.Read(endpointID)}), true, nil
 }
 
 func (s *LocalSyncer) Delete(_ context.Context, key fwkdl.StateKey, _ string) error {
-	_, err := s.state(key)
+	_, err := s.Binding(key)
 	return err
 }
 

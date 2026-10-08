@@ -259,7 +259,7 @@ func TestStateOperationsRequireBinding(t *testing.T) {
 	assert.Error(t, store.Delete(context.Background(), "missing", testEndpointID))
 }
 
-func TestBindConcurrentWithSetAndGet(t *testing.T) {
+func TestSetAndGetConcurrentAfterBinding(t *testing.T) {
 	server := miniredis.RunT(t)
 	store, _ := newTestStore(t, server, testReplicaID)
 	read := func(string) fwkdl.Cloneable { return cloneableInt(1) }
@@ -267,20 +267,17 @@ func TestBindConcurrentWithSetAndGet(t *testing.T) {
 	store.Bind(testStateKey, read, aggregate)
 
 	const iterations = 50
-	errs := make(chan error, 2*iterations)
+	errs := make(chan error, 4*iterations)
 	var wg sync.WaitGroup
-	wg.Go(func() {
-		for range iterations {
-			store.Bind(testStateKey, read, aggregate)
-		}
-	})
-	wg.Go(func() {
-		for range iterations {
-			errs <- store.Set(context.Background(), testStateKey, testEndpointID)
-			_, _, err := store.Get(context.Background(), testStateKey, testEndpointID)
-			errs <- err
-		}
-	})
+	for range 2 {
+		wg.Go(func() {
+			for range iterations {
+				errs <- store.Set(context.Background(), testStateKey, testEndpointID)
+				_, _, err := store.Get(context.Background(), testStateKey, testEndpointID)
+				errs <- err
+			}
+		})
+	}
 	wg.Wait()
 	close(errs)
 

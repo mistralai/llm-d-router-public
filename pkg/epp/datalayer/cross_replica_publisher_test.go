@@ -18,7 +18,6 @@ package datalayer
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,8 +51,9 @@ type setCall struct {
 }
 
 type fakeSyncer struct {
+	fwkdl.StateBindings
+
 	mu       sync.Mutex
-	bindings map[fwkdl.StateKey]fakeStateDefinition
 	sets     []setCall
 	deletes  []setCall
 	getValue any
@@ -62,22 +62,8 @@ type fakeSyncer struct {
 	setErr   error
 }
 
-type fakeStateDefinition struct {
-	read      func(string) fwkdl.Cloneable
-	aggregate func([]any) any
-}
-
 func (s *fakeSyncer) TypedName() fwkplugin.TypedName {
 	return fwkplugin.TypedName{Type: "fake-syncer", Name: "fake-syncer"}
-}
-
-func (s *fakeSyncer) Bind(key fwkdl.StateKey, read func(string) fwkdl.Cloneable, aggregate func([]any) any) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.bindings == nil {
-		s.bindings = make(map[fwkdl.StateKey]fakeStateDefinition)
-	}
-	s.bindings[key] = fakeStateDefinition{read: read, aggregate: aggregate}
 }
 
 func (s *fakeSyncer) Set(_ context.Context, key fwkdl.StateKey, endpointID string) error {
@@ -86,15 +72,15 @@ func (s *fakeSyncer) Set(_ context.Context, key fwkdl.StateKey, endpointID strin
 	if s.setErr != nil {
 		return s.setErr
 	}
-	state, ok := s.bindings[key]
-	if !ok {
-		return fmt.Errorf("state key %q is not bound", key)
+	state, err := s.Binding(key)
+	if err != nil {
+		return err
 	}
 	s.sets = append(s.sets, setCall{
 		key:        key,
 		endpointID: endpointID,
-		value:      state.read(endpointID),
-		aggregate:  state.aggregate,
+		value:      state.Read(endpointID),
+		aggregate:  state.Aggregate,
 	})
 	return nil
 }
@@ -102,25 +88,25 @@ func (s *fakeSyncer) Set(_ context.Context, key fwkdl.StateKey, endpointID strin
 func (s *fakeSyncer) Get(_ context.Context, key fwkdl.StateKey, endpointID string) (any, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	state, ok := s.bindings[key]
-	if !ok {
-		return nil, false, fmt.Errorf("state key %q is not bound", key)
+	state, err := s.Binding(key)
+	if err != nil {
+		return nil, false, err
 	}
 	if s.getErr != nil {
 		return nil, false, s.getErr
 	}
-	values := []any{state.read(endpointID)}
+	values := []any{state.Read(endpointID)}
 	if s.getOK {
 		values = append(values, s.getValue)
 	}
-	return state.aggregate(values), true, nil
+	return state.Aggregate(values), true, nil
 }
 
 func (s *fakeSyncer) Delete(_ context.Context, key fwkdl.StateKey, endpointID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.bindings[key]; !ok {
-		return fmt.Errorf("state key %q is not bound", key)
+	if _, err := s.Binding(key); err != nil {
+		return err
 	}
 	s.deletes = append(s.deletes, setCall{key: key, endpointID: endpointID})
 	return nil
@@ -181,12 +167,13 @@ func (c callbackEndpointContributor) Extract(_ context.Context, event fwkdl.Endp
 }
 
 type blockingSyncer struct {
+	fwkdl.StateBindings
+
 	mu         sync.Mutex
 	setStarted chan struct{}
 	allowSet   chan struct{}
 	startOnce  sync.Once
 	state      map[string]any
-	bindings   map[fwkdl.StateKey]fakeStateDefinition
 	events     []string
 }
 
@@ -229,7 +216,6 @@ func newBlockingSyncer() *blockingSyncer {
 		setStarted: make(chan struct{}),
 		allowSet:   make(chan struct{}),
 		state:      make(map[string]any),
-		bindings:   make(map[fwkdl.StateKey]fakeStateDefinition),
 	}
 }
 
@@ -237,20 +223,16 @@ func (s *blockingSyncer) TypedName() fwkplugin.TypedName {
 	return fwkplugin.TypedName{Type: "blocking-syncer", Name: "blocking-syncer"}
 }
 
-func (s *blockingSyncer) Bind(key fwkdl.StateKey, read func(string) fwkdl.Cloneable, aggregate func([]any) any) {
-	s.bindings[key] = fakeStateDefinition{read: read, aggregate: aggregate}
-}
-
 func (s *blockingSyncer) Set(_ context.Context, key fwkdl.StateKey, endpointID string) error {
-	state, ok := s.bindings[key]
-	if !ok {
-		return fmt.Errorf("state key %q is not bound", key)
+	state, err := s.Binding(key)
+	if err != nil {
+		return err
 	}
 	s.startOnce.Do(func() { close(s.setStarted) })
 	<-s.allowSet
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.state[endpointID] = state.read(endpointID)
+	s.state[endpointID] = state.Read(endpointID)
 	s.events = append(s.events, "set")
 	return nil
 }
@@ -258,22 +240,22 @@ func (s *blockingSyncer) Set(_ context.Context, key fwkdl.StateKey, endpointID s
 func (s *blockingSyncer) Get(_ context.Context, key fwkdl.StateKey, endpointID string) (any, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	state, ok := s.bindings[key]
-	if !ok {
-		return nil, false, fmt.Errorf("state key %q is not bound", key)
+	state, err := s.Binding(key)
+	if err != nil {
+		return nil, false, err
 	}
-	values := []any{state.read(endpointID)}
+	values := []any{state.Read(endpointID)}
 	if value, ok := s.state[endpointID]; ok {
 		values = append(values, value)
 	}
-	return state.aggregate(values), true, nil
+	return state.Aggregate(values), true, nil
 }
 
 func (s *blockingSyncer) Delete(_ context.Context, key fwkdl.StateKey, endpointID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.bindings[key]; !ok {
-		return fmt.Errorf("state key %q is not bound", key)
+	if _, err := s.Binding(key); err != nil {
+		return err
 	}
 	delete(s.state, endpointID)
 	s.events = append(s.events, "delete")

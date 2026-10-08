@@ -32,6 +32,7 @@ type CrossReplicaSyncer interface {
 	fwkplugin.Plugin
 
 	// Bind registers the live local value reader and aggregation function for key.
+	// All Bind calls must finish before Set, Get, or Delete is called.
 	Bind(key StateKey, read func(endpointID string) Cloneable, aggregate func([]any) any)
 
 	// Set publishes the live local value for endpointID and refreshes the peer

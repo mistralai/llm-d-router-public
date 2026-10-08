@@ -67,27 +67,24 @@ func TestLocalSyncerRequiresBinding(t *testing.T) {
 	assert.Error(t, syncer.Delete(context.Background(), "missing", "default/backend-0"))
 }
 
-func TestLocalSyncerBindConcurrentWithStateOperations(t *testing.T) {
+func TestLocalSyncerConcurrentStateOperationsAfterBinding(t *testing.T) {
 	syncer := NewLocalSyncer("test", "replica-a")
 	read := func(string) fwkdl.Cloneable { return cloneableInt(1) }
 	aggregate := func(values []any) any { return values[0] }
 	syncer.Bind("load", read, aggregate)
 
 	const iterations = 100
-	errs := make(chan error, 2*iterations)
+	errs := make(chan error, 4*iterations)
 	var wg sync.WaitGroup
-	wg.Go(func() {
-		for range iterations {
-			syncer.Bind("load", read, aggregate)
-		}
-	})
-	wg.Go(func() {
-		for range iterations {
-			errs <- syncer.Set(context.Background(), "load", "default/backend-0")
-			_, _, err := syncer.Get(context.Background(), "load", "default/backend-0")
-			errs <- err
-		}
-	})
+	for range 2 {
+		wg.Go(func() {
+			for range iterations {
+				errs <- syncer.Set(context.Background(), "load", "default/backend-0")
+				_, _, err := syncer.Get(context.Background(), "load", "default/backend-0")
+				errs <- err
+			}
+		})
+	}
 	wg.Wait()
 	close(errs)
 

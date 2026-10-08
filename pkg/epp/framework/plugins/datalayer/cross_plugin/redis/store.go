@@ -76,24 +76,19 @@ type redisTLSConfig struct {
 // state sharing. Set prepares each endpoint's peer aggregate, and Get combines
 // it with the live local value.
 type RedisStateStore struct {
+	fwkdl.StateBindings
+
 	typedName       fwkplugin.TypedName
 	replicaID       string
 	client          *goredis.Client
 	stateTTL        time.Duration
 	coordinationTTL time.Duration
 	cache           sync.Map
-	statesMu        sync.RWMutex
-	states          map[fwkdl.StateKey]stateDefinition
 }
 
 type aggregateCacheEntry struct {
 	value     any
 	expiresAt time.Time
-}
-
-type stateDefinition struct {
-	read      func(string) fwkdl.Cloneable
-	aggregate func([]any) any
 }
 
 func parseTTL(name, raw string, defaultValue time.Duration) (time.Duration, error) {
@@ -226,31 +221,11 @@ func RedisStateStoreFactory(name string, params *json.Decoder, handle fwkplugin.
 		client:          client,
 		stateTTL:        stateTTL,
 		coordinationTTL: coordinationTTL,
-		states:          make(map[fwkdl.StateKey]stateDefinition),
 	}, nil
 }
 
 func (s *RedisStateStore) TypedName() fwkplugin.TypedName {
 	return s.typedName
-}
-
-func (s *RedisStateStore) Bind(key fwkdl.StateKey, read func(string) fwkdl.Cloneable, aggregate func([]any) any) {
-	s.statesMu.Lock()
-	defer s.statesMu.Unlock()
-	if s.states == nil {
-		s.states = make(map[fwkdl.StateKey]stateDefinition)
-	}
-	s.states[key] = stateDefinition{read: read, aggregate: aggregate}
-}
-
-func (s *RedisStateStore) state(key fwkdl.StateKey) (stateDefinition, error) {
-	s.statesMu.RLock()
-	defer s.statesMu.RUnlock()
-	state, ok := s.states[key]
-	if !ok {
-		return stateDefinition{}, fmt.Errorf("redis-state-store: state key %q is not bound", key)
-	}
-	return state, nil
 }
 
 func (s *RedisStateStore) hashKey(key fwkdl.StateKey, endpointID string) string {
@@ -346,11 +321,11 @@ func (s *RedisStateStore) set(ctx context.Context, key fwkdl.StateKey, endpointI
 }
 
 func (s *RedisStateStore) Set(ctx context.Context, key fwkdl.StateKey, endpointID string) error {
-	state, err := s.state(key)
+	state, err := s.Binding(key)
 	if err != nil {
 		return err
 	}
-	return s.set(ctx, key, endpointID, state.read(endpointID), state.aggregate)
+	return s.set(ctx, key, endpointID, state.Read(endpointID), state.Aggregate)
 }
 
 // get combines the live local value with the peer aggregate prepared by set.
@@ -369,11 +344,11 @@ func (s *RedisStateStore) get(_ context.Context, key fwkdl.StateKey, endpointID 
 }
 
 func (s *RedisStateStore) Get(ctx context.Context, key fwkdl.StateKey, endpointID string) (any, bool, error) {
-	state, err := s.state(key)
+	state, err := s.Binding(key)
 	if err != nil {
 		return nil, false, err
 	}
-	return s.get(ctx, key, endpointID, state.read(endpointID), state.aggregate), true, nil
+	return s.get(ctx, key, endpointID, state.Read(endpointID), state.Aggregate), true, nil
 }
 
 func (s *RedisStateStore) delete(ctx context.Context, key fwkdl.StateKey, endpointID string) error {
@@ -383,7 +358,7 @@ func (s *RedisStateStore) delete(ctx context.Context, key fwkdl.StateKey, endpoi
 }
 
 func (s *RedisStateStore) Delete(ctx context.Context, key fwkdl.StateKey, endpointID string) error {
-	if _, err := s.state(key); err != nil {
+	if _, err := s.Binding(key); err != nil {
 		return err
 	}
 	return s.delete(ctx, key, endpointID)
