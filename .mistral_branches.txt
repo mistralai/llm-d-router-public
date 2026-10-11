@@ -20,7 +20,7 @@
 nzt/v1.0.2-pinned-reconstruction                      # adds pinned-base rebuilds on top of lfm/v1.0.2-rebased-upstream-build-tooling
 lfm/v1.0.2-rebased-upstream-dp-kvevents               # shared-port multi-DP routing with ordered KV-event cleanup
 lfm/v1.0.2-rebased-upstream-objective-key             # resolve inference objectives after request-header plugins
-lfm/v1.0.2-rebased-upstream-coordinator-revision      # revision forwarding across coordinator phases
+nicolo.lucchesi/pd-chat-token-reuse-integration       # revision forwarding and text chat prompt-token reuse (https://github.com/mistralai/llm-d-router-public/pull/47)
 lfm/v1.0.2-rebased-upstream-rawbody-release           # release request RawBody after Envoy forwarding
 
 lfm/multimodal-streaming-token-accounting            # preserve multimodal accounting and release prompt load at stream start (https://github.com/mistralai/llm-d-router-public/pull/39, https://github.com/mistralai/llm-d-router-public/pull/41)
