@@ -19,9 +19,11 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
@@ -31,6 +33,62 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline"
 )
+
+func TestPrefillPromptTokenReuse_RejectsIncompleteHandoff(t *testing.T) {
+	for _, response := range []string{
+		`{"kv_transfer_params":{"remote_request_id":"p"}}`,
+		`{"prompt_token_ids":[],"kv_transfer_params":{"remote_request_id":"p"}}`,
+		`{"prompt_token_ids":[-1],"kv_transfer_params":{"remote_request_id":"p"}}`,
+		`{"prompt_token_ids":[1.5],"kv_transfer_params":{"remote_request_id":"p"}}`,
+		`{"prompt_token_ids":[1]}`,
+	} {
+		t.Run(response, func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, response)
+			}))
+			defer backend.Close()
+			step, err := NewPrefillStep(gateway.New(config.GatewayConfig{Address: backend.URL}), map[string]any{
+				ParamKVConnector: kv.NIXL, "reuse_prompt_token_ids": true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = step.Execute(context.Background(), &pipeline.RequestContext{
+				OriginalPath: reqcommon.PathChatCompletions,
+				Body:         map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hello"}}},
+			})
+			if err == nil || errors.Is(err, pipeline.ErrBadRequest) {
+				t.Fatalf("expected upstream handoff error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestPrefillPromptTokenReuse_RejectsUnsupportedRequestsBeforePrefill(t *testing.T) {
+	for _, partType := range []string{"image_url", "input_audio", "video_url", "file"} {
+		t.Run(partType, func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+				t.Error("unsupported multimodal request reached prefill")
+			}))
+			defer backend.Close()
+			step, err := NewPrefillStep(gateway.New(config.GatewayConfig{Address: backend.URL}), map[string]any{
+				ParamKVConnector: kv.NIXL, "reuse_prompt_token_ids": true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = step.Execute(context.Background(), &pipeline.RequestContext{
+				OriginalPath: reqcommon.PathChatCompletions,
+				Body: map[string]any{"messages": []any{map[string]any{
+					"role": "user", "content": []any{map[string]any{"type": partType}},
+				}}},
+			})
+			if !errors.Is(err, pipeline.ErrBadRequest) || !strings.Contains(err.Error(), "text") {
+				t.Fatalf("expected text-only validation error, got %v", err)
+			}
+		})
+	}
+}
 
 func TestPrefillStep_SendsCorrectGenerateRequest(t *testing.T) {
 	var prefillBody map[string]any

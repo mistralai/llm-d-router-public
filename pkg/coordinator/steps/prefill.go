@@ -44,10 +44,11 @@ func init() {
 }
 
 type PrefillStep struct {
-	useOpenAIFormat bool
-	gwClient        *gateway.Client
-	kv              kv.Connector
-	ec              ec.Connector
+	useOpenAIFormat     bool
+	reusePromptTokenIDs bool
+	gwClient            *gateway.Client
+	kv                  kv.Connector
+	ec                  ec.Connector
 }
 
 func NewPrefillStep(gwClient *gateway.Client, params map[string]any) (pipeline.Step, error) {
@@ -55,6 +56,10 @@ func NewPrefillStep(gwClient *gateway.Client, params map[string]any) (pipeline.S
 		return nil, errors.New("prefill: gateway client is required")
 	}
 	useOpenAI, err := parseUseOpenAIFormat(params)
+	if err != nil {
+		return nil, fmt.Errorf("prefill: %w", err)
+	}
+	reusePromptTokenIDs, _, err := paramBool(params, "reuse_prompt_token_ids")
 	if err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
@@ -66,6 +71,9 @@ func NewPrefillStep(gwClient *gateway.Client, params map[string]any) (pipeline.S
 	if err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
+	if reusePromptTokenIDs && (!useOpenAI || kvConn.Name() != kv.NIXL) {
+		return nil, errors.New("prefill: reuse_prompt_token_ids requires use_openai_format=true and kv_connector=kv-nixl")
+	}
 	ecName, err := paramString(params, ParamECConnector)
 	if err != nil {
 		return nil, fmt.Errorf("prefill: %w", err)
@@ -75,10 +83,11 @@ func NewPrefillStep(gwClient *gateway.Client, params map[string]any) (pipeline.S
 		return nil, fmt.Errorf("prefill: %w", err)
 	}
 	return &PrefillStep{
-		useOpenAIFormat: useOpenAI,
-		gwClient:        gwClient,
-		kv:              kvConn,
-		ec:              ecConn,
+		useOpenAIFormat:     useOpenAI,
+		reusePromptTokenIDs: reusePromptTokenIDs,
+		gwClient:            gwClient,
+		kv:                  kvConn,
+		ec:                  ecConn,
 	}, nil
 }
 
@@ -88,6 +97,17 @@ func (s *PrefillStep) Execute(ctx context.Context, reqCtx *pipeline.RequestConte
 	logger := log.FromContext(ctx).WithName(PrefillStepName)
 
 	format := resolveFormat(s.useOpenAIFormat, reqCtx.OriginalPath)
+	if s.reusePromptTokenIDs {
+		if format != reqcommon.APITypeChatCompletions {
+			return fmt.Errorf("prefill: reuse_prompt_token_ids supports only text chat completions: %w", pipeline.ErrBadRequest)
+		}
+		if len(reqCtx.TokenIDs) != 0 {
+			return errors.New("prefill: reuse_prompt_token_ids requires prefill to tokenize; remove the render step")
+		}
+		if err := validateTextChatForTokenReuse(reqCtx.Body); err != nil {
+			return fmt.Errorf("prefill: %w", err)
+		}
+	}
 	body, err := s.buildPrefillBody(ctx, reqCtx, format)
 	if err != nil {
 		return fmt.Errorf("prefill: %w", err)
@@ -128,6 +148,23 @@ func (s *PrefillStep) Execute(ctx context.Context, reqCtx *pipeline.RequestConte
 	}
 
 	reqCtx.KVTransferParams = coerceParamsMap(logger, prefillResp.KVTransferParams, "kv_transfer_params")
+	if s.reusePromptTokenIDs {
+		var tokenIDs []int
+		if err := json.Unmarshal(prefillResp.PromptTokenIDs, &tokenIDs); err != nil {
+			return fmt.Errorf("prefill: invalid prompt_token_ids in prefill response: %w", err)
+		}
+		if len(tokenIDs) == 0 || len(reqCtx.KVTransferParams) == 0 {
+			return errors.New("prefill: token reuse requires non-empty prompt_token_ids and kv_transfer_params in prefill response")
+		}
+		for _, id := range tokenIDs {
+			if id < 0 {
+				return fmt.Errorf("prefill: prefill response contains negative prompt token ID %d", id)
+			}
+		}
+		// The NIXL connector forwards this map to D's chat endpoint, which
+		// consumes the IDs before templating and prompt tokenization.
+		reqCtx.KVTransferParams["prompt_token_ids"] = tokenIDs
+	}
 	reqCtx.CaptureResponseHeaders(resp.Header)
 
 	logger.V(logutil.DEFAULT).Info("complete")
@@ -145,6 +182,9 @@ func (s *PrefillStep) buildPrefillBody(ctx context.Context, reqCtx *pipeline.Req
 	case reqcommon.APITypeChatCompletions:
 		body := maps.Clone(reqCtx.Body)
 		reqcommon.CapSingleToken(body, format)
+		if s.reusePromptTokenIDs {
+			body["return_token_ids"] = true
+		}
 		body[reqcommon.FieldKVTransferParams] = kvParams
 		if len(ecParams) > 0 {
 			body[reqcommon.FieldECTransferParams] = ecParams
@@ -195,5 +235,6 @@ func (s *PrefillStep) buildPrefillBody(ctx context.Context, reqCtx *pipeline.Req
 type prefillResponse struct {
 	// KVTransferParams is decoded as any (not map[string]any) so a non-object
 	// value does not fail the decode; coerceParamsMap coerces it.
-	KVTransferParams any `json:"kv_transfer_params"`
+	KVTransferParams any             `json:"kv_transfer_params"`
+	PromptTokenIDs   json.RawMessage `json:"prompt_token_ids"`
 }
