@@ -24,3 +24,4 @@ nicolo.lucchesi/pd-chat-token-reuse-integration       # revision forwarding and 
 lfm/v1.0.2-rebased-upstream-rawbody-release           # release request RawBody after Envoy forwarding
 
 lfm/multimodal-streaming-token-accounting            # preserve multimodal accounting and release prompt load at stream start (https://github.com/mistralai/llm-d-router-public/pull/39, https://github.com/mistralai/llm-d-router-public/pull/41)
+selim/enable-websocket-upgrade                        # enable WebSocket upgrade with a fallback on random epp (https://github.com/mistralai/llm-d-router-public/pull/44)
