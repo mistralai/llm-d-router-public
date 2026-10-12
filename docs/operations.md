@@ -48,12 +48,44 @@ The EPP's scaling behavior and effectiveness are highly dependent on the configu
   | 3 | 2.7x |
   | 4 | 3.5x |
 
-  - **Note (Flow Control)**: Flow control state (queues, fairness accounting, and the saturation
-    view) is per replica and not shared. In Active-Active mode, priority and fairness are enforced
+  - **Note (Flow Control)**: Flow control queues and fairness accounting are per replica.
+    In Active-Active mode, priority and fairness are enforced
     only within each replica's share of the traffic, and per-band capacity limits apply per
     replica, so the fleet-wide queued volume scales with the replica count.
-  - **Plugin Compatibility**: EPP replicas do not share routing state. Active-Active mode works with stateless schedulers (`random-picker`), session affinity (`session-affinity-filter`), or plugins that read metrics from backend model servers. Avoid approximate prefix routing in Active-Active mode because replicas do not share prefix state.
+  - **Plugin Compatibility**: Without a syncer, EPP replicas keep routing state locally. Active-Active mode works with stateless schedulers (`random-picker`), session affinity (`session-affinity-filter`), or plugins that read metrics from backend model servers. The optional Redis syncer shares in-flight load. Approximate prefix-cache state remains local even with the syncer, so approximate prefix routing can make inconsistent cache decisions across replicas.
   - For more technical details and context on EPP replica state sync and scaling limitations, see [Issue #1290](https://github.com/llm-d/llm-d-router/issues/1290).
+
+##### Sharing in-flight load with Redis (Alpha)
+
+Choose active-active with the syncer when several EPP replicas must handle traffic
+concurrently and the routing plugins need peer in-flight load. Use leader election
+when one active EPP has sufficient capacity and the scheduling profile relies on
+local state that the syncer does not cover, such as approximate prefix state.
+
+In the official charts, set `router.epp.crossReplica.enabled: true` and configure
+an external Redis address. This disables leader election, enables the Alpha
+`redis-syncer` plugin, and supports both `router.epp.replicas > 1` and
+`router.epp.autoscaling`. Redis **7.4 or newer** must be provisioned separately;
+the chart does not deploy it. For values and Secret-based authentication, see
+[Active-active with Redis synchronization](../config/charts/README.md#active-active-with-redis-synchronization-alpha).
+
+The `inflight-load-producer` shares its per-endpoint load when
+`syncCrossReplicaState` is true (the default). Consumers such as
+`active-request-scorer` and `token-load-scorer` can use that shared view.
+Configuring a syncer does not change the scheduling profile or synchronize
+approximate prefix-cache state, flow-control queues, or fairness accounting.
+
+Load sharing is eventually consistent. Replicas can make simultaneous decisions
+before receiving each other's updates; this does not provide an atomic
+cluster-wide admission quota. Request-level `GetOrSet` coordination does not
+reserve capacity across different requests.
+
+During a Redis outage, EPP can start and continue scheduling with cached peer
+state until it expires, then with local load only. Request-level coordination
+calls return Redis errors. Set `stateTTL` above the observed interval between
+successful endpoint refreshes, including latency variation; see the
+[Redis syncer README](../pkg/epp/framework/plugins/datalayer/cross_plugin/redis/README.md)
+for transport restrictions and publisher timing.
 
 ### Performance Reference Data
 
@@ -206,7 +238,7 @@ router:
 
 In multi-replica deployments without priority routing (`router.epp.replicas > 1`), the router coordinates active-passive replicas using Kubernetes lease-based leader election:
 
-- **Leader Coordination**: EPP replicas contend for a `coordination.k8s.io/Lease`. The `--ha-enable-leader-election` flag enables leader election in EPP (automatically injected by Helm when `router.epp.replicas > 1`). The elected leader responds to active gRPC extension requests on Port 9002, while standby replicas run idle. (To run multi-replica in Fully Active-Active mode instead, set `router.epp.flags.ha-enable-leader-election: false`).
+- **Leader Coordination**: EPP replicas contend for a `coordination.k8s.io/Lease`. The `--ha-enable-leader-election` flag enables leader election in EPP. Helm enables it for fixed `router.epp.replicas > 1` unless explicitly disabled or `router.epp.haMode: all-active` or cross-replica synchronization is selected. The elected leader responds to active gRPC extension requests on Port 9002, while standby replicas run idle.
 - **Fail-Open Resiliency**: With `router.proxy.failOpen: true` (the default in standalone mode) or `router.inferencePool.failureMode: FailOpen`, if the active leader crashes or restarts, the proxy passes requests directly to backend model servers without dropping traffic during the lease transition period.
 
 ```yaml
@@ -298,4 +330,3 @@ router:
 ```
 
 See `router.proxy.autoscaling` in `config/charts/llm-d-router-standalone/values.yaml` for all fields and defaults.
-

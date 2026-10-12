@@ -62,6 +62,8 @@ declare -A test_cases_llm_d_router_gateway
 
 # llm_d_router_gateway Helm Chart test cases
 test_cases_llm_d_router_gateway["basic"]="--set router.modelServers.matchLabels.app=llm-instance-gateway"
+test_cases_llm_d_router_gateway["active-active-redis"]="--set router.modelServers.matchLabels.app=llm-instance-gateway --set router.epp.crossReplica.enabled=true --set router.epp.crossReplica.redis.address=redis.example:6379 --set router.epp.crossReplica.redis.passwordSecretRef.name=redis-auth --set router.epp.crossReplica.redis.passwordSecretRef.key=password --set router.epp.replicas=3"
+test_cases_llm_d_router_gateway["active-active-redis-hpa"]="--set router.modelServers.matchLabels.app=llm-instance-gateway --set router.epp.crossReplica.enabled=true --set router.epp.crossReplica.redis.address=redis.example:6379 --set router.epp.crossReplica.redis.passwordSecretRef.name=redis-auth --set router.epp.crossReplica.redis.passwordSecretRef.key=password --set router.epp.autoscaling.enabled=true --set router.epp.autoscaling.minReplicas=2"
 test_cases_llm_d_router_gateway["basic-kubernetes-1.30"]="--kube-version 1.30.0 --set router.modelServers.matchLabels.app=llm-instance-gateway"
 test_cases_llm_d_router_gateway["gke-provider"]="--set provider.name=gke --set router.modelServers.matchLabels.app=llm-instance-gateway"
 test_cases_llm_d_router_gateway["multiple-replicas"]="--set router.replicas=3 --set router.modelServers.matchLabels.app=llm-instance-gateway"
@@ -173,6 +175,8 @@ declare -A test_cases_llm_d_router_standalone
 
 # llm_d_router_standalone Helm Chart test cases
 test_cases_llm_d_router_standalone["basic"]="--set router.modelServers.matchLabels.app=llm-instance-gateway --set router.inferencePool.create=false"
+test_cases_llm_d_router_standalone["active-active-redis"]="--set router.modelServers.matchLabels.app=llm-instance-gateway --set router.epp.crossReplica.enabled=true --set router.epp.crossReplica.redis.address=redis.example:6379 --set router.epp.crossReplica.redis.passwordSecretRef.name=redis-auth --set router.epp.crossReplica.redis.passwordSecretRef.key=password --set router.epp.replicas=3"
+test_cases_llm_d_router_standalone["active-active-redis-hpa"]="--set router.modelServers.matchLabels.app=llm-instance-gateway --set router.epp.crossReplica.enabled=true --set router.epp.crossReplica.redis.address=redis.example:6379 --set router.epp.crossReplica.redis.passwordSecretRef.name=redis-auth --set router.epp.crossReplica.redis.passwordSecretRef.key=password --set router.epp.autoscaling.enabled=true --set router.epp.autoscaling.minReplicas=2"
 test_cases_llm_d_router_standalone["gke-provider"]="--set provider.name=gke --set router.modelServers.matchLabels.app=llm-instance-gateway --set router.inferencePool.create=false"
 test_cases_llm_d_router_standalone["latency-predictor"]="--set router.latencyPredictor.enabled=true --set router.modelServers.matchLabels.app=llm-instance-gateway --set router.inferencePool.create=false"
 test_cases_llm_d_router_standalone["llm-d-router-gateway"]="--set router.inferencePool.create=true --set router.modelServers.matchLabels.app=llm-instance-gateway"
@@ -270,7 +274,7 @@ verify_leader_election_rbac() {
 for chart in llm-d-router-gateway llm-d-router-standalone; do
   verify_leader_election_rbac "${chart}" false
   verify_leader_election_rbac "${chart}" true --set router.epp.replicas=2
-  verify_leader_election_rbac "${chart}" true --set router.epp.replicas=2 --set router.epp.flags.ha-enable-leader-election=false
+  verify_leader_election_rbac "${chart}" false --set router.epp.replicas=2 --set router.epp.flags.ha-enable-leader-election=false
   verify_leader_election_rbac "${chart}" true --set router.epp.replicas=1 --set router.epp.flags.ha-enable-leader-election=true
   verify_leader_election_rbac "${chart}" false --set router.epp.replicas=1 --set router.epp.flags.ha-enable-leader-election=false
   for value in true True TRUE t T 1; do
@@ -511,6 +515,11 @@ done
 
 if ! HELM="${HELM}" bash "${SCRIPT_ROOT}/hack/verify-plugins-config.sh"; then
   echo "Structured plugins configuration validation failed"
+  exit 1
+fi
+
+if ! HELM="${HELM}" bash "${SCRIPT_ROOT}/hack/verify-cross-replica-config.sh"; then
+  echo "Cross-replica configuration validation failed"
   exit 1
 fi
 
