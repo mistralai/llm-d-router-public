@@ -60,8 +60,7 @@ type mmPromptContent struct {
 func computeBlockKeys(ctx context.Context, idx kvCacheIndexer,
 	request *scheduling.InferenceRequest, blockSizeTokens int,
 ) ([][]kvblock.BlockHash, []*mmPromptContent, error) {
-	if request == nil || request.Body == nil {
-		return nil, nil, nil
+	if request == nil || request.Body == nil || request.Body.SkipPrefixCacheMatching {		return nil, nil, nil
 	}
 	tp := request.Body.TokenizedRequest
 	if tp == nil || len(tp.Prompts) == 0 {
