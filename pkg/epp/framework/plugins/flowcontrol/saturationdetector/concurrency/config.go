@@ -20,6 +20,8 @@ package concurrency
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"k8s.io/utils/ptr"
 )
@@ -40,6 +42,15 @@ type apiConfig struct {
 	//
 	// Defaults to 100 if unset.
 	MaxConcurrency *int64 `json:"maxConcurrency,omitempty"`
+
+	// MaxConcurrencyByPriority overrides MaxConcurrency in the scheduling filter for requests of a
+	// given priority (the InferenceObjective priority). Priorities without an entry use
+	// MaxConcurrency. The override is multiplied by (1 + Headroom) like MaxConcurrency. Pool
+	// saturation always uses MaxConcurrency.
+	//
+	// Example: {"9": 16, "2": 12} keeps an endpoint eligible for priority 9 requests until it holds
+	// 16 in-flight requests, and for priority 2 requests until it holds 12.
+	MaxConcurrencyByPriority map[int]int64 `json:"maxConcurrencyByPriority,omitempty"`
 
 	// Headroom defines the allowed burst capacity above the ideal threshold (MaxConcurrency or
 	// MaxTokenConcurrency), expressed as a multiplier (e.g., 0.2 for 20%).
@@ -87,7 +98,30 @@ type apiConfig struct {
 	//
 	// Defaults to true if unset.
 	FailOpen *bool `json:"failOpen,omitempty"`
+
+	// PoolAggregation defines how per-endpoint load is combined into pool saturation.
+	//
+	// Valid values are:
+	// - "average": the aggregate or average signal described by ConcurrencyMode.
+	// - "least-loaded": the saturation of the least-loaded endpoint, where an endpoint's
+	//   saturation is its request ratio ("requests"), token ratio ("tokens"), or the larger of
+	//   both ("hybrid"). Pending dispatch reservations are first added one request at a time to
+	//   the least-loaded endpoints. Flow control then dispatches a request only while at least
+	//   one endpoint is below the request's usage limit.
+	//
+	// Defaults to "average" if unset.
+	PoolAggregation *poolAggregation `json:"poolAggregation,omitempty"`
 }
+
+// poolAggregation is the strategy combining per-endpoint load into pool saturation.
+type poolAggregation string
+
+const (
+	// aggregationAverage reports the aggregate or average load of the pool.
+	aggregationAverage poolAggregation = "average"
+	// aggregationLeastLoaded reports the load of the least-loaded endpoint.
+	aggregationLeastLoaded poolAggregation = "least-loaded"
+)
 
 // concurrencyMode is the concurrency detection mode.
 type concurrencyMode string
@@ -112,17 +146,21 @@ const (
 	defaultMaxTokenConcurrency int64 = 1000000
 	// defaultFailOpen is used when FailOpen is unset.
 	defaultFailOpen = true
+	// defaultPoolAggregation is used when PoolAggregation is unset.
+	defaultPoolAggregation = aggregationAverage
 )
 
 // config is the internal, fully-validated configuration used by the detector.
 type config struct {
 	maxConcurrency           int64
+	maxConcurrencyByPriority map[int]int64
 	headroom                 float64
 	mode                     concurrencyMode
 	maxTokenConcurrency      int64
 	inFlightLoadProducerName string
 	// failClosed makes the filter return no endpoints when every candidate is over its limit.
-	failClosed bool
+	failClosed      bool
+	poolAggregation poolAggregation
 }
 
 // buildConfig applies the configuration lifecycle (defaulting and validation) and translates the
@@ -142,11 +180,13 @@ func buildConfig(apiCfg *apiConfig) (*config, error) {
 
 	return &config{
 		maxConcurrency:           *safeCfg.MaxConcurrency,
+		maxConcurrencyByPriority: maps.Clone(safeCfg.MaxConcurrencyByPriority),
 		headroom:                 *safeCfg.Headroom,
 		mode:                     *safeCfg.ConcurrencyMode,
 		maxTokenConcurrency:      *safeCfg.MaxTokenConcurrency,
 		inFlightLoadProducerName: safeCfg.InFlightLoadProducerName,
 		failClosed:               !*safeCfg.FailOpen,
+		poolAggregation:          *safeCfg.PoolAggregation,
 	}, nil
 }
 
@@ -167,6 +207,9 @@ func applyDefaults(cfg *apiConfig) {
 	if cfg.FailOpen == nil {
 		cfg.FailOpen = ptr.To(defaultFailOpen)
 	}
+	if cfg.PoolAggregation == nil {
+		cfg.PoolAggregation = ptr.To(defaultPoolAggregation)
+	}
 }
 
 // validateConfig checks the constraints of the fully defaulted configuration.
@@ -176,6 +219,11 @@ func validateConfig(cfg *apiConfig) error {
 
 	if cfg.MaxConcurrency != nil && *cfg.MaxConcurrency <= 0 {
 		errs = append(errs, fmt.Errorf("maxConcurrency must be strictly positive, got %d", *cfg.MaxConcurrency))
+	}
+	for _, priority := range slices.Sorted(maps.Keys(cfg.MaxConcurrencyByPriority)) {
+		if limit := cfg.MaxConcurrencyByPriority[priority]; limit <= 0 {
+			errs = append(errs, fmt.Errorf("maxConcurrencyByPriority[%d] must be strictly positive, got %d", priority, limit))
+		}
 	}
 	if cfg.Headroom != nil && *cfg.Headroom < 0.0 {
 		errs = append(errs, fmt.Errorf("headroom must be a non-negative value, got %f", *cfg.Headroom))
@@ -190,6 +238,15 @@ func validateConfig(cfg *apiConfig) error {
 			// Valid
 		default:
 			errs = append(errs, fmt.Errorf("unsupported concurrencyMode: %q", *cfg.ConcurrencyMode))
+		}
+	}
+
+	if cfg.PoolAggregation != nil {
+		switch *cfg.PoolAggregation {
+		case aggregationAverage, aggregationLeastLoaded:
+			// Valid
+		default:
+			errs = append(errs, fmt.Errorf("unsupported poolAggregation: %q", *cfg.PoolAggregation))
 		}
 	}
 

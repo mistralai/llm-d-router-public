@@ -22,6 +22,7 @@ limitations under the License.
 package concurrency
 
 import (
+	"container/heap"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -89,9 +90,11 @@ func newDetector(name string, cfg config, logger logr.Logger) *detector {
 	pluginLogger.V(logutil.DEFAULT).Info("Creating new ConcurrencyDetector",
 		"mode", cfg.mode,
 		"maxConcurrency", cfg.maxConcurrency,
+		"maxConcurrencyByPriority", cfg.maxConcurrencyByPriority,
 		"maxTokenConcurrency", cfg.maxTokenConcurrency,
 		"headroom", cfg.headroom,
-		"failOpen", !cfg.failClosed)
+		"failOpen", !cfg.failClosed,
+		"poolAggregation", cfg.poolAggregation)
 
 	if cfg.headroom > 1.0 {
 		pluginLogger.Info("Unusually high headroom configured; verify value is a fraction, not a percentage",
@@ -183,9 +186,14 @@ func (d *detector) getIncomingTokens(m datalayer.AttributeMap) int64 {
 // The inflight counts are read from the InFlightLoad attribute, which the
 // InFlightLoadProducer increments at dispatch and decrements on request
 // completion, so the signal already reflects completions with no scrape lag.
+//
+// With the "least-loaded" pool aggregation it returns the saturation of the least-loaded endpoint instead.
 func (d *detector) Saturation(_ context.Context, endpoints []datalayer.Endpoint) float64 {
 	if len(endpoints) == 0 {
 		return 1.0
+	}
+	if d.config.poolAggregation == aggregationLeastLoaded {
+		return d.leastLoadedSaturation(endpoints)
 	}
 
 	var reqInflight, reqCapacity, tokInflight, tokCapacity int64
@@ -230,6 +238,75 @@ func (d *detector) Saturation(_ context.Context, endpoints []datalayer.Endpoint)
 	}
 }
 
+// leastLoadedSaturation returns the saturation of the least-loaded endpoint after each pending dispatch
+// reservation has been assigned, one request at a time, to the endpoint that is least loaded at that point.
+// Reservations count as requests, so they are not assigned in "tokens" mode.
+func (d *detector) leastLoadedSaturation(endpoints []datalayer.Endpoint) float64 {
+	loads := make(endpointLoadHeap, 0, len(endpoints))
+	for _, e := range endpoints {
+		if e == nil {
+			continue
+		}
+		load := &attrconcurrency.InFlightLoad{}
+		if e.GetMetadata() != nil {
+			load = d.getLoad(e.GetAttributes())
+		}
+		loads = append(loads, endpointLoad{
+			requests:   load.Requests,
+			tokens:     load.Tokens,
+			saturation: d.endpointSaturation(load.Requests, load.Tokens),
+		})
+	}
+	if len(loads) == 0 {
+		return 1.0
+	}
+
+	heap.Init(&loads)
+	if d.config.mode != modeTokens {
+		for range d.pendingDispatches.Load() {
+			loads[0].requests++
+			loads[0].saturation = d.endpointSaturation(loads[0].requests, loads[0].tokens)
+			heap.Fix(&loads, 0)
+		}
+	}
+	return loads[0].saturation
+}
+
+// endpointSaturation returns the saturation of a single endpoint for the active mode.
+func (d *detector) endpointSaturation(requests, tokens int64) float64 {
+	switch d.config.mode {
+	case modeTokens:
+		return ratio(tokens, d.config.maxTokenConcurrency)
+	case modeHybrid:
+		return max(ratio(requests, d.config.maxConcurrency), ratio(tokens, d.config.maxTokenConcurrency))
+	default:
+		return ratio(requests, d.config.maxConcurrency)
+	}
+}
+
+// endpointLoad is the in-flight load of one endpoint and the saturation it yields.
+type endpointLoad struct {
+	requests   int64
+	tokens     int64
+	saturation float64
+}
+
+// endpointLoadHeap is a min-heap of endpoint loads ordered by saturation.
+type endpointLoadHeap []endpointLoad
+
+func (h endpointLoadHeap) Len() int           { return len(h) }
+func (h endpointLoadHeap) Less(i, j int) bool { return h[i].saturation < h[j].saturation }
+func (h endpointLoadHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *endpointLoadHeap) Push(x any) { *h = append(*h, x.(endpointLoad)) }
+
+func (h *endpointLoadHeap) Pop() any {
+	old := *h
+	last := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return last
+}
+
 // ratio computes inflight/capacity, failing closed (1.0) when capacity is zero.
 func ratio(inflight, capacity int64) float64 {
 	if capacity == 0 {
@@ -245,16 +322,17 @@ func ratio(inflight, capacity int64) float64 {
 // to it, so an endpoint is dropped when admitting the request would take it over the limit. An endpoint with no
 // in-flight tokens always passes the token check: it is the best placement the pool can offer a request that
 // is larger than the limit. In "hybrid" mode an endpoint is also dropped when its request load reaches the limit.
+// The request capacity is the request's entry in maxConcurrencyByPriority, or maxConcurrency.
 // If all endpoints are filtered out, the filter fails open and returns all endpoints, unless FailOpen is false.
 func (d *detector) Filter(
 	_ context.Context,
-	_ *fwksched.InferenceRequest,
+	request *fwksched.InferenceRequest,
 	endpoints []fwksched.Endpoint,
 ) []fwksched.Endpoint {
 	// Pre-allocate assuming most endpoints will pass the filter to minimize allocations.
 	filtered := make([]fwksched.Endpoint, 0, len(endpoints))
 
-	reqLimit := int64(float64(d.config.maxConcurrency) * (1.0 + d.config.headroom))
+	reqLimit := int64(float64(d.requestCapacity(request)) * (1.0 + d.config.headroom))
 	tokLimit := int64(float64(d.config.maxTokenConcurrency) * (1.0 + d.config.headroom))
 	countIncoming := d.config.mode == modeTokens || d.config.mode == modeHybrid
 
@@ -280,6 +358,16 @@ func (d *detector) Filter(
 		}
 	}
 	return filtered
+}
+
+// requestCapacity returns the per-endpoint request capacity that applies to the request's priority.
+func (d *detector) requestCapacity(request *fwksched.InferenceRequest) int64 {
+	if request != nil {
+		if limit, ok := d.config.maxConcurrencyByPriority[request.Objectives.Priority]; ok {
+			return limit
+		}
+	}
+	return d.config.maxConcurrency
 }
 
 // admits reports whether an endpoint can take the request within its safety limit for the active mode.

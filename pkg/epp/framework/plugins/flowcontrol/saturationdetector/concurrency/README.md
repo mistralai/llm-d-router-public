@@ -21,6 +21,8 @@ Hybrid mode is the exception: rather than one aggregate fraction, it evaluates e
 
 **Heterogeneous Deployments:** Because this detector calculates saturation globally as a single aggregate fraction (in requests and tokens mode), it utilizes an aggregate queueing model. In deployments with heterogeneous compute (e.g., mixing H100 and L4 nodes), this heavily biases the pool saturation metric toward the state of the larger nodes. Contrast this with the Utilization Detector, which evaluates saturation as an unweighted average of individual endpoint scores.
 
+**Least-loaded aggregation:** With `poolAggregation: least-loaded`, pool saturation is the saturation of the least-loaded endpoint, computed per endpoint as in `hybrid` mode (or from requests or tokens alone in the other modes). Pending dispatch reservations are first added, one request at a time, to the endpoint that is least loaded at that point. A priority band is then dispatched only while at least one endpoint is below the band's usage limit, so an endpoint over its limit does not let other requests through because other endpoints are idle. `tokens` mode does not count reservations.
+
 ### Role in Scheduling (The Traffic Shaper)
 The detector implements the `Filter` interface to protect individual endpoints. It removes endpoints from candidate lists if their local inflight count exceeds the safety limit:
 
@@ -31,6 +33,8 @@ In tokens and hybrid modes the token check also counts the uncached tokens the i
     InflightTokens + IncomingUncachedTokens <= TokenLimit
 
 An endpoint with no in-flight tokens always passes the token check. A request larger than the limit can still be placed on an idle endpoint, which is the best placement the pool can offer, and the engine's own limits decide whether it runs.
+
+The request capacity is the `maxConcurrencyByPriority` entry for the request's priority when one is configured, and `maxConcurrency` otherwise. This lets lower-priority requests stop being routed to an endpoint at a lower in-flight count than higher-priority requests.
 
 This approach allows the Flow Controller to manage average pool load, while the Scheduler retains the flexibility to burst above ideal targets (the "Headroom") to satisfy affinity or scoring objectives.
 
@@ -50,9 +54,11 @@ The plugin accepts JSON parameters decoding to the following fields:
 
 - `concurrencyMode` (`string`): Evaluation mode. Valid values are `"requests"`, `"tokens"`, or `"hybrid"`. In `"hybrid"` mode both request and token accounting are evaluated. Pool saturation is computed per endpoint as the larger of that endpoint's request and token ratios, then averaged across endpoints, so an endpoint saturated on either dimension is reflected even when distinct endpoints saturate on different dimensions. An endpoint is filtered out when either its request load reaches the limit or its token load plus the request's uncached tokens exceeds the limit. (Default: `"requests"`)
 - `maxConcurrency` (`int64`): Maximum requests in flight. Serves as the "ideal" request capacity for a single endpoint. Must be > 0. (Default: `100`)
+- `maxConcurrencyByPriority` (`map[int]int64`): Request capacity used by the filter for requests of the given InferenceObjective priority, e.g. `{"9": 16, "2": 12}`. Priorities without an entry use `maxConcurrency`. Pool saturation always uses `maxConcurrency`. Values must be > 0. (Default: empty)
 - `maxTokenConcurrency` (`int64`): Maximum tokens in flight. The "tokens" mode equivalent of `maxConcurrency`. Must be > 0. (Default: `1000000`)
 - `headroom` (`float64`): Allowed burst capacity above the ideal threshold, expressed as a fraction (e.g., `0.2` for 20%). Must be >= 0.0. (Default: `0.0`)
 - `failOpen` (`bool`): Whether the filter returns all candidates when every candidate is over its limit. When `false` it returns none. (Default: `true`)
+- `poolAggregation` (`string`): How per-endpoint load is combined into pool saturation. Valid values are `"average"` (the aggregate or average signal of the selected `concurrencyMode`) and `"least-loaded"` (the saturation of the least-loaded endpoint after assigning pending dispatch reservations). (Default: `"average"`)
 
 ## Trade-offs
 
