@@ -142,9 +142,12 @@ func TestRepackagePreservesNativeRenderContent(t *testing.T) {
 type mockAdmissionController struct {
 	admitErr        error
 	releaseDispatch func(requestID string)
+	// gotPriority records the priority the director passed to Admit.
+	gotPriority int
 }
 
-func (m *mockAdmissionController) Admit(context.Context, *handlers.RequestContext, int) error {
+func (m *mockAdmissionController) Admit(_ context.Context, _ *handlers.RequestContext, priority int) error {
+	m.gotPriority = priority
 	return m.admitErr
 }
 
@@ -513,6 +516,8 @@ func TestDirector_HandleRequest(t *testing.T) {
 		wantFairnessID          string // If non-empty, asserted against returnedReqCtx.SchedulingRequest.FairnessID.
 		wantSpanFairnessID      string // If non-empty, asserted against request_orchestration span fairness ID.
 		wantSource              string // If non-empty, asserted against request_orchestration span source.
+		wantObjectiveKey        string // If non-empty, asserted against returnedReqCtx.ObjectiveKey.
+		wantPriority            *int   // If non-nil, asserted against the resolved priority and the value passed to Admit.
 		rewrites                []*v1alpha2.InferenceModelRewrite
 	}{
 		{
@@ -676,6 +681,45 @@ func TestDirector_HandleRequest(t *testing.T) {
 			wantFairnessID:     "explicit-id",
 			wantSpanFairnessID: "explicit-id",
 			wantSource:         tracing.AttributionSourceHeader,
+		},
+		{
+			name: "objective-key attribute takes precedence over the objective header",
+			reqBodyMap: map[string]any{
+				"model":  model,
+				"prompt": "critical prompt",
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleResults = defaultSuccessfulScheduleResults
+			},
+			initialTargetModelName: model,
+			inferenceObjectiveName: objectiveName,
+			requestHeaderPlugin: &mockRequestHeaderPlugin{
+				name:           "objective-key",
+				attributeKey:   fwkrc.ObjectiveKeyAttribute,
+				attributeValue: objectiveNameResolve,
+			},
+			wantObjectiveKey: objectiveNameResolve,
+			wantPriority:     ptr.To(1),
+		},
+		{
+			name: "empty objective-key attribute falls back to the objective header",
+			reqBodyMap: map[string]any{
+				"model":  model,
+				"prompt": "critical prompt",
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			schedulerMockSetup: func(m *mockScheduler) {
+				m.scheduleResults = defaultSuccessfulScheduleResults
+			},
+			initialTargetModelName: model,
+			inferenceObjectiveName: objectiveName,
+			requestHeaderPlugin: &mockRequestHeaderPlugin{
+				name:           "objective-key",
+				attributeKey:   fwkrc.ObjectiveKeyAttribute,
+				attributeValue: "",
+			},
+			wantPriority: ptr.To(2),
 		},
 		{
 			name: "successful request with preRequest plugin adding key",
@@ -1375,6 +1419,19 @@ func TestDirector_HandleRequest(t *testing.T) {
 				if test.wantFairnessID != "" {
 					require.NotNil(t, returnedReqCtx.SchedulingRequest, "SchedulingRequest should be populated")
 					assert.Equal(t, test.wantFairnessID, returnedReqCtx.SchedulingRequest.FairnessID, "SchedulingRequest.FairnessID mismatch")
+				}
+
+				if test.wantObjectiveKey != "" {
+					assert.Equal(t, test.wantObjectiveKey, returnedReqCtx.ObjectiveKey, "reqCtx.ObjectiveKey mismatch")
+				}
+
+				if test.wantPriority != nil {
+					require.NotNil(t, returnedReqCtx.SchedulingRequest, "SchedulingRequest should be populated")
+					assert.Equal(t, *test.wantPriority, returnedReqCtx.Priority, "reqCtx.Priority mismatch")
+					assert.Equal(t, *test.wantPriority, returnedReqCtx.SchedulingRequest.Objectives.Priority,
+						"SchedulingRequest.Objectives.Priority mismatch")
+					assert.Equal(t, *test.wantPriority, test.mockAdmissionController.gotPriority,
+						"priority passed to Admit mismatch")
 				}
 
 				if test.wantMutatedBody != nil {
