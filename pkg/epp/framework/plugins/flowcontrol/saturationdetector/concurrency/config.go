@@ -98,7 +98,30 @@ type apiConfig struct {
 	//
 	// Defaults to true if unset.
 	FailOpen *bool `json:"failOpen,omitempty"`
+
+	// PoolAggregation defines how per-endpoint load is combined into pool saturation.
+	//
+	// Valid values are:
+	// - "average": the aggregate or average signal described by ConcurrencyMode.
+	// - "least-loaded": the saturation of the least-loaded endpoint, where an endpoint's
+	//   saturation is its request ratio ("requests"), token ratio ("tokens"), or the larger of
+	//   both ("hybrid"). Pending dispatch reservations are first added one request at a time to
+	//   the least-loaded endpoints. Flow control then dispatches a request only while at least
+	//   one endpoint is below the request's usage limit.
+	//
+	// Defaults to "average" if unset.
+	PoolAggregation *poolAggregation `json:"poolAggregation,omitempty"`
 }
+
+// poolAggregation is the strategy combining per-endpoint load into pool saturation.
+type poolAggregation string
+
+const (
+	// aggregationAverage reports the aggregate or average load of the pool.
+	aggregationAverage poolAggregation = "average"
+	// aggregationLeastLoaded reports the load of the least-loaded endpoint.
+	aggregationLeastLoaded poolAggregation = "least-loaded"
+)
 
 // concurrencyMode is the concurrency detection mode.
 type concurrencyMode string
@@ -123,6 +146,8 @@ const (
 	defaultMaxTokenConcurrency int64 = 1000000
 	// defaultFailOpen is used when FailOpen is unset.
 	defaultFailOpen = true
+	// defaultPoolAggregation is used when PoolAggregation is unset.
+	defaultPoolAggregation = aggregationAverage
 )
 
 // config is the internal, fully-validated configuration used by the detector.
@@ -134,7 +159,8 @@ type config struct {
 	maxTokenConcurrency      int64
 	inFlightLoadProducerName string
 	// failClosed makes the filter return no endpoints when every candidate is over its limit.
-	failClosed bool
+	failClosed      bool
+	poolAggregation poolAggregation
 }
 
 // buildConfig applies the configuration lifecycle (defaulting and validation) and translates the
@@ -160,6 +186,7 @@ func buildConfig(apiCfg *apiConfig) (*config, error) {
 		maxTokenConcurrency:      *safeCfg.MaxTokenConcurrency,
 		inFlightLoadProducerName: safeCfg.InFlightLoadProducerName,
 		failClosed:               !*safeCfg.FailOpen,
+		poolAggregation:          *safeCfg.PoolAggregation,
 	}, nil
 }
 
@@ -179,6 +206,9 @@ func applyDefaults(cfg *apiConfig) {
 	}
 	if cfg.FailOpen == nil {
 		cfg.FailOpen = ptr.To(defaultFailOpen)
+	}
+	if cfg.PoolAggregation == nil {
+		cfg.PoolAggregation = ptr.To(defaultPoolAggregation)
 	}
 }
 
@@ -208,6 +238,15 @@ func validateConfig(cfg *apiConfig) error {
 			// Valid
 		default:
 			errs = append(errs, fmt.Errorf("unsupported concurrencyMode: %q", *cfg.ConcurrencyMode))
+		}
+	}
+
+	if cfg.PoolAggregation != nil {
+		switch *cfg.PoolAggregation {
+		case aggregationAverage, aggregationLeastLoaded:
+			// Valid
+		default:
+			errs = append(errs, fmt.Errorf("unsupported poolAggregation: %q", *cfg.PoolAggregation))
 		}
 	}
 

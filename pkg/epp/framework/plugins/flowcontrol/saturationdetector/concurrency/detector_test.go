@@ -143,6 +143,16 @@ func TestConcurrencyDetectorFactory(t *testing.T) {
 			configJSON: []byte(`{"maxConcurrencyByPriority": {"high": 12}}`),
 			wantError:  true,
 		},
+		{
+			name:       "valid least-loaded pool aggregation",
+			configJSON: []byte(`{"concurrencyMode": "hybrid", "poolAggregation": "least-loaded"}`),
+			wantError:  false,
+		},
+		{
+			name:       "invalid pool aggregation",
+			configJSON: []byte(`{"poolAggregation": "median"}`),
+			wantError:  true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -890,6 +900,148 @@ func TestDetector_FilterByPriority(t *testing.T) {
 
 		saturation := detector.Saturation(ctx, []datalayer.Endpoint{newFakeEndpoint(reg, endpointName)})
 		require.InDelta(t, 0.5, saturation, 1e-6, "pool saturation must use maxConcurrency")
+	})
+}
+
+// TestDetector_LeastLoadedSaturation verifies that the least-loaded pool aggregation reports the saturation of the
+// least-loaded endpoint, computed per endpoint for the active mode.
+func TestDetector_LeastLoadedSaturation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	type load struct{ requests, tokens int64 }
+
+	tests := []struct {
+		name        string
+		mode        concurrencyMode
+		aggregation poolAggregation
+		loads       []load
+		want        float64
+	}{
+		{
+			name:        "requests_mode_reports_least_loaded_endpoint",
+			mode:        modeRequests,
+			aggregation: aggregationLeastLoaded,
+			loads:       []load{{requests: 10}, {requests: 5}},
+			want:        0.5,
+		},
+		{
+			name:        "average_aggregation_is_unchanged",
+			mode:        modeRequests,
+			aggregation: aggregationAverage,
+			loads:       []load{{requests: 10}, {requests: 5}},
+			want:        0.75,
+		},
+		{
+			name:        "hybrid_mode_uses_the_larger_ratio_per_endpoint",
+			mode:        modeHybrid,
+			aggregation: aggregationLeastLoaded,
+			loads:       []load{{requests: 2, tokens: 90}, {requests: 6, tokens: 10}},
+			want:        0.6,
+		},
+		{
+			name:        "tokens_mode_uses_token_ratio",
+			mode:        modeTokens,
+			aggregation: aggregationLeastLoaded,
+			loads:       []load{{requests: 1, tokens: 30}, {requests: 9, tokens: 80}},
+			want:        0.3,
+		},
+		{
+			name:        "overloaded_endpoints_report_saturation_above_one",
+			mode:        modeRequests,
+			aggregation: aggregationLeastLoaded,
+			loads:       []load{{requests: 12}, {requests: 15}},
+			want:        1.2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reg := newLocalRegistry()
+			detector := newDetector("test-detector", config{
+				mode:                tc.mode,
+				maxConcurrency:      10,
+				maxTokenConcurrency: 100,
+				poolAggregation:     tc.aggregation,
+			}, logr.Discard())
+
+			endpoints := make([]datalayer.Endpoint, 0, len(tc.loads))
+			for i, l := range tc.loads {
+				name := fmt.Sprintf("endpoint-%d", i)
+				reg.update(fullEndpointName(name), func(load *attrconcurrency.InFlightLoad) {
+					load.Requests = l.requests
+					load.Tokens = l.tokens
+				})
+				endpoints = append(endpoints, newFakeEndpoint(reg, name))
+			}
+
+			require.InDelta(t, tc.want, detector.Saturation(ctx, endpoints), 1e-6)
+		})
+	}
+}
+
+// TestDetector_LeastLoadedReservations verifies that pending dispatch reservations are assigned one request at a
+// time to the least-loaded endpoint before the least-loaded saturation is reported.
+func TestDetector_LeastLoadedReservations(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	newPool := func(t *testing.T, mode concurrencyMode) (*detector, []datalayer.Endpoint) {
+		t.Helper()
+		reg := newLocalRegistry()
+		reg.update(fullEndpointName("endpoint-a"), func(load *attrconcurrency.InFlightLoad) { load.Requests = 4 })
+		reg.update(fullEndpointName("endpoint-b"), func(load *attrconcurrency.InFlightLoad) { load.Requests = 8 })
+		detector := newDetector("test-detector", config{
+			mode:                mode,
+			maxConcurrency:      10,
+			maxTokenConcurrency: 100,
+			poolAggregation:     aggregationLeastLoaded,
+		}, logr.Discard())
+		return detector, []datalayer.Endpoint{newFakeEndpoint(reg, "endpoint-a"), newFakeEndpoint(reg, "endpoint-b")}
+	}
+	reserve := func(t *testing.T, detector *detector, count int) {
+		t.Helper()
+		for i := range count {
+			require.True(t, detector.ReserveDispatch(fmt.Sprintf("req-%d", i)))
+		}
+	}
+
+	t.Run("reservations_fill_the_least_loaded_endpoint_first", func(t *testing.T) {
+		t.Parallel()
+		detector, endpoints := newPool(t, modeRequests)
+		reserve(t, detector, 3)
+		require.InDelta(t, 0.7, detector.Saturation(ctx, endpoints), 1e-6, "endpoint-a must absorb all 3 reservations")
+	})
+
+	t.Run("reservations_spread_once_endpoints_are_level", func(t *testing.T) {
+		t.Parallel()
+		detector, endpoints := newPool(t, modeRequests)
+		reserve(t, detector, 6)
+		require.InDelta(t, 0.9, detector.Saturation(ctx, endpoints), 1e-6,
+			"4 reservations level endpoint-a with endpoint-b and the next 2 go one to each")
+	})
+
+	t.Run("released_reservations_stop_counting", func(t *testing.T) {
+		t.Parallel()
+		detector, endpoints := newPool(t, modeRequests)
+		reserve(t, detector, 3)
+		require.True(t, detector.ReleaseDispatch("req-0"))
+		require.InDelta(t, 0.6, detector.Saturation(ctx, endpoints), 1e-6)
+	})
+
+	t.Run("hybrid_mode_counts_reservations", func(t *testing.T) {
+		t.Parallel()
+		detector, endpoints := newPool(t, modeHybrid)
+		reserve(t, detector, 2)
+		require.InDelta(t, 0.6, detector.Saturation(ctx, endpoints), 1e-6)
+	})
+
+	t.Run("tokens_mode_ignores_reservations", func(t *testing.T) {
+		t.Parallel()
+		detector, endpoints := newPool(t, modeTokens)
+		reserve(t, detector, 5)
+		require.InDelta(t, 0.0, detector.Saturation(ctx, endpoints), 1e-6)
 	})
 }
 

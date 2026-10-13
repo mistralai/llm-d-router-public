@@ -21,6 +21,8 @@ Hybrid mode is the exception: rather than one aggregate fraction, it evaluates e
 
 **Heterogeneous Deployments:** Because this detector calculates saturation globally as a single aggregate fraction (in requests and tokens mode), it utilizes an aggregate queueing model. In deployments with heterogeneous compute (e.g., mixing H100 and L4 nodes), this heavily biases the pool saturation metric toward the state of the larger nodes. Contrast this with the Utilization Detector, which evaluates saturation as an unweighted average of individual endpoint scores.
 
+**Least-loaded aggregation:** With `poolAggregation: least-loaded`, pool saturation is the saturation of the least-loaded endpoint, computed per endpoint as in `hybrid` mode (or from requests or tokens alone in the other modes). Pending dispatch reservations are first added, one request at a time, to the endpoint that is least loaded at that point. A priority band is then dispatched only while at least one endpoint is below the band's usage limit, so an endpoint over its limit does not let other requests through because other endpoints are idle. `tokens` mode does not count reservations.
+
 ### Role in Scheduling (The Traffic Shaper)
 The detector implements the `Filter` interface to protect individual endpoints. It removes endpoints from candidate lists if their local inflight count exceeds the safety limit:
 
@@ -56,6 +58,7 @@ The plugin accepts JSON parameters decoding to the following fields:
 - `maxTokenConcurrency` (`int64`): Maximum tokens in flight. The "tokens" mode equivalent of `maxConcurrency`. Must be > 0. (Default: `1000000`)
 - `headroom` (`float64`): Allowed burst capacity above the ideal threshold, expressed as a fraction (e.g., `0.2` for 20%). Must be >= 0.0. (Default: `0.0`)
 - `failOpen` (`bool`): Whether the filter returns all candidates when every candidate is over its limit. When `false` it returns none. (Default: `true`)
+- `poolAggregation` (`string`): How per-endpoint load is combined into pool saturation. Valid values are `"average"` (the aggregate or average signal of the selected `concurrencyMode`) and `"least-loaded"` (the saturation of the least-loaded endpoint after assigning pending dispatch reservations). (Default: `"average"`)
 
 ## Trade-offs
 
