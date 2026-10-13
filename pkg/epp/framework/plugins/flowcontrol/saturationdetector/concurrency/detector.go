@@ -89,6 +89,7 @@ func newDetector(name string, cfg config, logger logr.Logger) *detector {
 	pluginLogger.V(logutil.DEFAULT).Info("Creating new ConcurrencyDetector",
 		"mode", cfg.mode,
 		"maxConcurrency", cfg.maxConcurrency,
+		"maxConcurrencyByPriority", cfg.maxConcurrencyByPriority,
 		"maxTokenConcurrency", cfg.maxTokenConcurrency,
 		"headroom", cfg.headroom,
 		"failOpen", !cfg.failClosed)
@@ -245,16 +246,17 @@ func ratio(inflight, capacity int64) float64 {
 // to it, so an endpoint is dropped when admitting the request would take it over the limit. An endpoint with no
 // in-flight tokens always passes the token check: it is the best placement the pool can offer a request that
 // is larger than the limit. In "hybrid" mode an endpoint is also dropped when its request load reaches the limit.
+// The request capacity is the request's entry in maxConcurrencyByPriority, or maxConcurrency.
 // If all endpoints are filtered out, the filter fails open and returns all endpoints, unless FailOpen is false.
 func (d *detector) Filter(
 	_ context.Context,
-	_ *fwksched.InferenceRequest,
+	request *fwksched.InferenceRequest,
 	endpoints []fwksched.Endpoint,
 ) []fwksched.Endpoint {
 	// Pre-allocate assuming most endpoints will pass the filter to minimize allocations.
 	filtered := make([]fwksched.Endpoint, 0, len(endpoints))
 
-	reqLimit := int64(float64(d.config.maxConcurrency) * (1.0 + d.config.headroom))
+	reqLimit := int64(float64(d.requestCapacity(request)) * (1.0 + d.config.headroom))
 	tokLimit := int64(float64(d.config.maxTokenConcurrency) * (1.0 + d.config.headroom))
 	countIncoming := d.config.mode == modeTokens || d.config.mode == modeHybrid
 
@@ -280,6 +282,16 @@ func (d *detector) Filter(
 		}
 	}
 	return filtered
+}
+
+// requestCapacity returns the per-endpoint request capacity that applies to the request's priority.
+func (d *detector) requestCapacity(request *fwksched.InferenceRequest) int64 {
+	if request != nil {
+		if limit, ok := d.config.maxConcurrencyByPriority[request.Objectives.Priority]; ok {
+			return limit
+		}
+	}
+	return d.config.maxConcurrency
 }
 
 // admits reports whether an endpoint can take the request within its safety limit for the active mode.

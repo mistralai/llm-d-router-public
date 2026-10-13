@@ -128,6 +128,21 @@ func TestConcurrencyDetectorFactory(t *testing.T) {
 			configJSON: []byte(`{"headroom": 2.0}`),
 			wantError:  false,
 		},
+		{
+			name:       "valid max concurrency by priority",
+			configJSON: []byte(`{"maxConcurrency": 16, "maxConcurrencyByPriority": {"9": 16, "2": 12, "-1": 8}}`),
+			wantError:  false,
+		},
+		{
+			name:       "invalid max concurrency by priority value",
+			configJSON: []byte(`{"maxConcurrencyByPriority": {"2": 0}}`),
+			wantError:  true,
+		},
+		{
+			name:       "invalid max concurrency by priority key",
+			configJSON: []byte(`{"maxConcurrencyByPriority": {"high": 12}}`),
+			wantError:  true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -806,6 +821,75 @@ func TestDetector_HybridFilter(t *testing.T) {
 			newStubSchedulingEndpoint(reg, endpointB),
 		})
 		require.Len(t, kept, 2, "hybrid filter should fail open when all endpoints exceed limits")
+	})
+}
+
+// TestDetector_FilterByPriority verifies that the filter applies the request capacity configured for the
+// request's priority, falls back to maxConcurrency otherwise, and scales the capacity by the headroom.
+func TestDetector_FilterByPriority(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	requestWithPriority := func(priority int) *fwksched.InferenceRequest {
+		return &fwksched.InferenceRequest{Objectives: fwksched.RequestObjectives{Priority: priority}}
+	}
+
+	tests := []struct {
+		name     string
+		headroom float64
+		request  *fwksched.InferenceRequest
+		inFlight int64
+		wantKept int
+	}{
+		{name: "high_priority_below_its_limit", request: requestWithPriority(9), inFlight: 15, wantKept: 2},
+		{name: "high_priority_at_its_limit", request: requestWithPriority(9), inFlight: 16, wantKept: 1},
+		{name: "low_priority_below_its_limit", request: requestWithPriority(2), inFlight: 11, wantKept: 2},
+		{name: "low_priority_at_its_limit", request: requestWithPriority(2), inFlight: 12, wantKept: 1},
+		{name: "unlisted_priority_uses_max_concurrency", request: requestWithPriority(5), inFlight: 13, wantKept: 2},
+		{name: "unlisted_priority_at_max_concurrency", request: requestWithPriority(5), inFlight: 14, wantKept: 1},
+		{name: "nil_request_uses_max_concurrency", request: nil, inFlight: 14, wantKept: 1},
+		{name: "headroom_scales_priority_limit", headroom: 0.5, request: requestWithPriority(2), inFlight: 17, wantKept: 2},
+		{name: "headroom_scaled_priority_limit_reached", headroom: 0.5, request: requestWithPriority(2), inFlight: 18, wantKept: 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reg := newLocalRegistry()
+			detector := newDetector("test-detector", config{
+				mode:                     modeRequests,
+				maxConcurrency:           14,
+				maxConcurrencyByPriority: map[int]int64{9: 16, 2: 12},
+				headroom:                 tc.headroom,
+			}, logr.Discard())
+			endpointName := "endpoint-a"
+			reg.update(fullEndpointName(endpointName), func(load *attrconcurrency.InFlightLoad) {
+				load.Requests = tc.inFlight
+			})
+
+			kept := detector.Filter(ctx, tc.request, []fwksched.Endpoint{
+				newStubSchedulingEndpoint(reg, endpointName),
+				newStubSchedulingEndpoint(reg, cleanEndpoint),
+			})
+			require.Len(t, kept, tc.wantKept, "filter must apply the capacity of the request's priority")
+		})
+	}
+
+	t.Run("saturation_ignores_priority_capacities", func(t *testing.T) {
+		t.Parallel()
+		reg := newLocalRegistry()
+		detector := newDetector("test-detector", config{
+			mode:                     modeRequests,
+			maxConcurrency:           10,
+			maxConcurrencyByPriority: map[int]int64{9: 20},
+		}, logr.Discard())
+		endpointName := "endpoint-a"
+		reg.update(fullEndpointName(endpointName), func(load *attrconcurrency.InFlightLoad) {
+			load.Requests = 5
+		})
+
+		saturation := detector.Saturation(ctx, []datalayer.Endpoint{newFakeEndpoint(reg, endpointName)})
+		require.InDelta(t, 0.5, saturation, 1e-6, "pool saturation must use maxConcurrency")
 	})
 }
 
