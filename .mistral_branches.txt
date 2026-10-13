@@ -14,14 +14,17 @@
 # Commits already present upstream (by patch id) or already applied by an
 # earlier branch in this list are skipped automatically.
 #
-# The v1.0.2-rebased-upstream feature branches were prepared against
-# de2e3e11fc038f53d9a1aa8cdc51a1aa07917501. Branches are replayed in this order.
+# The feature branches were prepared against upstream
+# a2de1a015d18f229f62986922ecf2e504cc55347. Branches are replayed in this order.
 
 nzt/v1.0.2-pinned-reconstruction                      # adds pinned-base rebuilds on top of lfm/v1.0.2-rebased-upstream-build-tooling
-lfm/v1.0.2-rebased-upstream-dp-kvevents               # shared-port multi-DP routing with ordered KV-event cleanup
-lfm/v1.0.2-rebased-upstream-objective-key             # resolve inference objectives after request-header plugins
-nicolo.lucchesi/pd-chat-token-reuse-integration       # revision forwarding and text chat prompt-token reuse (https://github.com/mistralai/llm-d-router-public/pull/47)
+mk/261013-rebase-dp-kvevents                          # shared-port multi-DP routing with ordered KV-event cleanup (port of lfm/v1.0.2-rebased-upstream-dp-kvevents)
+mk/261013-rebase-objective-key                        # resolve inference objectives after request-header plugins (port of lfm/v1.0.2-rebased-upstream-objective-key)
+mk/261013-rebase-pd-chat-token-reuse                  # text chat prompt-token reuse; revision forwarding is upstream (port of nicolo.lucchesi/pd-chat-token-reuse-integration, https://github.com/mistralai/llm-d-router-public/pull/47)
 lfm/v1.0.2-rebased-upstream-rawbody-release           # release request RawBody after Envoy forwarding
 
-lfm/multimodal-streaming-token-accounting            # preserve multimodal accounting and release prompt load at stream start (https://github.com/mistralai/llm-d-router-public/pull/39, https://github.com/mistralai/llm-d-router-public/pull/41)
-selim/enable-websocket-upgrade                        # enable WebSocket upgrade with a fallback on random epp (https://github.com/mistralai/llm-d-router-public/pull/44)
+mk/261013-rebase-streaming-accounting                 # preserve multimodal accounting and release prompt load at stream start (port of lfm/multimodal-streaming-token-accounting, https://github.com/mistralai/llm-d-router-public/pull/39, https://github.com/mistralai/llm-d-router-public/pull/41)
+mk/261013-rebase-websocket-upgrade                    # enable WebSocket upgrade with a fallback on random epp (port of selim/enable-websocket-upgrade, https://github.com/mistralai/llm-d-router-public/pull/44)
+
+mk/261013-priority-concurrency-filter                 # per-priority request capacity in the concurrency filter
+mk/261013-least-loaded-pool-saturation                # least-loaded pool aggregation; also carries the previous commit, skipped by patch id
