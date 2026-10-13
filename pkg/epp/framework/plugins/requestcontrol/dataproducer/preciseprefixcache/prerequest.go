@@ -28,6 +28,7 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -291,10 +292,7 @@ func (p *Producer) PreRequest(ctx context.Context,
 	if targetMeta == nil {
 		return nil
 	}
-	speculativePod := kvblock.PodEntry{
-		PodIdentifier: fmt.Sprintf("%s:%s", targetMeta.Address, targetMeta.Port),
-		Speculative:   true,
-	}
+	speculativePod := speculativePodEntry(targetMeta)
 
 	index := p.kvCacheIndexer.KVBlockIndex()
 	// Insert per-prompt keys separately to preserve correct block adjacency.
@@ -310,10 +308,7 @@ func (p *Producer) PreRequest(ctx context.Context,
 	// P/D disagg: seed the prefill endpoint too.
 	if prefill := schedulingResult.ProfileResults[experimentalPrefillProfile].FirstEndpoint(); prefill != nil {
 		if prefillMeta := prefill.GetMetadata(); prefillMeta != nil {
-			prefillPod := kvblock.PodEntry{
-				PodIdentifier: fmt.Sprintf("%s:%s", prefillMeta.Address, prefillMeta.Port),
-				Speculative:   true,
-			}
+			prefillPod := speculativePodEntry(prefillMeta)
 			for _, promptKeys := range state.perPromptKeys {
 				if err := index.Add(ctx, nil, promptKeys, []kvblock.PodEntry{prefillPod}); err != nil {
 					logger.Error(err, "Failed to add speculative entries for prefill endpoint",
@@ -335,4 +330,16 @@ func (p *Producer) PreRequest(ctx context.Context,
 		"prompts", len(state.perPromptKeys),
 		"ttl", p.speculativeTTL)
 	return nil
+}
+
+func speculativePodEntry(meta *datalayer.EndpointMetadata) kvblock.PodEntry {
+	entry := kvblock.PodEntry{
+		PodIdentifier: fmt.Sprintf("%s:%s", meta.Address, meta.Port),
+		Speculative:   true,
+	}
+	if meta.DataParallelRank != nil {
+		rank := *meta.DataParallelRank
+		entry.DataParallelRank = &rank
+	}
+	return entry
 }

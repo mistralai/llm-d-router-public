@@ -7,6 +7,11 @@
       {{- $proxyConfigMap := index $proxy "configMap" | default dict }}
       {{- $proxyConfigMapName := index $proxyConfigMap "name" | default "" }}
       {{- $eppFlags := deepCopy (.Values.router.epp.flags | default dict) }}
+      {{- $dataParallelSize := .Values.router.modelServers.dataParallelSize | int }}
+      {{- if gt $dataParallelSize 1 }}
+        {{- $_ := set $eppFlags "endpoint-data-parallel-size" $dataParallelSize }}
+        {{- $_ := set $eppFlags "allow-experimental-plugins" true }}
+      {{- end }}
       {{- if and (eq $proxyType "agentgateway") (not (hasKey $eppFlags "secure-serving")) }}
         {{- $_ := set $eppFlags "secure-serving" false }}
       {{- end }}

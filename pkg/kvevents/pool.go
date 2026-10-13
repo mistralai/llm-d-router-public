@@ -147,6 +147,23 @@ type PodDiscoveryConfig struct {
 	// offset by rank like SocketPort. A subscriber loads the snapshot in place
 	// of a full replay. Disabled when not set (0 or negative).
 	SnapshotSocketPort int `json:"snapshotSocketPort,omitempty"`
+	// DataParallelSize is accepted for compatibility with configurations that
+	// predate rank metadata discovery. It is ignored.
+	DataParallelSize int `json:"dataParallelSize,omitempty"`
+	// RankPodMapping maps logical ranks behind one serving endpoint to separate
+	// Kubernetes pods that host their KV-event sockets.
+	RankPodMapping *RankPodMappingConfig `json:"rankPodMapping,omitempty"`
+}
+
+// RankPodMappingConfig describes a multi-pod data-parallel group. Pods are
+// grouped with GroupLabelKey. RankLabelKey identifies each pod's zero-based
+// worker index.
+type RankPodMappingConfig struct {
+	GroupLabelKey string `json:"groupLabelKey"`
+	RankLabelKey  string `json:"rankLabelKey"`
+	// RanksPerPod is the number of consecutive global DP ranks hosted by each
+	// worker pod. Values of zero default to one.
+	RanksPerPod int `json:"ranksPerPod,omitempty"`
 }
 
 // EffectiveReplayPort returns the replay socket port.
@@ -376,7 +393,11 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 		if podID == "" {
 			podID = p.adapter.ShardingKey(msg)
 		}
-		p.clearPod(ctx, podID, msg.retire)
+		if msg.ResetDataParallelRank == nil {
+			p.clearPod(ctx, podID, msg.retire)
+		} else {
+			p.clearRank(ctx, podID, *msg.ResetDataParallelRank)
+		}
 		return
 	}
 
@@ -412,6 +433,7 @@ func (p *Pool) processRawMessage(ctx context.Context, msg *RawMessage) {
 
 	if msg.SourceEndpoint != "" {
 		podID = msg.SourceEndpoint
+		batch.DataParallelRank = msg.SourceDataParallelRank
 	}
 	if tracingActive {
 		span.SetAttributes(
@@ -457,6 +479,15 @@ func (p *Pool) clearPod(ctx context.Context, podIdentifier string, retire bool) 
 	if retire {
 		p.groupCatalog.Clear(podIdentifier)
 	}
+}
+
+func (p *Pool) clearRank(ctx context.Context, podIdentifier string, dataParallelRank int) {
+	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
+	if err := kvblock.ClearDataParallelRank(ctx, p.index, podIdentifier, dataParallelRank); err != nil {
+		debugLogger.Error(err, "Failed to clear data-parallel rank from index",
+			"podIdentifier", podIdentifier, "dataParallelRank", dataParallelRank)
+	}
+	p.dedup.clearRank(podIdentifier, dataParallelRank)
 }
 
 // realignExtraFeatures converts per-engine-block extra features to per-canonical-block
@@ -566,13 +597,12 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			deviceTier := normalizeDeviceTier(ev.DeviceTier)
 
 			// Scope for reference-counting this store against duplicate removes.
-			// Mirrors the index eviction identity (pod, tier, group); DP rank is
-			// the sentinel until PR #370 makes the index DP-aware.
+			// Mirrors the index eviction identity.
 			storeScope := blockScope{
 				podIdentifier:    podIdentifier,
 				deviceTier:       deviceTier,
 				groupIdx:         groupIdxOrNoGroup(ev.GroupIdx),
-				dataParallelRank: noDataParallelRank,
+				dataParallelRank: dataParallelRankOrNone(batch.DataParallelRank),
 			}
 
 			// Use LoRA name as model identifier if available, otherwise fall back to base model name.
@@ -582,7 +612,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			}
 
 			// Create PodEntry for this specific event's device tier.
-			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+			podEntries := []kvblock.PodEntry{{
+				PodIdentifier:    podIdentifier,
+				DeviceTier:       deviceTier,
+				DataParallelRank: batch.DataParallelRank,
+			}}
 			hasExplicitKind := ev.KVCacheSpecKind != ""
 			if ev.GroupIdx != nil {
 				g := kvblock.GroupID(*ev.GroupIdx)
@@ -766,7 +800,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			}
 
 			// Create PodEntry for this specific event's device tier.
-			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+			podEntries := []kvblock.PodEntry{{
+				PodIdentifier:    podIdentifier,
+				DeviceTier:       deviceTier,
+				DataParallelRank: batch.DataParallelRank,
+			}}
 			if ev.GroupIdx != nil {
 				podEntries[0].HasGroup = true
 				podEntries[0].GroupIdx = kvblock.GroupID(*ev.GroupIdx)
@@ -780,7 +818,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				podIdentifier:    podIdentifier,
 				deviceTier:       deviceTier,
 				groupIdx:         groupIdxOrNoGroup(ev.GroupIdx),
-				dataParallelRank: noDataParallelRank,
+				dataParallelRank: dataParallelRankOrNone(batch.DataParallelRank),
 			}
 			hashesToEvict := p.dedup.filterRemove(removeScope, ev.BlockHashes)
 
@@ -816,9 +854,8 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				"deviceTier", ev.DeviceTier,
 				"modelName", modelName)
 
-			// AllBlocksCleared is pod-wide: vLLM reset its entire prefix cache
-			// (e.g. after an RLHF weight update), so drop every entry for this pod
-			// across all tiers. vLLM and SGLang both emit it with no tier annotation.
+			// AllBlocksCleared resets the emitting engine's entire prefix cache. A
+			// data-parallel rank must not clear sibling ranks sharing the pod.
 			// Index.Clear cannot scope by tier, so if an engine ever starts setting
 			// DeviceTier (a tier-scoped reset), this would over-wipe the other tiers.
 			// Surface that here so the regression does not pass silently.
@@ -827,7 +864,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 					"anyway (tier-scoped clear is not supported)",
 					"podIdentifier", podIdentifier, "deviceTier", ev.DeviceTier)
 			}
-			p.clearPod(ctx, podIdentifier, false)
+			if batch.DataParallelRank == nil {
+				p.clearPod(ctx, podIdentifier, false)
+			} else {
+				p.clearRank(ctx, podIdentifier, *batch.DataParallelRank)
+			}
 
 		default:
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)
