@@ -32,6 +32,8 @@ In tokens and hybrid modes the token check also counts the uncached tokens the i
 
 An endpoint with no in-flight tokens always passes the token check. A request larger than the limit can still be placed on an idle endpoint, which is the best placement the pool can offer, and the engine's own limits decide whether it runs.
 
+The request capacity is the `maxConcurrencyByPriority` entry for the request's priority when one is configured, and `maxConcurrency` otherwise. This lets lower-priority requests stop being routed to an endpoint at a lower in-flight count than higher-priority requests.
+
 This approach allows the Flow Controller to manage average pool load, while the Scheduler retains the flexibility to burst above ideal targets (the "Headroom") to satisfy affinity or scoring objectives.
 
 **Fail-Open Fallback:** To prevent complete routing failure, if *all* candidate endpoints are filtered out (i.e., the entire cluster is over the safety limits), the filter softens and returns the original list of endpoints, allowing the scheduler's scorers to pick the least-bad option. With `failOpen: false` the filter returns no endpoints instead, so the profile finds no endpoint and the request fails rather than overloading one.
@@ -50,6 +52,7 @@ The plugin accepts JSON parameters decoding to the following fields:
 
 - `concurrencyMode` (`string`): Evaluation mode. Valid values are `"requests"`, `"tokens"`, or `"hybrid"`. In `"hybrid"` mode both request and token accounting are evaluated. Pool saturation is computed per endpoint as the larger of that endpoint's request and token ratios, then averaged across endpoints, so an endpoint saturated on either dimension is reflected even when distinct endpoints saturate on different dimensions. An endpoint is filtered out when either its request load reaches the limit or its token load plus the request's uncached tokens exceeds the limit. (Default: `"requests"`)
 - `maxConcurrency` (`int64`): Maximum requests in flight. Serves as the "ideal" request capacity for a single endpoint. Must be > 0. (Default: `100`)
+- `maxConcurrencyByPriority` (`map[int]int64`): Request capacity used by the filter for requests of the given InferenceObjective priority, e.g. `{"9": 16, "2": 12}`. Priorities without an entry use `maxConcurrency`. Pool saturation always uses `maxConcurrency`. Values must be > 0. (Default: empty)
 - `maxTokenConcurrency` (`int64`): Maximum tokens in flight. The "tokens" mode equivalent of `maxConcurrency`. Must be > 0. (Default: `1000000`)
 - `headroom` (`float64`): Allowed burst capacity above the ideal threshold, expressed as a fraction (e.g., `0.2` for 20%). Must be >= 0.0. (Default: `0.0`)
 - `failOpen` (`bool`): Whether the filter returns all candidates when every candidate is over its limit. When `false` it returns none. (Default: `true`)
