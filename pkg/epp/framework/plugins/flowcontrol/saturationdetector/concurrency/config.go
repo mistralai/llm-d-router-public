@@ -20,6 +20,8 @@ package concurrency
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"k8s.io/utils/ptr"
 )
@@ -40,6 +42,15 @@ type apiConfig struct {
 	//
 	// Defaults to 100 if unset.
 	MaxConcurrency *int64 `json:"maxConcurrency,omitempty"`
+
+	// MaxConcurrencyByPriority overrides MaxConcurrency in the scheduling filter for requests of a
+	// given priority (the InferenceObjective priority). Priorities without an entry use
+	// MaxConcurrency. The override is multiplied by (1 + Headroom) like MaxConcurrency. Pool
+	// saturation always uses MaxConcurrency.
+	//
+	// Example: {"9": 16, "2": 12} keeps an endpoint eligible for priority 9 requests until it holds
+	// 16 in-flight requests, and for priority 2 requests until it holds 12.
+	MaxConcurrencyByPriority map[int]int64 `json:"maxConcurrencyByPriority,omitempty"`
 
 	// Headroom defines the allowed burst capacity above the ideal threshold (MaxConcurrency or
 	// MaxTokenConcurrency), expressed as a multiplier (e.g., 0.2 for 20%).
@@ -117,6 +128,7 @@ const (
 // config is the internal, fully-validated configuration used by the detector.
 type config struct {
 	maxConcurrency           int64
+	maxConcurrencyByPriority map[int]int64
 	headroom                 float64
 	mode                     concurrencyMode
 	maxTokenConcurrency      int64
@@ -142,6 +154,7 @@ func buildConfig(apiCfg *apiConfig) (*config, error) {
 
 	return &config{
 		maxConcurrency:           *safeCfg.MaxConcurrency,
+		maxConcurrencyByPriority: maps.Clone(safeCfg.MaxConcurrencyByPriority),
 		headroom:                 *safeCfg.Headroom,
 		mode:                     *safeCfg.ConcurrencyMode,
 		maxTokenConcurrency:      *safeCfg.MaxTokenConcurrency,
@@ -176,6 +189,11 @@ func validateConfig(cfg *apiConfig) error {
 
 	if cfg.MaxConcurrency != nil && *cfg.MaxConcurrency <= 0 {
 		errs = append(errs, fmt.Errorf("maxConcurrency must be strictly positive, got %d", *cfg.MaxConcurrency))
+	}
+	for _, priority := range slices.Sorted(maps.Keys(cfg.MaxConcurrencyByPriority)) {
+		if limit := cfg.MaxConcurrencyByPriority[priority]; limit <= 0 {
+			errs = append(errs, fmt.Errorf("maxConcurrencyByPriority[%d] must be strictly positive, got %d", priority, limit))
+		}
 	}
 	if cfg.Headroom != nil && *cfg.Headroom < 0.0 {
 		errs = append(errs, fmt.Errorf("headroom must be a non-negative value, got %f", *cfg.Headroom))
