@@ -18,6 +18,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
+	"github.com/llm-d/llm-d-router/pkg/sidecar/constants"
 	"github.com/llm-d/llm-d-router/pkg/sidecar/metrics"
 )
 
@@ -168,6 +170,14 @@ func (s *Server) disaggregatedPrefillHandler(apiType reqcommon.APIType) http.Han
 						"requestPath", r.URL.Path)
 				}
 			}
+		}
+
+		if apiType.IsMistral() && (len(allowedEncoders) > 0 || kvCacheSource != "" || (len(prefillHostPort) > 0 &&
+			(s.config.KVConnector != constants.KVConnectorNIXLV2 || s.config.MoRIIOWriteMode || s.config.MoRIIOParallelDispatch))) {
+			if err := errorJSONInvalid(errors.New("remote prefill on Mistral APIs requires serial NIXLv2 READ mode without encoder or P2P stages"), w); err != nil {
+				logger.Error(err, "failed to send error response to client")
+			}
+			return
 		}
 
 		if len(allowedEncoders) > 0 && s.handleECConnector != nil {

@@ -17,9 +17,13 @@ limitations under the License.
 package request
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 )
+
+// Keep this value one past the final API type to exercise fallback behavior.
+const unknownAPIType = APITypeMistralV3 + 1
 
 func TestAPIType_StringAndPath(t *testing.T) {
 	cases := map[APIType]struct{ name, path string }{
@@ -29,7 +33,9 @@ func TestAPIType_StringAndPath(t *testing.T) {
 		APITypeVLLMGenerate:    {"vllm_generate", PathVLLMGenerate},
 		APITypeSGLangGenerate:  {"sglang_generate", PathSGLangGenerate},
 		APITypeMessages:        {"messages", PathMessages},
-		APIType(7):             {"APIType(7)", PathChatCompletions},
+		APITypeMistralV2:       {"mistral_v2", PathMistralV2},
+		APITypeMistralV3:       {"mistral_v3", PathMistralV3},
+		unknownAPIType:         {fmt.Sprintf("APIType(%d)", unknownAPIType), PathChatCompletions},
 	}
 	for apiType, want := range cases {
 		if got := apiType.String(); got != want.name {
@@ -48,6 +54,8 @@ func TestDetectAPIType(t *testing.T) {
 		want APIType
 	}{
 		{name: "chat completions", path: PathChatCompletions, want: APITypeChatCompletions},
+		{name: "mistral v2", path: PathMistralV2, want: APITypeMistralV2},
+		{name: "mistral v3", path: PathMistralV3, want: APITypeMistralV3},
 		{name: "completions", path: PathCompletions, want: APITypeCompletions},
 		{name: "responses", path: PathResponses, want: APITypeResponses},
 		{name: "messages", path: PathMessages, want: APITypeMessages},
@@ -78,7 +86,9 @@ func TestAPIType_tokenLimitFields(t *testing.T) {
 		APITypeResponses:       {FieldMaxOutputTokens},
 		APITypeVLLMGenerate:    {FieldMaxTokens},
 		APITypeMessages:        {FieldMaxTokens},
-		APIType(7):             {FieldMaxTokens, FieldMaxCompletionTokens},
+		APITypeMistralV2:       {FieldMaxTokens},
+		APITypeMistralV3:       {FieldMaxTokens},
+		unknownAPIType:         {FieldMaxTokens, FieldMaxCompletionTokens},
 	}
 	for apiType, want := range cases {
 		if got := apiType.tokenLimitFields(); !reflect.DeepEqual(got, want) {

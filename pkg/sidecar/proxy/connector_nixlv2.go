@@ -20,11 +20,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"sync/atomic"
@@ -64,9 +66,62 @@ func newNIXLV2RequestID() (string, error) {
 func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPodHostPort, kvCacheSource string, apiType reqcommon.APIType) {
 	s.logger.V(logging.DEBUG).Info("running NIXL protocol V2", "url", prefillPodHostPort, "api", apiType.String())
 
-	original, body, ok := s.readJSONBody(r, w)
-	if !ok {
-		return
+	var native *mistralRequest
+	var nativeBudget context.Context
+	var cancelNative context.CancelFunc
+	var nativeTargetURL *url.URL
+	var transfer mistralTransfer
+	nativeComplete := false
+	var original []byte
+	var body map[string]any
+	if apiType.IsMistral() {
+		select {
+		case s.nativeSlots <- struct{}{}:
+			defer func() { <-s.nativeSlots }()
+		default:
+			_ = sendError(errors.New("native disaggregation resource limit reached"), "ResourceUnavailable", 503, w)
+			return
+		}
+		nativeBudget, cancelNative = context.WithTimeout(r.Context(), s.nativeLimits.PrefillTimeout)
+		defer cancelNative()
+		deadline, _ := nativeBudget.Deadline()
+		controller := http.NewResponseController(w)
+		_ = controller.SetReadDeadline(deadline)
+		var err error
+		native, err = readMistralRequest(r.WithContext(nativeBudget), apiType, s.nativeLimits)
+		if err != nil {
+			status := 400
+			var input *mistralInputError
+			var network net.Error
+			if errors.As(err, &input) {
+				status = input.status
+			} else if nativeBudget.Err() != nil || (errors.As(err, &network) && network.Timeout()) {
+				status = 408
+			}
+			if writeErr := sendError(err, "NativeRequestError", status, w); writeErr != nil {
+				s.logger.Error(writeErr, "failed to send error response to client")
+			}
+			return
+		}
+		_ = controller.SetReadDeadline(time.Time{})
+		defer native.close()
+		nativeTargetURL, err = nativeTarget(s.prefillerURLPrefix, prefillPodHostPort)
+		if err != nil {
+			_ = sendError(err, "NativeEndpointError", 400, w)
+			return
+		}
+		defer func() {
+			if !nativeComplete {
+				s.cleanupMistralTransfer(r.Context(), nativeTargetURL, transfer, r.Header)
+			}
+		}()
+		body = native.metadata
+	} else {
+		var ok bool
+		original, body, ok = s.readJSONBody(r, w)
+		if !ok {
+			return
+		}
 	}
 
 	// Generate unique request UUID
@@ -90,7 +145,9 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	// Prefill Stage
 	tracer := tracing.Tracer(tracerScope)
 	ctx := r.Context()
-
+	if native != nil {
+		ctx = nativeBudget
+	}
 	ctx, prefillSpan := tracer.Start(ctx, "prefill",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
@@ -168,6 +225,11 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	s.addP2PPullToPrefill(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
 
 	reqcommon.CapSingleToken(prefillRequest, apiType)
+	if native != nil {
+		delete(prefillRequest, reqcommon.FieldEcho)
+		delete(prefillRequest, "top_k_prompt_logprobs")
+		delete(prefillRequest, "top_k_logprobs")
+	}
 
 	pbody, err := json.Marshal(prefillRequest)
 	if err != nil {
@@ -179,12 +241,15 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	preq.Body = io.NopCloser(bytes.NewReader(pbody))
 	preq.ContentLength = int64(len(pbody))
 
-	prefillHandler, err := s.prefillerProxyHandler(prefillPodHostPort)
-	if err != nil {
-		if err := errorBadGateway(err, w); err != nil {
-			s.logger.Error(err, "failed to send error response to client")
+	var prefillHandler http.Handler
+	if native == nil {
+		prefillHandler, err = s.prefillerProxyHandler(prefillPodHostPort)
+		if err != nil {
+			if writeErr := errorBadGateway(err, w); writeErr != nil {
+				s.logger.Error(writeErr, "failed to send error response to client")
+			}
+			return
 		}
-		return
 	}
 
 	// 2. Forward request to prefiller
@@ -202,13 +267,33 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	var pw *bufferedResponseWriter
 retryLoop:
 	for attempt := 0; ; attempt++ {
-		pw = &bufferedResponseWriter{}
-		preq.Body = io.NopCloser(bytes.NewReader(pbody))
-		preq.ContentLength = int64(len(pbody))
-		prefillHandler.ServeHTTP(pw, preq)
+		if native != nil {
+			if err := nativeBudget.Err(); err != nil {
+				pw = &bufferedResponseWriter{}
+				_ = sendError(err, "NativePrefillError", nativeStatus(err), pw)
+				break
+			}
+			transfer = mistralTransfer{}
+			pw = s.prefillMistral(preq, nativeTargetURL, native, pbody, &transfer)
+		} else {
+			pw = &bufferedResponseWriter{}
+			preq.Body = io.NopCloser(bytes.NewReader(pbody))
+			preq.ContentLength = int64(len(pbody))
+			prefillHandler.ServeHTTP(pw, preq)
+			_ = preq.Body.Close()
+		}
 
 		if !isHTTPError(pw.statusCode) {
 			break
+		}
+		if native != nil {
+			s.cleanupMistralTransfer(r.Context(), nativeTargetURL, transfer, r.Header)
+			transfer = mistralTransfer{}
+			if nativeBudget.Err() != nil {
+				pw = &bufferedResponseWriter{}
+				_ = sendError(nativeBudget.Err(), "NativePrefillError", nativeStatus(nativeBudget.Err()), pw)
+				break
+			}
 		}
 		if !isRetryableStatus(pw.statusCode) {
 			break
@@ -256,16 +341,21 @@ retryLoop:
 		}
 		return
 	}
-	prefillSpan.End()
-
 	// Process response - extract p/d fields
 	var prefillerResponse map[string]any
-	if err := json.Unmarshal(pw.bodyBytes(), &prefillerResponse); err != nil {
+	if native != nil {
+		prefillerResponse = map[string]any{reqcommon.FieldKVTransferParams: transfer.raw, mistralCachedTokensField: transfer.cachedTokens}
+		cancelNative()
+
+	} else if err := json.Unmarshal(pw.bodyBytes(), &prefillerResponse); err != nil {
+		prefillSpan.End()
 		if err := errorJSONInvalid(err, w); err != nil {
 			s.logger.Error(err, "failed to send error response to client")
 		}
 		return
 	}
+
+	prefillSpan.End()
 
 	// 3. Verify response
 
@@ -274,6 +364,9 @@ retryLoop:
 		s.logger.Info("warning: missing 'kv_transfer_params' field in prefiller response")
 	}
 	pCachedTokens, hasPCachedTokens := extractCachedTokens(prefillerResponse)
+	if native != nil {
+		pCachedTokens, hasPCachedTokens = prefillerResponse[mistralCachedTokensField].(int)
+	}
 	if !hasPCachedTokens {
 		// vLLM returns prompt_tokens_details as null when cached_tokens is 0,
 		// so treat a missing prefiller cached_tokens value as zero.
@@ -287,6 +380,9 @@ retryLoop:
 
 	// Decode Stage
 
+	if native != nil {
+		ctx = r.Context()
+	}
 	ctx, decodeSpan := tracer.Start(ctx, "decode",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
@@ -344,6 +440,7 @@ retryLoop:
 	}
 
 	streamingEnabled, _ := body[reqcommon.FieldStream].(bool)
+	streamingEnabled = streamingEnabled || native != nil
 	decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeStreaming(streamingEnabled))
 
 	// WRITE mode: backfill the decode-side kv_transfer_params fields that
@@ -399,6 +496,15 @@ retryLoop:
 	}
 	dreq.Body = io.NopCloser(bytes.NewReader(dbody))
 	dreq.ContentLength = int64(len(dbody))
+	if native != nil {
+		if err := native.setBody(dreq, dbody, true); err != nil {
+			if writeErr := errorInternalServerError(err, w); writeErr != nil {
+				s.logger.Error(writeErr, "failed to send error response to client")
+			}
+			return
+		}
+		defer dreq.Body.Close()
+	}
 
 	// 2. Forward to local decoder.
 
@@ -406,16 +512,21 @@ retryLoop:
 		trace.Info("sending request to decoder", logging.HTTPBodyKey, string(dbody))
 	}
 	statusWriter, decodeStatus := captureResponseStatus(w)
-	decodeWriter, finalizeDecodeWriter := newCachedTokensResponseWriterWithFinalize(statusWriter, pCachedTokens, streamingEnabled)
+	state := &mistralDecodeState{}
+	decodeWriter, finalizeDecodeWriter := newCachedTokensResponseWriterForAPIWithLimits(statusWriter, pCachedTokens, streamingEnabled, apiType, s.nativeLimits, state)
 	decodeReturned := false
 	defer recordDecodeAbort(&decodeReturned, decodeStart)
-	dataParallelUsed := s.forwardDataParallel && s.dataParallelHandler(decodeWriter, dreq)
+	decodeServer := s
+	if native != nil {
+		decodeServer = s.mistralDecodeServer(state)
+	}
+	dataParallelUsed := decodeServer.forwardDataParallel && decodeServer.dataParallelHandler(decodeWriter, dreq)
 	decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeDataParallel(dataParallelUsed))
 
 	if !dataParallelUsed {
 		s.logger.V(logging.DEBUG).Info("sending request to decoder", "to", s.config.DecoderURL.Host)
 		decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeTarget(s.config.DecoderURL.Host))
-		s.dispatchDecode(decodeWriter, dreq, body)
+		decodeServer.dispatchDecode(decodeWriter, dreq, body)
 	}
 	decodeReturned = true
 	if err := finalizeDecodeWriter(); err != nil {
@@ -423,12 +534,18 @@ retryLoop:
 		metrics.RecordError(metrics.StageDecode)
 		s.logger.Error(err, "failed to flush cached token response writer")
 		decodeSpan.SetStatus(codes.Error, "failed to flush cached token response writer")
+		if native != nil {
+			panic(http.ErrAbortHandler)
+		}
 		return
 	}
 
+	if native != nil {
+		nativeComplete = state.done && !state.failed && !decodeStatus.failed() && r.Context().Err() == nil
+	}
 	decodeDuration := time.Since(decodeStart)
 	metrics.RecordDecodeDuration(decodeDuration)
-	if decodeStatus.failed() {
+	if decodeStatus.failed() || state.failed {
 		metrics.RecordError(metrics.StageDecode)
 		decodeSpan.SetStatus(codes.Error, "decode request failed")
 	}

@@ -90,6 +90,47 @@ check a target against the InferencePool; see
    - If `x-llm-d-prefiller-host-port` header exists → sidecar sends prefill to the selected Prefill Worker, then runs decode locally
 4. **Response Flow** – decode sidecar → Envoy → EPP → User
 
+### Mistral tokenized APIs
+
+The sidecar accepts Mistral `/v2/completions` JSON requests and
+`/v3/completions` multipart requests. The EPP must use a parser that supports
+these formats. Both engines must accept the model name in the request.
+
+Without a prefill header, the sidecar forwards the request body and content
+type to decode unchanged. With a prefill header, the sidecar uses serial
+NIXLv2 READ mode to prefill the entire prompt with output capped at one
+generated token (`max_tokens=1`), read `kv_transfer_params` from its SSE
+response, and attach those parameters to the decode request.
+It forwards the native decode SSE stream and reports the prefill cache count
+in `usage.num_cached_tokens`.
+
+Native v2/v3 endpoints always return SSE, including when the gateway serves a
+non-streaming client. The sidecar does not add OpenAI streaming fields to
+the native prefill request. It starts decode only after prefill completes
+with transfer metadata and `[DONE]`.
+
+For v3, the sidecar preserves the multipart parts and their headers. Binary
+parts share one temporary file. Rebuilt requests stream from that file so
+retries can replay the payload without duplicate copies in memory. The sidecar needs a
+writable temporary directory, selected by `TMPDIR` or the operating system
+default. Files are removed after completion, failure, or cancellation.
+
+Native disaggregated requests have fixed limits: 256 MiB per request,
+8 MiB of JSON metadata, 128 parts, and 16 KiB of headers per part. At most
+eight requests hold upload and transfer resources across all local DP ranks.
+Upload and prefill retries share a 120-second deadline. Prefill responses
+are limited to 16 MiB, with at most 4 MiB per SSE event.
+
+Decode closes the upstream response at `[DONE]` or a native error event.
+Failed or cancelled transfers use the selected prefill endpoint to release
+KV blocks, with a five-second cleanup deadline.
+
+Mistral remote prefill does not support WRITE mode, parallel dispatch,
+separate encoder stages, or P2P cache-source stages. Such requests return
+HTTP 400. Invalid prefill streams return HTTP 502; native abort and error
+finish reasons return HTTP 503. Native stream errors retain their valid
+HTTP error code.
+
 ### E/PD (Encode/Prefill-Decode)
 
 For multimodal requests (images, video, audio), the encode stage can be disaggregated to dedicated workers:
