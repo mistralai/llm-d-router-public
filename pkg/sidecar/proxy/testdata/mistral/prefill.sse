@@ -1,0 +1,4 @@
+data: {"id":"cmpl-prefill","index":0,"token_ids":[0, 1, 2],"is_prompt":[true,true,true],"sequence_final_response":false,"usage":{},"kv_transfer_params":{"do_remote_decode":false,"do_remote_prefill":true,"remote_request_id":"fixture-transfer","remote_engine_id":"00000000-0000-4000-8000-000000000000","remote_block_ids":[109],"remote_host":"127.0.0.1","remote_port":5557,"tp_size":2}}
+
+data: [DONE]
+

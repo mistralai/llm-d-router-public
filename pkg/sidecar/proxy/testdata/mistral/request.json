@@ -1,0 +1,16 @@
+{
+  "model": "test-model",
+  "prompt": [
+    0,
+    1,
+    2
+  ],
+  "max_tokens": 20,
+  "seed": 0,
+  "temperature": 0.0,
+  "priority": 5,
+  "request_id": "fixture_0",
+  "vllm_xargs": {
+    "kv_cache_report_mode": "full"
+  }
+}

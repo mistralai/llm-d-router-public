@@ -279,7 +279,10 @@ type Server struct {
 	resolverOnce sync.Once
 	hostResolver *hostResolver
 
-	config Config
+	config              Config
+	nativeLimits        mistralLimits
+	nativeSlots         chan struct{}
+	nativePrefillClient *http.Client
 
 	// HTTPListener is an optional pre-bound listener for the data-plane HTTP
 	// server. When set, startHTTP serves on it and does not call net.Listen.
@@ -375,6 +378,8 @@ func NewProxy(config Config) *Server {
 		prefillerURLPrefix:  "http://",
 		encoderURLPrefix:    "http://",
 		config:              config,
+		nativeLimits:        defaultMistralLimits(),
+		nativeSlots:         make(chan struct{}, defaultMistralLimits().MaxInFlight),
 		dataParallelProxies: map[string]http.Handler{},
 		forwardDataParallel: true,
 		prefillSamplerFn:    rand.IntN,
@@ -389,6 +394,11 @@ func NewProxy(config Config) *Server {
 		server.prefillerURLPrefix = "https://"
 	}
 
+	prefillScheme := "http"
+	if config.UseTLSForPrefiller {
+		prefillScheme = "https"
+	}
+	server.nativePrefillClient = &http.Client{Transport: server.newProxyTransport(prefillScheme, config.InsecureSkipVerifyForPrefiller), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	if config.ECConnector != "" {
 		server.setECConnector()
 		if config.UseTLSForEncoder {
@@ -464,6 +474,9 @@ func (s *Server) Clone() *Server {
 		nixlRequestIDFn:     s.nixlRequestIDFn,
 		dpBasePort:          s.dpBasePort,
 		config:              s.config,
+		nativeLimits:        s.nativeLimits,
+		nativeSlots:         s.nativeSlots,
+		nativePrefillClient: s.nativePrefillClient,
 	}
 }
 
@@ -562,7 +575,7 @@ func (s *Server) createRoutes() *http.ServeMux {
 	})
 	// DetectAPIType owns the path-to-API mapping; deriving it here keeps the
 	// served routes from drifting away from it.
-	for _, path := range []string{reqcommon.PathChatCompletions, reqcommon.PathCompletions, reqcommon.PathMessages, reqcommon.PathResponses, reqcommon.PathVLLMGenerate, reqcommon.PathSGLangGenerate} {
+	for _, path := range []string{reqcommon.PathChatCompletions, reqcommon.PathCompletions, reqcommon.PathMessages, reqcommon.PathResponses, reqcommon.PathVLLMGenerate, reqcommon.PathSGLangGenerate, reqcommon.PathMistralV2, reqcommon.PathMistralV3} {
 		mux.HandleFunc("POST "+path, s.disaggregatedPrefillHandler(reqcommon.DetectAPIType(path)))
 	}
 
