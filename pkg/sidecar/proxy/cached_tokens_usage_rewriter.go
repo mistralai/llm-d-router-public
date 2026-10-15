@@ -19,6 +19,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 
@@ -35,6 +36,10 @@ type cachedTokensUsageRewriter struct {
 	cachedTokens int
 	wroteHeader  bool
 	streaming    bool
+	mistral      bool
+	httpError    bool
+	nativeParser *sseEventParser
+	nativeState  *mistralDecodeState
 	streamBuffer []byte
 	jsonBuffer   []byte
 }
@@ -57,7 +62,24 @@ func newCachedTokensResponseWriter(
 func newCachedTokensResponseWriterWithFinalize(
 	w http.ResponseWriter, cachedTokens int, streaming bool,
 ) (http.ResponseWriter, func() error) {
+	return newCachedTokensResponseWriterForAPI(w, cachedTokens, streaming, reqcommon.APITypeChatCompletions)
+}
+
+type mistralDecodeState struct {
+	done     bool
+	terminal bool
+	failed   bool
+}
+
+func newCachedTokensResponseWriterForAPI(w http.ResponseWriter, cachedTokens int, streaming bool, apiType reqcommon.APIType) (http.ResponseWriter, func() error) {
+	return newCachedTokensResponseWriterForAPIWithLimits(w, cachedTokens, streaming, apiType, defaultMistralLimits(), &mistralDecodeState{})
+}
+
+func newCachedTokensResponseWriterForAPIWithLimits(w http.ResponseWriter, cachedTokens int, streaming bool, apiType reqcommon.APIType, limits mistralLimits, state *mistralDecodeState) (http.ResponseWriter, func() error) {
 	rewriter := &cachedTokensUsageRewriter{
+		mistral:      apiType.IsMistral(),
+		nativeParser: newSSEEventParser(limits.MaxEventBytes),
+		nativeState:  state,
 		header:       w.Header(),
 		cachedTokens: cachedTokens,
 		streaming:    streaming,
@@ -83,6 +105,18 @@ func newCachedTokensResponseWriterWithFinalize(
 		},
 	})
 	return writer, func() error {
+		if rewriter.mistral && rewriter.httpError {
+			return nil
+		}
+		if rewriter.mistral && rewriter.streaming {
+			if err := rewriter.nativeParser.finish(); err != nil {
+				return err
+			}
+			if !rewriter.nativeState.terminal {
+				return io.ErrUnexpectedEOF
+			}
+			return nil
+		}
 		if rewriter.streaming {
 			return rewriter.flushSSEBuffer(w.Write)
 		}
@@ -94,10 +128,22 @@ func (r *cachedTokensUsageRewriter) writeHeader(next httpsnoop.WriteHeaderFunc, 
 	// Rewriting may change the body size, so any upstream Content-Length is stale.
 	r.header.Del("Content-Length")
 	r.wroteHeader = true
+	if statusCode >= 400 {
+		r.httpError = true
+		if r.nativeState != nil {
+			r.nativeState.failed = true
+		}
+	}
 	next(statusCode)
 }
 
 func (r *cachedTokensUsageRewriter) write(next httpsnoop.WriteFunc, body []byte) (int, error) {
+	if r.mistral && r.httpError {
+		return next(body)
+	}
+	if r.mistral && r.streaming {
+		return r.writeNative(next, body)
+	}
 	if !r.streaming {
 		return r.writeJSON(next, body)
 	}
@@ -131,6 +177,9 @@ func (r *cachedTokensUsageRewriter) writeJSON(next httpsnoop.WriteFunc, body []b
 }
 
 func (r *cachedTokensUsageRewriter) readFrom(next httpsnoop.WriteFunc, src io.Reader) (int64, error) {
+	if r.mistral && r.httpError {
+		return io.Copy(cachedTokensStreamWriter{write: r.write, forward: next}, src)
+	}
 	if r.streaming {
 		// SSE can be long-lived, so keep it streaming and rewrite complete lines.
 		n, err := io.Copy(cachedTokensStreamWriter{
@@ -139,6 +188,9 @@ func (r *cachedTokensUsageRewriter) readFrom(next httpsnoop.WriteFunc, src io.Re
 		}, src)
 		if err != nil {
 			return n, err
+		}
+		if r.mistral {
+			return n, r.nativeParser.finish()
 		}
 		if err := r.flushSSEBuffer(next); err != nil {
 			return n, err
@@ -177,7 +229,7 @@ func (r *cachedTokensUsageRewriter) rewriteSSEChunk(body []byte) []byte {
 		}
 		// Upstream may split chunks mid-event; only rewrite complete SSE lines.
 		line := r.streamBuffer[:lineEnd+1]
-		replacedLine, _ := replaceCachedTokensSSELine(line, r.cachedTokens)
+		replacedLine, _ := r.replaceSSELine(line)
 		updated = append(updated, replacedLine...)
 		r.streamBuffer = r.streamBuffer[lineEnd+1:]
 	}
@@ -190,7 +242,7 @@ func (r *cachedTokensUsageRewriter) flushSSEBuffer(next httpsnoop.WriteFunc) err
 	}
 	// EOF without a final newline is malformed SSE, but forward it rather than
 	// dropping bytes. If it is a data line, still try to apply the usage rewrite.
-	replacedLine, _ := replaceCachedTokensSSELine(r.streamBuffer, r.cachedTokens)
+	replacedLine, _ := r.replaceSSELine(r.streamBuffer)
 	r.streamBuffer = nil
 	_, err := next(replacedLine)
 	return err
@@ -300,7 +352,18 @@ func replaceCachedTokensSSE(body []byte, cachedTokens int) ([]byte, bool) {
 	return updated, true
 }
 
+func (r *cachedTokensUsageRewriter) replaceSSELine(line []byte) ([]byte, bool) {
+	if r.mistral {
+		return replaceCachedTokensSSELineWithRewriter(line, r.cachedTokens, replaceMistralCachedTokensJSON)
+	}
+	return replaceCachedTokensSSELine(line, r.cachedTokens)
+}
+
 func replaceCachedTokensSSELine(line []byte, cachedTokens int) ([]byte, bool) {
+	return replaceCachedTokensSSELineWithRewriter(line, cachedTokens, replaceCachedTokensJSON)
+}
+
+func replaceCachedTokensSSELineWithRewriter(line []byte, cachedTokens int, rewrite func([]byte, int) ([]byte, bool)) ([]byte, bool) {
 	trimmedLine := bytes.TrimRight(line, "\r\n")
 	lineEnding := line[len(trimmedLine):]
 	data, ok := bytes.CutPrefix(trimmedLine, []byte(reqcommon.SSEDataPrefix))
@@ -315,7 +378,7 @@ func replaceCachedTokensSSELine(line []byte, cachedTokens int) ([]byte, bool) {
 		return line, true
 	}
 	// Only JSON data frames can carry usage; other SSE frames pass through.
-	replacedData, isJSON := replaceCachedTokensJSON(data, cachedTokens)
+	replacedData, isJSON := rewrite(data, cachedTokens)
 	if !isJSON {
 		return line, true
 	}
@@ -343,4 +406,51 @@ func setCachedTokens(response map[string]any, cachedTokens int) bool {
 		changed = true
 	}
 	return changed
+}
+
+func (r *cachedTokensUsageRewriter) writeNative(next httpsnoop.WriteFunc, body []byte) (int, error) {
+	stop := errors.New("native SSE terminal event")
+	err := r.nativeParser.write(body, func(event sseEvent) error {
+		if r.nativeState.terminal {
+			return stop
+		}
+		out := event.raw
+		if event.isDone() {
+			r.nativeState.done = true
+			r.nativeState.terminal = true
+		} else if event.hasData {
+			var fields struct {
+				Reason string          `json:"sequence_finish_reason"`
+				Error  json.RawMessage `json:"error"`
+			}
+			if err := json.Unmarshal(event.data, &fields); err != nil || bytes.Equal(bytes.TrimSpace(event.data), []byte("null")) {
+				return errors.New("invalid native decode event")
+			}
+			if fields.Reason == "abort" || fields.Reason == "error" || (len(fields.Error) > 0 && !bytes.Equal(bytes.TrimSpace(fields.Error), []byte("null"))) {
+				r.nativeState.failed = true
+				r.nativeState.terminal = true
+			}
+			if updated, ok := replaceMistralCachedTokensJSON(event.data, r.cachedTokens); ok && !bytes.Equal(updated, event.data) {
+				out = event.rewrite(updated)
+			}
+		}
+		written, err := next(out)
+		if err != nil {
+			return err
+		}
+		if written != len(out) {
+			return io.ErrShortWrite
+		}
+		if r.nativeState.terminal {
+			return stop
+		}
+		return nil
+	})
+	if errors.Is(err, stop) {
+		err = nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return len(body), nil
 }

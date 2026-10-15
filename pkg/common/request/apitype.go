@@ -29,6 +29,8 @@ const (
 	PathMessages        = "/v1/messages"
 	PathVLLMGenerate    = "/inference/v1/generate"
 	PathSGLangGenerate  = "/generate"
+	PathMistralV2       = "/v2/completions"
+	PathMistralV3       = "/v3/completions"
 )
 
 // APIType is the inference API a request was sent to. Path and the output
@@ -49,6 +51,8 @@ const (
 	APITypeSGLangGenerate
 	// APITypeMessages is the Anthropic Messages API (/v1/messages).
 	APITypeMessages
+	APITypeMistralV2
+	APITypeMistralV3
 )
 
 // String implements fmt.Stringer so structured logs show readable API names.
@@ -66,6 +70,10 @@ func (a APIType) String() string {
 		return "sglang_generate"
 	case APITypeMessages:
 		return "messages"
+	case APITypeMistralV2:
+		return "mistral_v2"
+	case APITypeMistralV3:
+		return "mistral_v3"
 	default:
 		return fmt.Sprintf("APIType(%d)", int(a))
 	}
@@ -83,6 +91,10 @@ func (a APIType) Path() string {
 		return PathSGLangGenerate
 	case APITypeMessages:
 		return PathMessages
+	case APITypeMistralV2:
+		return PathMistralV2
+	case APITypeMistralV3:
+		return PathMistralV3
 	default:
 		return PathChatCompletions
 	}
@@ -93,6 +105,10 @@ func (a APIType) Path() string {
 // fallback.
 func DetectAPIType(path string) APIType {
 	switch {
+	case strings.Contains(path, PathMistralV2):
+		return APITypeMistralV2
+	case strings.Contains(path, PathMistralV3):
+		return APITypeMistralV3
 	case strings.Contains(path, PathChatCompletions):
 		return APITypeChatCompletions
 	case strings.Contains(path, PathCompletions):
@@ -129,9 +145,13 @@ func (a APIType) tokenLimitFields() []string {
 	switch a {
 	case APITypeResponses:
 		return responsesTokenLimitFields
-	case APITypeCompletions, APITypeVLLMGenerate, APITypeMessages:
+	case APITypeCompletions, APITypeVLLMGenerate, APITypeMessages, APITypeMistralV2, APITypeMistralV3:
 		return maxTokensOnlyTokenLimitFields
 	default:
 		return chatCompletionTokenLimitFields
 	}
+}
+
+func (a APIType) IsMistral() bool {
+	return a == APITypeMistralV2 || a == APITypeMistralV3
 }
