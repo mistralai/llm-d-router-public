@@ -130,7 +130,7 @@ func TestCapSingleToken(t *testing.T) {
 		},
 		{
 			name:    "an unrecognized API is capped as chat completions",
-			apiType: APIType(7),
+			apiType: unknownAPIType,
 			body: map[string]any{
 				"model":           "m",
 				"max_tokens":      100,
@@ -280,6 +280,17 @@ func TestCapSingleToken(t *testing.T) {
 				t.Fatalf("got %v, want %v", tt.body, tt.want)
 			}
 		})
+	}
+}
+
+func TestMistralCapSingleToken(t *testing.T) {
+	for _, apiType := range []APIType{APITypeMistralV2, APITypeMistralV3} {
+		body := map[string]any{FieldMaxTokens: 128, FieldMinTokens: 32, FieldStream: true, FieldStreamOptions: map[string]any{"include_usage": true}, "seed": json.RawMessage("9007199254740993")}
+		CapSingleToken(body, apiType)
+		want := map[string]any{FieldMaxTokens: 1, "seed": json.RawMessage("9007199254740993")}
+		if !reflect.DeepEqual(body, want) {
+			t.Errorf("%s: got %v, want %v", apiType, body, want)
+		}
 	}
 }
 

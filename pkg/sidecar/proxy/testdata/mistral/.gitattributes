@@ -1,0 +1,2 @@
+# SSE requires an empty line to terminate the final event.
+*.sse whitespace=-blank-at-eof

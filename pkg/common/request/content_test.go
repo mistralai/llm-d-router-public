@@ -323,7 +323,7 @@ func TestNewEncoderPrimingBody(t *testing.T) {
 			APITypeCompletions,
 			APITypeVLLMGenerate,
 			APITypeSGLangGenerate,
-			APIType(7),
+			unknownAPIType,
 		} {
 			body := NewEncoderPrimingBody(clientBody, part, apiType)
 			if !reflect.DeepEqual(body, want) {

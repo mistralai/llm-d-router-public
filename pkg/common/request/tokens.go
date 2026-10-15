@@ -23,8 +23,9 @@ import (
 	"maps"
 )
 
-// CapSingleToken rewrites body into a synthetic, non-streaming,
-// single-output-token prefill or encode request. It returns the map
+// CapSingleToken rewrites body into a synthetic,
+// single-output-token prefill or encode request. Mistral APIs always return SSE;
+// other APIs disable streaming for the synthetic request. It returns the map
 // the caps were written into: sampling_params for the vLLM generate API, body itself
 // otherwise. The vLLM generate API also expects transfer params in that map, so a
 // caller adding them needs no second lookup.
@@ -58,7 +59,11 @@ func CapSingleToken(body map[string]any, apiType APIType) map[string]any {
 	}
 	delete(limits, FieldMinTokens)
 
-	body[FieldStream] = false
+	if apiType.IsMistral() {
+		delete(body, FieldStream)
+	} else {
+		body[FieldStream] = false
+	}
 	delete(body, FieldStreamOptions)
 	if apiType == APITypeResponses {
 		body[FieldStore] = false
