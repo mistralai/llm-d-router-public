@@ -38,7 +38,7 @@ runs:
         echo "build=$HOME/.cache/llm-d-gobuildcache" >> "$GITHUB_OUTPUT"
 
     - name: Cache Go modules and build cache
-      uses: actions/cache@v5
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
       with:
         path: |
           ${{ steps.go-cache.outputs.mod }}
