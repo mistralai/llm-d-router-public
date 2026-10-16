@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   check-changes:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     outputs:
       src: ${{ steps.filter.outputs.src }}
       helm: ${{ steps.filter.outputs.helm }}
@@ -60,7 +60,7 @@ jobs:
   verify-helm-charts:
     needs: check-changes
     if: ${{ needs.check-changes.outputs.helm == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x8gi-x86]
     steps:
       - name: Checkout source
         uses: actions/checkout@v7
@@ -76,7 +76,7 @@ jobs:
   test:
     needs: check-changes
     if: ${{ needs.check-changes.outputs.src == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     timeout-minutes: 60
     steps:
       - name: Checkout source
@@ -224,7 +224,7 @@ jobs:
   e2e-image-common:
     needs: check-changes
     if: ${{ needs.check-changes.outputs.src == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -280,7 +280,7 @@ jobs:
   e2e-image-common-status:
     needs: e2e-image-common
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     steps:
       - name: Check e2e-image-common result
         run: |
@@ -293,7 +293,7 @@ jobs:
   e2e-image-router:
     needs: check-changes
     if: ${{ needs.check-changes.outputs.src == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -344,7 +344,7 @@ jobs:
   e2e-image-router-status:
     needs: e2e-image-router
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     steps:
       - name: Check e2e-image-router result
         run: |
@@ -360,7 +360,7 @@ jobs:
       - e2e-image-common
       - e2e-image-router
     if: ${{ needs.check-changes.outputs.src == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     timeout-minutes: 45
     steps:
       - name: Checkout source

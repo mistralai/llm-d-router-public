@@ -52,7 +52,7 @@ permissions:
 
 jobs:
   run-perf-benchmark:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 2x2gi-x86]
     env:
       # This cluster must have the Gateway API Inference Extension CRDs
       # already installed in it.

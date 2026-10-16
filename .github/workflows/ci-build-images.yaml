@@ -42,7 +42,7 @@ permissions:
 
 jobs:
   build-epp:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     permissions:
       contents: read
       packages: write
@@ -92,7 +92,7 @@ jobs:
           push-to-registry: true
 
   build-sidecar:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     permissions:
       contents: read
       packages: write
@@ -140,7 +140,7 @@ jobs:
           push-to-registry: true
 
   build-coordinator:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     permissions:
       contents: read
       packages: write
@@ -189,7 +189,7 @@ jobs:
 
   push-helm-charts:
     needs: [build-epp, build-sidecar, build-coordinator]
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x8gi-x86]
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v7

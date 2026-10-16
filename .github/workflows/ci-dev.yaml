@@ -15,7 +15,7 @@ permissions:
 jobs:
   set-params:
     if: github.event.repository.fork != true
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     outputs:
       epp_name: ${{ steps.version.outputs.epp_name }}
       sidecar_name: ${{ steps.version.outputs.sidecar_name }}

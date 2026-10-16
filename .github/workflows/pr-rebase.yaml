@@ -19,7 +19,7 @@ jobs:
     if: >-
       github.event.issue.pull_request &&
       github.event.comment.body == '/rebase'
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 2x2gi-x86]
     steps:
       - name: Check commenter has write access
         id: check-access
