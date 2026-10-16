@@ -22,13 +22,13 @@ concurrency:
 jobs:
   
   check-for-markdown-files:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     outputs:
       src: ${{ steps.filter.outputs.src }}
     steps:
       - name: Checkout source
-        uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
           filters: |
@@ -44,14 +44,14 @@ jobs:
     # protection, but we skip all real work: pull_request already covers human
     # PRs, and running twice would cause the concurrency group to cancel one run.
     if: github.event_name != 'pull_request_target' && needs.check-for-markdown-files.outputs.src == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 2x2gi-x86]
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Run lychee link checker
-        uses: lycheeverse/lychee-action@v2.9.0
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
           args: '--config .lychee.toml --verbose --no-progress "**/*.md"'
           fail: true

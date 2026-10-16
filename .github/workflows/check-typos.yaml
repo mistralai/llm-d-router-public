@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   typos:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 2x2gi-x86]
 
     steps:
       - name: Checkout code

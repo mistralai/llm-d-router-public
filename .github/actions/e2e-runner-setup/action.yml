@@ -13,6 +13,7 @@ runs:
     # Custom profile with directory-only removals.
     # cleanup-profile: max frees more space but takes longer.
     - name: Free disk space
+      if: runner.environment == 'github-hosted'
       # justinthelaw/maximize-github-runner-space@v0.9.0
       uses: justinthelaw/maximize-github-runner-space@ed391644e646cac4b88480d2f9b12d135f1ccf77
       with:
@@ -37,7 +38,7 @@ runs:
         echo "build=$HOME/.cache/llm-d-gobuildcache" >> "$GITHUB_OUTPUT"
 
     - name: Cache Go modules and build cache
-      uses: actions/cache@v5
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
       with:
         path: |
           ${{ steps.go-cache.outputs.mod }}

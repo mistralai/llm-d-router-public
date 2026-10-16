@@ -19,7 +19,7 @@ jobs:
     if: >-
       github.event.issue.pull_request &&
       github.event.comment.body == '/rebase'
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 2x2gi-x86]
     steps:
       - name: Check commenter has write access
         id: check-access
@@ -70,7 +70,7 @@ jobs:
 
       - name: Checkout base repo
         if: steps.check-access.outputs.skip != 'true'
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ steps.pr.outputs.base-ref }}
           fetch-depth: 0

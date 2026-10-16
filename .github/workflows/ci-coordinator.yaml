@@ -23,13 +23,13 @@ concurrency:
 
 jobs:
   check-changes:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     outputs:
       src: ${{ steps.filter.outputs.src }}
     steps:
       - name: Checkout source
-        uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
           filters: |
@@ -60,11 +60,11 @@ jobs:
   unit-tests:
     needs: check-changes
     if: ${{ needs.check-changes.outputs.src == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     timeout-minutes: 30
     steps:
       - name: Checkout source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Create Go cache dirs
         id: go-cache
@@ -74,7 +74,7 @@ jobs:
           echo "build=$HOME/.cache/llm-d-gobuildcache" >> "$GITHUB_OUTPUT"
 
       - name: Cache Go modules and build cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ${{ steps.go-cache.outputs.mod }}
@@ -93,7 +93,7 @@ jobs:
   e2e-images:
     needs: check-changes
     if: ${{ needs.check-changes.outputs.src == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -122,7 +122,7 @@ jobs:
     steps:
       - name: Checkout source
         if: ${{ matrix.image.source == 'build' }}
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Build ${{ matrix.image.name }} image
         if: ${{ matrix.image.source == 'build' }}
@@ -144,7 +144,7 @@ jobs:
           docker save "${{ matrix.image.image }}" -o "${{ runner.temp }}/${{ matrix.image.archive }}.tar"
 
       - name: Upload ${{ matrix.image.name }} image
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: e2e-coord-image-${{ matrix.image.name }}
           path: ${{ runner.temp }}/${{ matrix.image.archive }}.tar
@@ -154,7 +154,7 @@ jobs:
   e2e-images-status:
     needs: e2e-images
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     steps:
       - name: Check e2e-images result
         run: |
@@ -169,7 +169,7 @@ jobs:
       - check-changes
       - e2e-images
     if: ${{ needs.check-changes.outputs.src == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -182,32 +182,32 @@ jobs:
     name: e2e-tests (${{ matrix.topology }})
     steps:
       - name: Checkout source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up e2e runner
         id: e2e-setup
         uses: ./.github/actions/e2e-runner-setup
 
       - name: Download builder image
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: e2e-coord-image-builder
           path: ${{ runner.temp }}/e2e-images
 
       - name: Download coordinator image
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: e2e-coord-image-coordinator
           path: ${{ runner.temp }}/e2e-images
 
       - name: Download EPP image
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: e2e-coord-image-epp
           path: ${{ runner.temp }}/e2e-images
 
       - name: Download simulator image
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: e2e-coord-image-simulator
           path: ${{ runner.temp }}/e2e-images
@@ -229,7 +229,7 @@ jobs:
   e2e-tests-status:
     needs: e2e-tests
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     steps:
       - name: Check e2e-tests result
         run: |

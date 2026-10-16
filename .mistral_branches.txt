@@ -30,3 +30,5 @@ mk/261013-priority-concurrency-filter                 # per-priority request cap
 mk/261013-least-loaded-pool-saturation                # least-loaded pool aggregation; also carries the previous commit, skipped by patch id
 
 nzt/native-sidecar                                   # native v2/v3 P/D sidecar (https://github.com/mistralai/llm-d-router-public/pull/59)
+
+codex/ciclone-runner-overlay                        # run all composed workflows on Ciclone workers
