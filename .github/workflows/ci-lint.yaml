@@ -34,7 +34,7 @@ jobs:
     # protection, but we skip all real work: pull_request already covers human
     # PRs, and running twice would cause the concurrency group to cancel one run.
     if: github.event_name != 'pull_request_target'
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     outputs:
       src: ${{ steps.filter.outputs.src }}
     steps:
@@ -61,7 +61,7 @@ jobs:
   lint:
     needs: check-changes
     if: ${{ needs.check-changes.outputs.src == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     timeout-minutes: 30
     permissions:
       contents: read
@@ -152,7 +152,7 @@ jobs:
   # within a major version they may only be added to, never changed or removed.
   frozen-stable-configs:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     timeout-minutes: 5
     steps:
       - name: Checkout source

@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   set-params:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     outputs:
       epp_name: ${{ steps.version.outputs.epp_name }}
       sidecar_name: ${{ steps.version.outputs.sidecar_name }}
@@ -60,7 +60,7 @@ jobs:
 
   upload-artifacts:
     needs: set-params
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 4x16gi-x86]
     permissions:
       contents: write
     env:
@@ -102,7 +102,7 @@ jobs:
 
   upload-sbom:
     needs: [set-params, build-and-push, upload-artifacts]
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 2x2gi-x86]
     # A tag push and the release publish it triggers can both run this
     # workflow for the same tag. Queue duplicate runs of this job instead of
     # letting their --clobber uploads interleave.
