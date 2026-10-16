@@ -22,7 +22,7 @@ jobs:
     if: |
       github.event_name != 'pull_request_target' &&
       !contains(fromJSON('["dependabot[bot]", "llm-d-router-release-notes[bot]"]'), github.event.pull_request.user.login)
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     permissions:
       contents: read
     env:

@@ -13,6 +13,7 @@ runs:
     # Custom profile with directory-only removals.
     # cleanup-profile: max frees more space but takes longer.
     - name: Free disk space
+      if: runner.environment == 'github-hosted'
       # justinthelaw/maximize-github-runner-space@v0.9.0
       uses: justinthelaw/maximize-github-runner-space@ed391644e646cac4b88480d2f9b12d135f1ccf77
       with:
