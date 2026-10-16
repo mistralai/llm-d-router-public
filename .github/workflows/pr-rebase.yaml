@@ -23,7 +23,7 @@ jobs:
     steps:
       - name: Check commenter has write access
         id: check-access
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
             const perm = await github.rest.repos.getCollaboratorPermissionLevel({
@@ -91,7 +91,7 @@ jobs:
         if: >-
           steps.check-access.outputs.skip != 'true' &&
           steps.check-date.outputs.skip != 'true'
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ steps.pr.outputs.base-ref }}
           fetch-depth: 0
