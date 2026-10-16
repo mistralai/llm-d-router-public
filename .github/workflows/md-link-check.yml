@@ -27,8 +27,8 @@ jobs:
       src: ${{ steps.filter.outputs.src }}
     steps:
       - name: Checkout source
-        uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
           filters: |
@@ -48,7 +48,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # A missing cache is fine. Lychee then checks every link.
       - id: cache-key
@@ -56,7 +56,7 @@ jobs:
 
       - name: Restore lychee cache
         id: lychee-cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .lycheecache
           key: lychee-${{ hashFiles('.lychee.toml') }}-${{ steps.cache-key.outputs.date }}
@@ -64,7 +64,7 @@ jobs:
             lychee-${{ hashFiles('.lychee.toml') }}-
 
       - name: Run lychee link checker
-        uses: lycheeverse/lychee-action@v2.9.0
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
           args: '--config .lychee.toml --cache --max-cache-age 1d --verbose --no-progress "**/*.md"'
           fail: true
@@ -73,7 +73,7 @@ jobs:
       # This also runs when the check fails, so links that passed are still saved.
       - name: Save lychee cache
         if: ${{ !cancelled() && steps.lychee-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .lycheecache
           key: lychee-${{ hashFiles('.lychee.toml') }}-${{ steps.cache-key.outputs.date }}

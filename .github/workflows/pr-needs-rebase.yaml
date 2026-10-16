@@ -57,7 +57,7 @@ jobs:
     runs-on: [ciclone, 1x1gi-x86]
     steps:
       - name: Checkout workflow script
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.base.ref || github.ref_name }}
           sparse-checkout: .github/scripts/pr-needs-rebase.cjs
@@ -65,7 +65,7 @@ jobs:
           persist-credentials: false
 
       - name: Remove re-approve label
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
             const { clearReApprove } = require('./.github/scripts/pr-needs-rebase.cjs');
@@ -87,7 +87,7 @@ jobs:
     runs-on: [ciclone, 1x1gi-x86]
     steps:
       - name: Checkout workflow script
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.base.ref || github.ref_name }}
           sparse-checkout: .github/scripts/pr-needs-rebase.cjs
@@ -95,7 +95,7 @@ jobs:
           persist-credentials: false
 
       - name: Check mergeability and prior approval state
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
             const { checkSinglePr } = require('./.github/scripts/pr-needs-rebase.cjs');
@@ -110,14 +110,14 @@ jobs:
     runs-on: [ciclone, 1x1gi-x86]
     steps:
       - name: Checkout workflow script
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           sparse-checkout: .github/scripts/pr-needs-rebase.cjs
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
       - name: Scan open PRs targeting base branch
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
             const { checkOpenPrs } = require('./.github/scripts/pr-needs-rebase.cjs');
