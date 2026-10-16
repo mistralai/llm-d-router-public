@@ -43,7 +43,7 @@ concurrency:
 
 jobs:
   rebuild:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     steps:
       - name: Checkout mistral-branches
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
