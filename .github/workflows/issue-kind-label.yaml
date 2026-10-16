@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   kind-labels:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     permissions:
       issues: write
     env:

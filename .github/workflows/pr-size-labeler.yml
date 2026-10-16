@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   size-label:
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     steps:
       - name: size-label
         uses: pascalgn/size-label-action@v0.5.7

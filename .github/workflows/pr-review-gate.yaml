@@ -17,7 +17,7 @@ jobs:
   review-approved:
     name: Approved PR review submitted
     if: github.event.review.state == 'approved'
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     steps:
       - name: Record approval event
         env:

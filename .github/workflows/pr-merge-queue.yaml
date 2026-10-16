@@ -68,7 +68,7 @@ jobs:
         github.event.issue.pull_request &&
         (contains(github.event.comment.body, '/lgtm') || contains(github.event.comment.body, '/approve'))
       )
-    runs-on: ubuntu-latest
+    runs-on: [ciclone, 1x1gi-x86]
     steps:
       - name: Checkout workflow scripts
         uses: actions/checkout@v7
