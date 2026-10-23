@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -76,6 +77,9 @@ type detector struct {
 	inFlightLoadDataKey          fwkplugin.DataKey
 	uncachedRequestTokensDataKey fwkplugin.DataKey
 	dispatchReservations         sync.Map
+	reservationMu                sync.Mutex
+	pendingPrefill               atomic.Int64
+	pendingDecode                atomic.Int64
 	pendingDispatches            atomic.Int64
 }
 
@@ -140,26 +144,56 @@ func (d *detector) getLoad(m datalayer.AttributeMap) *attrconcurrency.InFlightLo
 // ReserveDispatch accounts for a request in the interval after flow-control dispatch and before
 // the in-flight load producer publishes it through PreRequest.
 func (d *detector) ReserveDispatch(requestID string) bool {
+	return d.ReserveDispatchStages(requestID, nil)
+}
+
+func (d *detector) ReserveDispatchStages(requestID string, stages []string) bool {
 	if requestID == "" {
 		return false
 	}
-	if _, loaded := d.dispatchReservations.LoadOrStore(requestID, struct{}{}); loaded {
+	d.reservationMu.Lock()
+	defer d.reservationMu.Unlock()
+	if _, loaded := d.dispatchReservations.LoadOrStore(requestID, slices.Clone(stages)); loaded {
 		return false
 	}
 	d.pendingDispatches.Add(1)
+	d.adjustStageReservations(stages, 1)
 	return true
 }
 
-// ReleaseDispatch removes a dispatch reservation. Duplicate and unknown releases are no-ops.
 func (d *detector) ReleaseDispatch(requestID string) bool {
 	if requestID == "" {
 		return false
 	}
-	if _, loaded := d.dispatchReservations.LoadAndDelete(requestID); !loaded {
+	d.reservationMu.Lock()
+	defer d.reservationMu.Unlock()
+	stages, loaded := d.dispatchReservations.LoadAndDelete(requestID)
+	if !loaded {
 		return false
 	}
 	d.pendingDispatches.Add(-1)
+	d.adjustStageReservations(stages.([]string), -1)
 	return true
+}
+
+func (d *detector) adjustStageReservations(stages []string, delta int64) {
+	if len(stages) == 0 || slices.Contains(stages, flowcontrol.SaturationStagePrefill) {
+		d.pendingPrefill.Add(delta)
+	}
+	if len(stages) == 0 || slices.Contains(stages, flowcontrol.SaturationStageDecode) {
+		d.pendingDecode.Add(delta)
+	}
+}
+
+func (d *detector) pendingForStage(ctx context.Context) int64 {
+	switch flowcontrol.SaturationStageFromContext(ctx) {
+	case flowcontrol.SaturationStagePrefill:
+		return d.pendingPrefill.Load()
+	case flowcontrol.SaturationStageDecode:
+		return d.pendingDecode.Load()
+	default:
+		return d.pendingDispatches.Load()
+	}
 }
 
 // getIncomingTokens returns the uncached tokens the current request would add to the endpoint.
@@ -188,12 +222,12 @@ func (d *detector) getIncomingTokens(m datalayer.AttributeMap) int64 {
 // completion, so the signal already reflects completions with no scrape lag.
 //
 // With the "least-loaded" pool aggregation it returns the saturation of the least-loaded endpoint instead.
-func (d *detector) Saturation(_ context.Context, endpoints []datalayer.Endpoint) float64 {
+func (d *detector) Saturation(ctx context.Context, endpoints []datalayer.Endpoint) float64 {
 	if len(endpoints) == 0 {
 		return 1.0
 	}
 	if d.config.poolAggregation == aggregationLeastLoaded {
-		return d.leastLoadedSaturation(endpoints)
+		return d.leastLoadedSaturation(endpoints, d.pendingForStage(ctx))
 	}
 
 	var reqInflight, reqCapacity, tokInflight, tokCapacity int64
@@ -220,7 +254,7 @@ func (d *detector) Saturation(_ context.Context, endpoints []datalayer.Endpoint)
 			ratio(load.Tokens, d.config.maxTokenConcurrency),
 		)
 	}
-	pendingDispatches := d.pendingDispatches.Load()
+	pendingDispatches := d.pendingForStage(ctx)
 
 	switch d.config.mode {
 	case modeTokens:
@@ -241,21 +275,30 @@ func (d *detector) Saturation(_ context.Context, endpoints []datalayer.Endpoint)
 // leastLoadedSaturation returns the saturation of the least-loaded endpoint after each pending dispatch
 // reservation has been assigned, one request at a time, to the endpoint that is least loaded at that point.
 // Reservations count as requests, so they are not assigned in "tokens" mode.
-func (d *detector) leastLoadedSaturation(endpoints []datalayer.Endpoint) float64 {
+func (d *detector) leastLoadedSaturation(endpoints []datalayer.Endpoint, pending int64) float64 {
+	if pending == 0 || d.config.mode == modeTokens {
+		lowest, found := 0.0, false
+		for _, endpoint := range endpoints {
+			if endpoint == nil {
+				continue
+			}
+			load := d.loadForSaturation(endpoint)
+			if !found || load.saturation < lowest {
+				lowest = load.saturation
+				found = true
+			}
+		}
+		if !found {
+			return 1.0
+		}
+		return lowest
+	}
 	loads := make(endpointLoadHeap, 0, len(endpoints))
 	for _, e := range endpoints {
 		if e == nil {
 			continue
 		}
-		load := &attrconcurrency.InFlightLoad{}
-		if e.GetMetadata() != nil {
-			load = d.getLoad(e.GetAttributes())
-		}
-		loads = append(loads, endpointLoad{
-			requests:   load.Requests,
-			tokens:     load.Tokens,
-			saturation: d.endpointSaturation(load.Requests, load.Tokens),
-		})
+		loads = append(loads, d.loadForSaturation(e))
 	}
 	if len(loads) == 0 {
 		return 1.0
@@ -263,13 +306,21 @@ func (d *detector) leastLoadedSaturation(endpoints []datalayer.Endpoint) float64
 
 	heap.Init(&loads)
 	if d.config.mode != modeTokens {
-		for range d.pendingDispatches.Load() {
+		for range pending {
 			loads[0].requests++
 			loads[0].saturation = d.endpointSaturation(loads[0].requests, loads[0].tokens)
 			heap.Fix(&loads, 0)
 		}
 	}
 	return loads[0].saturation
+}
+
+func (d *detector) loadForSaturation(endpoint datalayer.Endpoint) endpointLoad {
+	load := &attrconcurrency.InFlightLoad{}
+	if endpoint.GetMetadata() != nil {
+		load = d.getLoad(endpoint.GetAttributes())
+	}
+	return endpointLoad{requests: load.Requests, tokens: load.Tokens, saturation: d.endpointSaturation(load.Requests, load.Tokens)}
 }
 
 // endpointSaturation returns the saturation of a single endpoint for the active mode.

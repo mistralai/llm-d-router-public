@@ -23,6 +23,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/go-logr/logr"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
@@ -269,4 +271,21 @@ func computeLimits(p *policy, saturation float64, priorities []int) []float64 {
 	}
 	p.ComputeLimit(context.Background(), saturation, priorities, ceilings)
 	return ceilings
+}
+
+func TestStageLimitsUseOneTick(t *testing.T) {
+	p := newPolicy("stage-test", logr.Discard())
+	priorities := []int{10, 0}
+	signals := map[string]float64{flowcontrol.SaturationStageOverall: 1.2, "prefill": 1.2, "decode": 0.8}
+	out := map[string][]float64{flowcontrol.SaturationStageOverall: make([]float64, 2), "prefill": make([]float64, 2), "decode": make([]float64, 2)}
+	for cycle := int64(1); cycle <= 8; cycle++ {
+		p.ComputeStageLimits(context.Background(), signals, priorities, out)
+		require.Equal(t, cycle, p.tick.Load())
+		require.Equal(t, 0.0, out["prefill"][1])
+		if cycle%4 == 0 {
+			require.Equal(t, 1.0, out["decode"][1])
+		} else {
+			require.Equal(t, 0.0, out["decode"][1])
+		}
+	}
 }

@@ -344,6 +344,13 @@ type fallbackRequest struct {
 
 func (r fallbackRequest) FlowKey() flowcontrol.FlowKey { return r.key }
 
+func (r fallbackRequest) DispatchPreparation() flowcontrol.PrepareDispatchFunc {
+	if preparer, ok := r.FlowControlRequest.(flowcontrol.DispatchPreparer); ok {
+		return preparer.DispatchPreparation()
+	}
+	return nil
+}
+
 // withConnectionWithFallback acquires a flow connection, falling back to priority 0 when the requested band is not yet
 // provisioned. On fallback, the callback receives a request whose FlowKey reports priority 0, ensuring the item is
 // leased, distributed, and enqueued consistently under priority 0; otherwise it receives the original request.

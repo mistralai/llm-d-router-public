@@ -209,3 +209,16 @@ func wrapCause(cause error, isQueued bool) error {
 	// We treat this as a rejection, as it never formally consumed queue capacity.
 	return fmt.Errorf("%w: %w", types.ErrRejected, specificErr)
 }
+
+// dispatch publishes the placement only if dispatch wins against cancellation and expiry.
+func (fi *FlowItem) dispatch(commit func()) bool {
+	dispatched := false
+	fi.onceFinalize.Do(func() {
+		if commit != nil {
+			commit()
+		}
+		dispatched = true
+		fi.finalizeInternal(nil)
+	})
+	return dispatched
+}

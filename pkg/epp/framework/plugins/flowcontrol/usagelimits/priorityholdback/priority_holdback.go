@@ -142,3 +142,12 @@ func computeLimitLinearProportional(cMin, cMax float64, priorities []int, ceilin
 		ceilings[i] = cMin + r*spread
 	}
 }
+
+func (p *priorityHoldbackPolicy) ComputeStageLimits(ctx context.Context, saturation map[string]float64, priorities []int, ceilings map[string][]float64) {
+	p.ComputeLimit(ctx, saturation[flowcontrol.SaturationStageOverall], priorities, ceilings[flowcontrol.SaturationStageOverall])
+	for stage, out := range ceilings {
+		if stage != flowcontrol.SaturationStageOverall {
+			copy(out, ceilings[flowcontrol.SaturationStageOverall])
+		}
+	}
+}

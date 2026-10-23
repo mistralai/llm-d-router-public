@@ -645,3 +645,32 @@ func (h *Handler) PreRequest(ctx context.Context, request *scheduling.InferenceR
 	)
 	return nil
 }
+
+func (h *Handler) SupportsDispatchPreparation() bool {
+	_, prefixBased := h.pdDecider.(*PrefixBasedPDDecider)
+	return h.stageOrder == StageOrderDecodeFirst && prefixBased && h.encodeDecider == nil
+}
+
+func (h *Handler) DispatchUsesPrefill(request *scheduling.InferenceRequest, result *scheduling.SchedulingResult) bool {
+	if result.ProfileResults[h.prefillProfile].FirstEndpoint() != nil {
+		return true
+	}
+	// An unreadable prefix estimate cannot establish eligibility to bypass prefill capacity.
+	if _, ok := h.pdDecider.(*PrefixBasedPDDecider); ok {
+		decision, found := scheduling.ReadRequestAttribute[remotePrefillDecision](request, remotePrefillDecisionAttributeKey)
+		return !found || decision.err != nil || decision.needs
+	}
+	return false
+}
+
+func (h *Handler) DecodeProfileName() string { return h.decodeProfile }
+
+func (h *Handler) CanDecodeLocally(ctx context.Context, request *scheduling.InferenceRequest, endpoint scheduling.Endpoint) bool {
+	decider, ok := h.pdDecider.(*PrefixBasedPDDecider)
+	if !ok {
+		return false
+	}
+	// A probe can inspect several endpoints. Its result must not enter the request-wide decision memo.
+	needs, err := decider.computeNeedsRemotePrefill(ctx, request, endpoint)
+	return err == nil && !needs
+}
