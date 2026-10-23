@@ -265,8 +265,8 @@ func TestHealthySelectionDoesNotConsumeLookaheadBudget(t *testing.T) {
 	band, err := h.priorityBandAccessor(testFlow.Priority)
 	require.NoError(t, err)
 	remaining := maxLookaheadCandidates
-	signals := map[string]float64{"": 0.2, flowcontrol.SaturationStageDecode: 0.2, flowcontrol.SaturationStagePrefill: 0.2}
-	limits := map[string][]float64{"": {1}, flowcontrol.SaturationStageDecode: {1}, flowcontrol.SaturationStagePrefill: {1}}
+	signals := map[string]float64{flowcontrol.SaturationStageOverall: 0.2, flowcontrol.SaturationStageDecode: 0.2, flowcontrol.SaturationStagePrefill: 0.2}
+	limits := map[string][]float64{flowcontrol.SaturationStageOverall: {1}, flowcontrol.SaturationStageDecode: {1}, flowcontrol.SaturationStagePrefill: {1}}
 	got, plan, err := h.processor.selectPreparedItem(t.Context(), band, 0, &remaining, signals, limits)
 	require.NoError(t, err)
 	require.Same(t, item, got)

@@ -68,7 +68,7 @@ func (b *eligibleBand) IterateQueues(visit func(flowcontrol.FlowQueueAccessor) b
 func (p *Processor) selectPreparedItem(ctx context.Context, band flowcontrol.PriorityBandAccessor,
 	priorityIndex int, remaining *int, saturation map[string]float64, ceilings map[string][]float64,
 ) (flowcontrol.QueueItemAccessor, *flowcontrol.DispatchPlan, error) {
-	if saturation[""] < ceilings[""][priorityIndex] {
+	if saturation[flowcontrol.SaturationStageOverall] < ceilings[flowcontrol.SaturationStageOverall][priorityIndex] {
 		item, err := p.selectItem(ctx, band)
 		if err != nil || item == nil {
 			return nil, nil, err

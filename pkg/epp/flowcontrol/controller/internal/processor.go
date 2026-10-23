@@ -503,8 +503,8 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 
 	priorities := p.registry.AllOrderedPriorityLevels()
 	ceilings := p.ceilingsBuffer(len(priorities))
-	stageSaturation[""] = saturation
-	stageCeilings := map[string][]float64{"": ceilings}
+	stageSaturation[flowcontrol.SaturationStageOverall] = saturation
+	stageCeilings := map[string][]float64{flowcontrol.SaturationStageOverall: ceilings}
 	for _, stage := range []string{flowcontrol.SaturationStagePrefill, flowcontrol.SaturationStageDecode} {
 		stageCeilings[stage] = make([]float64, len(priorities))
 		for i := range priorities {
@@ -516,7 +516,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	} else {
 		p.usageLimitPolicy.ComputeLimit(ctx, saturation, priorities, ceilings)
 		for stage, out := range stageCeilings {
-			if stage != "" {
+			if stage != flowcontrol.SaturationStageOverall {
 				copy(out, ceilings)
 			}
 		}
@@ -758,13 +758,13 @@ func (p *Processor) prepareItem(ctx context.Context, item flowcontrol.QueueItemA
 	}
 	preparer, ok := item.OriginalRequest().(flowcontrol.DispatchPreparer)
 	if !ok || preparer.DispatchPreparation() == nil {
-		return nil, saturation[""] < ceilings[""][band]
+		return nil, saturation[flowcontrol.SaturationStageOverall] < ceilings[flowcontrol.SaturationStageOverall][band]
 	}
 	if saturation[flowcontrol.SaturationStageDecode] >= ceilings[flowcontrol.SaturationStageDecode][band] {
 		return nil, false
 	}
 	if saturation[flowcontrol.SaturationStagePrefill] < ceilings[flowcontrol.SaturationStagePrefill][band] {
-		return nil, saturation[""] < ceilings[""][band]
+		return nil, saturation[flowcontrol.SaturationStageOverall] < ceilings[flowcontrol.SaturationStageOverall][band]
 	}
 	plan, err := preparer.DispatchPreparation()(ctx)
 	if err != nil {

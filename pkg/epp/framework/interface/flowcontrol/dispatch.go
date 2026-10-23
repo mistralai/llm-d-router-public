@@ -40,8 +40,10 @@ type DispatchPlan struct {
 	Commit            func()
 }
 
+// SaturationStageOverall identifies the combined signal in stage policy maps.
+const SaturationStageOverall = "overall"
+
 // StageUsageLimitPolicy evaluates all stage signals with one policy tick per dispatch cycle.
-// The empty stage name carries the pool-wide signal for requests without a dispatch preparer.
 // Output buffers have the same length as priorities and contain 1.0 before the call.
 type StageUsageLimitPolicy interface {
 	ComputeStageLimits(ctx context.Context, saturation map[string]float64, priorities []int, ceilings map[string][]float64)

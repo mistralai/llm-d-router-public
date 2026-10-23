@@ -99,10 +99,10 @@ func (u usageLimitPolicyFunc) ComputeLimit(ctx context.Context, saturation float
 type constantPolicy struct{ flowcontrol.UsageLimitPolicy }
 
 func (p *constantPolicy) ComputeStageLimits(ctx context.Context, saturation map[string]float64, priorities []int, ceilings map[string][]float64) {
-	p.ComputeLimit(ctx, saturation[""], priorities, ceilings[""])
+	p.ComputeLimit(ctx, saturation[flowcontrol.SaturationStageOverall], priorities, ceilings[flowcontrol.SaturationStageOverall])
 	for stage, out := range ceilings {
-		if stage != "" {
-			copy(out, ceilings[""])
+		if stage != flowcontrol.SaturationStageOverall {
+			copy(out, ceilings[flowcontrol.SaturationStageOverall])
 		}
 	}
 }
