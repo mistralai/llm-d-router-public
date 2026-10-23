@@ -32,6 +32,8 @@ type DispatchPreparer interface {
 // Commit publishes the placement before the waiting request resumes. It must not block or fail.
 type DispatchPlan struct {
 	Stages []string
+	// Complete runs scheduling only after selection. False keeps the request queued.
+	Complete func() (bool, error)
 	// Shared pods consume capacity in both pools even when the placement omits remote prefill.
 	// An empty reservation set uses Stages.
 	ReservationStages []string

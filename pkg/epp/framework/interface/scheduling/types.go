@@ -212,4 +212,11 @@ type SchedulerProfile interface {
 type DispatchProfileHandler interface {
 	SupportsDispatchPreparation() bool
 	DispatchUsesPrefill(request *InferenceRequest, result *SchedulingResult) bool
+	DecodeProfileName() string
+	CanDecodeLocally(context.Context, *InferenceRequest, Endpoint) bool
+}
+
+// DispatchFilter applies profile constraints without running scorers or a picker.
+type DispatchFilter interface {
+	FilterCandidates(context.Context, *InferenceRequest, []Endpoint) []Endpoint
 }

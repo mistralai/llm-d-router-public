@@ -172,8 +172,9 @@ func runSchedulerProfile(ctx context.Context, name string, profile fwksched.Sche
 }
 
 func (s *Scheduler) SupportsDispatchPreparation() bool {
-	if handler, ok := s.profileHandler.(fwksched.DispatchProfileHandler); ok {
-		return handler.SupportsDispatchPreparation()
+	if handler, ok := s.profileHandler.(fwksched.DispatchProfileHandler); ok && handler.SupportsDispatchPreparation() {
+		_, filterable := s.profiles[handler.DecodeProfileName()].(fwksched.DispatchFilter)
+		return filterable
 	}
 	return false
 }
@@ -183,4 +184,27 @@ func (s *Scheduler) DispatchUsesPrefill(request *fwksched.InferenceRequest, resu
 		return handler.DispatchUsesPrefill(request, result)
 	}
 	return true
+}
+
+// ProbeDecodeLocal finds a compatible local decoder without scoring or selecting other stages.
+func (s *Scheduler) ProbeDecodeLocal(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) (fwksched.Endpoint, error) {
+	handler, ok := s.profileHandler.(fwksched.DispatchProfileHandler)
+	if !ok || !handler.SupportsDispatchPreparation() {
+		return nil, nil //nolint:nilnil
+	}
+	profile, ok := s.profiles[handler.DecodeProfileName()].(fwksched.DispatchFilter)
+	if !ok {
+		return nil, nil //nolint:nilnil
+	}
+	endpoints = profile.FilterCandidates(ctx, request, endpoints)
+	scopedRequest, _ := datalayer.ScopeRequest(log.FromContext(ctx), profilePickerExtensionPoint, s.profileHandler, request)
+	for _, endpoint := range endpoints {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if handler.CanDecodeLocally(ctx, scopedRequest, endpoint) {
+			return endpoint, nil
+		}
+	}
+	return nil, nil //nolint:nilnil
 }
