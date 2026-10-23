@@ -53,6 +53,7 @@ type dispatchScheduler interface {
 	SupportsDispatchPreparation() bool
 	DispatchUsesPrefill(*fwksched.InferenceRequest, *fwksched.SchedulingResult) bool
 	ProbeDecodeLocal(context.Context, *fwksched.InferenceRequest, []fwksched.Endpoint) (fwksched.Endpoint, error)
+	FilterDecodeCandidates(context.Context, *fwksched.InferenceRequest, []fwksched.Endpoint) []fwksched.Endpoint
 }
 
 type preparedScheduling struct {
@@ -119,6 +120,13 @@ func (d *Director) newDispatchPreparation(ctx context.Context, reqCtx *handlers.
 				return &flowcontrol.DispatchPlan{
 					Stages: result.stages, ReservationStages: result.reservationStages,
 					Complete: func() (bool, error) {
+						// Fairness policies can write request attributes after the probe snapshot.
+						for _, key := range base.AttributeKeys() {
+							if _, present := result.prepared.request.GetAttribute(key); !present {
+								value, _ := base.GetAttribute(key)
+								result.prepared.request.PutAttribute(key, value)
+							}
+						}
 						ready, err := d.completeDispatch(ctx, scheduler, metadata, result.prepared)
 						if !ready {
 							retryAfter = now().Add(dispatchProbeMissDelay)
@@ -338,6 +346,17 @@ func (d *Director) completeDispatch(ctx context.Context, scheduler dispatchSched
 		if value, ok := prepared.endpoints[0].Get(key); ok {
 			selected.Put(key, value)
 		}
+	}
+	// Pool-wide filtering preserves fallback rules before scheduling is restricted to the retained decoder.
+	eligible := false
+	for _, candidate := range scheduler.FilterDecodeCandidates(ctx, prepared.request, candidates) {
+		if sameDestination(candidate, selected) {
+			eligible = true
+			break
+		}
+	}
+	if !eligible {
+		return false, nil
 	}
 	prepared.endpoints = []fwksched.Endpoint{selected}
 	result, err := scheduler.Schedule(ctx, prepared.request, prepared.endpoints)
