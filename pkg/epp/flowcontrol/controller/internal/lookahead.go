@@ -68,14 +68,11 @@ func (b *eligibleBand) IterateQueues(visit func(flowcontrol.FlowQueueAccessor) b
 func (p *Processor) selectPreparedItem(ctx context.Context, band flowcontrol.PriorityBandAccessor,
 	priorityIndex int, remaining *int, saturation map[string]float64, ceilings map[string][]float64,
 ) (flowcontrol.QueueItemAccessor, *flowcontrol.DispatchPlan, error) {
-	if saturation[flowcontrol.SaturationStageOverall] < ceilings[flowcontrol.SaturationStageOverall][priorityIndex] {
+	bothStagesOpen := saturation[flowcontrol.SaturationStagePrefill] < ceilings[flowcontrol.SaturationStagePrefill][priorityIndex] &&
+		saturation[flowcontrol.SaturationStageDecode] < ceilings[flowcontrol.SaturationStageDecode][priorityIndex]
+	if saturation[flowcontrol.SaturationStageOverall] < ceilings[flowcontrol.SaturationStageOverall][priorityIndex] && (bothStagesOpen || !bandHasDispatchPreparation(band)) {
 		item, err := p.selectItem(ctx, band)
-		if err != nil || item == nil {
-			return nil, nil, err
-		}
-		if !hasDispatchPreparation(item) || (saturation[flowcontrol.SaturationStagePrefill] < ceilings[flowcontrol.SaturationStagePrefill][priorityIndex] && saturation[flowcontrol.SaturationStageDecode] < ceilings[flowcontrol.SaturationStageDecode][priorityIndex]) {
-			return item, nil, nil
-		}
+		return item, nil, err
 	}
 	view := &eligibleBand{PriorityBandAccessor: band, byID: make(map[string]*dispatchCandidate)}
 	band.IterateQueues(func(queue flowcontrol.FlowQueueAccessor) bool {
@@ -137,4 +134,18 @@ func (p *Processor) selectPreparedItem(ctx context.Context, band flowcontrol.Pri
 func hasDispatchPreparation(item flowcontrol.QueueItemAccessor) bool {
 	preparer, ok := item.OriginalRequest().(flowcontrol.DispatchPreparer)
 	return ok && preparer.DispatchPreparation() != nil
+}
+
+// Capability inspection must not advance a stateful fairness policy.
+func bandHasDispatchPreparation(band flowcontrol.PriorityBandAccessor) bool {
+	found := false
+	band.IterateQueues(func(queue flowcontrol.FlowQueueAccessor) bool {
+		if queue != nil {
+			if item := queue.Peek(); item != nil && hasDispatchPreparation(item) {
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
 }

@@ -273,3 +273,55 @@ func TestHealthySelectionDoesNotConsumeLookaheadBudget(t *testing.T) {
 	require.Nil(t, plan)
 	require.Equal(t, maxLookaheadCandidates, remaining)
 }
+
+func TestLookaheadRoundRobinMissingPrefillUsesOneTurn(t *testing.T) {
+	h := newTestHarness(t, testCleanupTick)
+	plugin, err := roundrobin.RoundRobinFairnessPolicyFactory("review-rr", nil, nil)
+	require.NoError(t, err)
+	policy := plugin.(flowcontrol.FairnessPolicy)
+	state := policy.NewState(t.Context())
+	h.FairnessPolicyFunc = func(int) (flowcontrol.FairnessPolicy, error) { return policy, nil }
+	h.PriorityBandAccessorFunc = func(priority int) (flowcontrol.PriorityBandAccessor, error) {
+		band, err := h.priorityBandAccessor(priority)
+		if err != nil {
+			return nil, err
+		}
+		mock := band.(*fwkfcmocks.MockPriorityBandAccessor)
+		mock.PolicyStateV = state
+		mock.FlowKeysFunc = func() []flowcontrol.FlowKey {
+			var keys []flowcontrol.FlowKey
+			band.IterateQueues(func(q flowcontrol.FlowQueueAccessor) bool { keys = append(keys, q.FlowKey()); return true })
+			return keys
+		}
+		mock.QueueFunc = func(id string) flowcontrol.FlowQueueAccessor {
+			var found flowcontrol.FlowQueueAccessor
+			band.IterateQueues(func(q flowcontrol.FlowQueueAccessor) bool {
+				if q.FlowKey().ID == id {
+					found = q
+					return false
+				}
+				return true
+			})
+			return found
+		}
+		return band, nil
+	}
+	var dispatched []string
+	for _, id := range []string{"a", "b"} {
+		key := flowcontrol.FlowKey{ID: id, Priority: testFlow.Priority}
+		q := h.addQueue(key)
+		q.OrderingPolicyFunc = func() flowcontrol.OrderingPolicy { return lookaheadOrdering{} }
+		for i := range 3 {
+			requestID := id + strconv.Itoa(i)
+			request := &preparedRequest{FlowControlRequest: fwkfcmocks.NewMockFlowControlRequest(100, requestID, key)}
+			request.prepare = func(context.Context) (*flowcontrol.DispatchPlan, error) {
+				return &flowcontrol.DispatchPlan{Stages: []string{flowcontrol.SaturationStageDecode}, Commit: func() { dispatched = append(dispatched, requestID) }}, nil
+			}
+			require.NoError(t, q.Add(NewItem(request, testTTL, h.clock.Now(), logr.Discard())))
+			h.clock.Step(time.Millisecond)
+		}
+	}
+	require.True(t, h.processor.dispatchCycle(t.Context()))
+	require.True(t, h.processor.dispatchCycle(t.Context()))
+	require.Equal(t, []string{"a0", "b0"}, dispatched)
+}
