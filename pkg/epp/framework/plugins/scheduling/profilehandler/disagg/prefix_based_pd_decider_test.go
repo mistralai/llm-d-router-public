@@ -908,3 +908,14 @@ func TestPreRequest_ClaimsConditionalDecodeAttribute(t *testing.T) {
 		})
 	}
 }
+
+func TestDispatchUsesPrefillRequiresReadableCache(t *testing.T) {
+	decider, err := NewPrefixBasedPDDecider(PrefixBasedPDDeciderConfig{NonCachedTokens: 4})
+	require.NoError(t, err)
+	handler := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "", decider, nil)
+	request := withTokens(makeRequestWithTokens(10), 10)
+	endpoint := makeTestEndpointBase()
+	require.False(t, decider.disaggregate(t.Context(), request, endpoint))
+	result := &scheduling.SchedulingResult{ProfileResults: map[string]*scheduling.ProfileRunResult{defaultDecodeProfile: {TargetEndpoints: []scheduling.Endpoint{endpoint}}}}
+	require.True(t, handler.DispatchUsesPrefill(request, result))
+}

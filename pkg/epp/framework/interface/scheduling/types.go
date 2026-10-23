@@ -206,3 +206,10 @@ func (r *ProfileRunResult) FirstEndpoint() Endpoint {
 type SchedulerProfile interface {
 	Run(ctx context.Context, request *InferenceRequest, candidateEndpoints []Endpoint) (*ProfileRunResult, error)
 }
+
+// DispatchProfileHandler identifies decode-first profiles that support request-aware admission.
+// Unsupported handlers keep pool-wide admission.
+type DispatchProfileHandler interface {
+	SupportsDispatchPreparation() bool
+	DispatchUsesPrefill(request *InferenceRequest, result *SchedulingResult) bool
+}

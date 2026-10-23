@@ -153,11 +153,13 @@ func (q *responseBodyQueue) closeAndWait() {
 // - Preparing the request context for the Envoy ext_proc filter to route the request.
 // - Running PostResponse plugins.
 type Director struct {
-	datastore             Datastore
-	scheduler             Scheduler
-	admissionController   AdmissionController
-	endpointCandidates    contracts.EndpointCandidates
-	requestControlPlugins Config
+	dispatchPreparationOnce  sync.Once
+	dispatchPreparationSlots chan struct{}
+	datastore                Datastore
+	scheduler                Scheduler
+	admissionController      AdmissionController
+	endpointCandidates       contracts.EndpointCandidates
+	requestControlPlugins    Config
 	// We just need a pointer to an int32 variable since Priority is a pointer in InferenceObjective.
 	// No need to set this in the constructor, since the value we want is the default (0)
 	// and value types cannot be nil.
@@ -269,8 +271,23 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	ctx = log.IntoContext(ctx, logger)
 	logger.V(logutil.DEBUG).Info("LLM request assembled")
 
-	// Admit may block until flow control admits the request.
-	if err := d.admissionController.Admit(ctx, reqCtx, priority); err != nil {
+	var prepared *preparedScheduling
+	if admission, ok := d.admissionController.(preparedAdmissionController); ok && d.supportsDispatchPreparation() {
+		preparationCtx, cancelPreparation := context.WithCancel(ctx)
+		defer cancelPreparation()
+		err = admission.AdmitPrepared(ctx, reqCtx, priority, d.newDispatchPreparation(preparationCtx, reqCtx, func(result *preparedScheduling) {
+			prepared = result
+			if inferenceRequestBody != nil && result.request.Body != nil {
+				*inferenceRequestBody = *result.request.Body
+				result.request.Body = inferenceRequestBody
+			}
+			reqCtx.SchedulingRequest = result.request
+			reqCtx.Request.Headers = result.request.Headers
+		}))
+	} else {
+		err = d.admissionController.Admit(ctx, reqCtx, priority)
+	}
+	if err != nil {
 		return reqCtx, err
 	}
 	reservationPending := false
@@ -284,29 +301,34 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 		}()
 	}
 
-	endpointCandidates := d.endpointCandidates.Locate(ctx, reqCtx.Request.Metadata)
-	if len(endpointCandidates) == 0 {
-		return reqCtx, errcommon.Error{
-			Code:    errcommon.ServiceUnavailable,
-			Msg:     "failed to find endpoint candidates for serving the request",
-			Headers: map[string]string{errcommon.RequestDroppedReasonHeaderKey: string(errcommon.RequestDroppedReasonNoEndpoints)},
+	var snapshotOfCandidatePods []fwksched.Endpoint
+	if prepared != nil {
+		snapshotOfCandidatePods = prepared.endpoints
+	} else {
+		endpointCandidates := d.endpointCandidates.Locate(ctx, reqCtx.Request.Metadata)
+		if len(endpointCandidates) == 0 {
+			return reqCtx, errcommon.Error{
+				Code:    errcommon.ServiceUnavailable,
+				Msg:     "failed to find endpoint candidates for serving the request",
+				Headers: map[string]string{errcommon.RequestDroppedReasonHeaderKey: string(errcommon.RequestDroppedReasonNoEndpoints)},
+			}
 		}
-	}
 
-	snapshotOfCandidatePods := d.toSchedulerEndpoints(endpointCandidates)
-	snapshotOfCandidatePods = d.runScreeners(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods)
-	if len(snapshotOfCandidatePods) == 0 {
-		return reqCtx, errcommon.Error{
-			Code:    errcommon.ServiceUnavailable,
-			Msg:     "screeners eliminated all endpoint candidates",
-			Headers: map[string]string{errcommon.RequestDroppedReasonHeaderKey: string(errcommon.RequestDroppedReasonNoEndpoints)},
+		snapshotOfCandidatePods = d.toSchedulerEndpoints(endpointCandidates)
+		snapshotOfCandidatePods = d.runScreeners(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods)
+		if len(snapshotOfCandidatePods) == 0 {
+			return reqCtx, errcommon.Error{
+				Code:    errcommon.ServiceUnavailable,
+				Msg:     "screeners eliminated all endpoint candidates",
+				Headers: map[string]string{errcommon.RequestDroppedReasonHeaderKey: string(errcommon.RequestDroppedReasonNoEndpoints)},
+			}
 		}
-	}
-	// Prepare per request data by running DataProducer plugins.
-	err = d.runDataProducerPlugins(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods)
-	if err != nil {
-		// Don't fail the request if DataProducer plugins fail.
-		logger.Error(err, "failed to prepare per request data")
+		// Prepare per request data by running DataProducer plugins.
+		err = d.runDataProducerPlugins(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods)
+		if err != nil {
+			// Don't fail the request if DataProducer plugins fail.
+			logger.Error(err, "failed to prepare per request data")
+		}
 	}
 
 	// Run admit request plugins
@@ -314,7 +336,12 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 		return reqCtx, errcommon.Error{Code: errcommon.Internal, Msg: fmt.Errorf("request cannot be admitted: %w", denyReason).Error()}
 	}
 
-	result, err := d.scheduler.Schedule(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods)
+	var result *fwksched.SchedulingResult
+	if prepared != nil {
+		result = prepared.result
+	} else {
+		result, err = d.scheduler.Schedule(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods)
+	}
 	if err != nil {
 		// Preserve typed errcommon.Error from the scheduler so its status code
 		// (e.g. PreconditionFailed) reaches Envoy intact, even if the error

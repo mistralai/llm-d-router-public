@@ -59,11 +59,11 @@ func DefaultPolicy() flowcontrol.UsageLimitPolicy {
 
 // NewConstPolicy implements a UsageLimitPolicy that applies a fixed threshold to all priorities.
 func NewConstPolicy(usageLimitName string, threshold float64) flowcontrol.UsageLimitPolicy {
-	return NewPolicyFunc(usageLimitName, func(_ context.Context, _ float64, _ []int, ceilings []float64) {
+	return &constantPolicy{UsageLimitPolicy: NewPolicyFunc(usageLimitName, func(_ context.Context, _ float64, _ []int, ceilings []float64) {
 		for i := range ceilings {
 			ceilings[i] = threshold
 		}
-	})
+	})}
 }
 
 // NewPolicyFunc implements a UsageLimitPolicy with a single func.
@@ -93,4 +93,16 @@ func (u usageLimitPolicyFunc) TypedName() plugin.TypedName {
 
 func (u usageLimitPolicyFunc) ComputeLimit(ctx context.Context, saturation float64, priorities []int, ceilings []float64) {
 	u.f(ctx, saturation, priorities, ceilings)
+}
+
+// constantPolicy shares one computation across stages because its limit does not depend on saturation.
+type constantPolicy struct{ flowcontrol.UsageLimitPolicy }
+
+func (p *constantPolicy) ComputeStageLimits(ctx context.Context, saturation map[string]float64, priorities []int, ceilings map[string][]float64) {
+	p.ComputeLimit(ctx, saturation[""], priorities, ceilings[""])
+	for stage, out := range ceilings {
+		if stage != "" {
+			copy(out, ceilings[""])
+		}
+	}
 }

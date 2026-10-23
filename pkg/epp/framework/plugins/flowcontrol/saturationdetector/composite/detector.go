@@ -226,3 +226,27 @@ func (d *detector) ReleaseDispatch(requestID string) bool {
 	}
 	return released
 }
+
+func (d *detector) ReserveDispatchStages(requestID string, stages []string) bool {
+	reserved := false
+	for i, child := range d.children {
+		relevant := stages
+		if len(d.childStages[i]) > 0 {
+			relevant = nil
+			for _, stage := range stages {
+				if slices.Contains(d.childStages[i], stage) {
+					relevant = append(relevant, stage)
+				}
+			}
+			if len(relevant) == 0 {
+				continue
+			}
+		}
+		if tracker, ok := child.(flowcontrol.StageDispatchReservationTracker); ok {
+			reserved = tracker.ReserveDispatchStages(requestID, relevant) || reserved
+		} else if tracker, ok := child.(flowcontrol.DispatchReservationTracker); ok {
+			reserved = tracker.ReserveDispatch(requestID) || reserved
+		}
+	}
+	return reserved
+}

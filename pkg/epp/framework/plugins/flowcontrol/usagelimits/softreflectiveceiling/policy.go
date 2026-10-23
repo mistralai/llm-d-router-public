@@ -107,6 +107,31 @@ func (p *policy) TypedName() fwkplugin.TypedName {
 // reached alternate between 1.0 and 0.0 with period round(saturation/(1-saturation)), producing a
 // proportional duty cycle.
 func (p *policy) ComputeLimit(_ context.Context, saturation float64, priorities []int, ceilings []float64) {
+	tick := p.tick.Load()
+	if len(priorities) > 1 && alternating(saturation) {
+		tick = p.tick.Add(1)
+	}
+	writeLimits(saturation, priorities, ceilings, tick)
+}
+
+func (p *policy) ComputeStageLimits(_ context.Context, saturation map[string]float64, priorities []int, ceilings map[string][]float64) {
+	tick := p.tick.Load()
+	if len(priorities) > 1 {
+		for _, value := range saturation {
+			if alternating(value) {
+				tick = p.tick.Add(1)
+				break
+			}
+		}
+	}
+	for stage, value := range saturation {
+		writeLimits(value, priorities, ceilings[stage], tick)
+	}
+}
+
+func alternating(saturation float64) bool { return saturation >= 1.0-saturation && saturation < 1.0 }
+
+func writeLimits(saturation float64, priorities []int, ceilings []float64, tick int64) {
 	n := len(priorities)
 	if n == 0 {
 		return
@@ -115,40 +140,22 @@ func (p *policy) ComputeLimit(_ context.Context, saturation float64, priorities 
 		ceilings[0] = 1.0
 		return
 	}
-
-	// Ceilings decrease monotonically with rank, so any band is at or past
-	// its reflective ceiling iff the lowest band is (whose ceiling is
-	// 1 - saturation). Advance the shared tick only when at least one band
-	// is in the alternating regime; below that saturation the policy is a
-	// pure function of its inputs.
-	inAlternatingRegime := saturation >= 1.0-saturation && saturation < 1.0
-
 	var open bool
-	if inAlternatingRegime {
-		// 1e-9 guards against round-off when saturation is very near 1.0.
+	if alternating(saturation) {
+		// The offset prevents division by zero near full saturation.
 		period := int64(math.Max(1, math.Round(saturation/(1.0-saturation+1e-9))))
-		open = p.tick.Add(1)%period == 0
+		open = tick%period == 0
 	}
-
 	for i := range priorities {
 		if i == 0 {
 			ceilings[i] = 1.0
 			continue
 		}
-
 		reflectiveCeiling := 1.0 - float64(i)*saturation/float64(n-1)
-
-		switch {
-		case saturation < reflectiveCeiling:
+		if saturation < reflectiveCeiling || (saturation < 1.0 && open) {
 			ceilings[i] = 1.0
-		case saturation >= 1.0:
+		} else {
 			ceilings[i] = 0.0
-		default:
-			if open {
-				ceilings[i] = 1.0
-			} else {
-				ceilings[i] = 0.0
-			}
 		}
 	}
 }

@@ -167,6 +167,11 @@ func (fcac *FlowControlAdmissionController) Admit(
 	reqCtx *handlers.RequestContext,
 	priority int,
 ) error {
+	return fcac.AdmitPrepared(ctx, reqCtx, priority, nil)
+}
+
+func (fcac *FlowControlAdmissionController) AdmitPrepared(ctx context.Context, reqCtx *handlers.RequestContext,
+	priority int, prepare flowcontrol.PrepareDispatchFunc) error {
 	logger := log.FromContext(ctx)
 	logger.V(logutil.TRACE).Info("Executing FlowControlAdmissionController",
 		"requestID", reqCtx.SchedulingRequest.RequestID, "priority", priority, "fairnessID", reqCtx.SchedulingRequest.FairnessID)
@@ -183,6 +188,7 @@ func (fcac *FlowControlAdmissionController) Admit(
 	}
 
 	fcReq := &flowControlRequest{
+		prepare:             prepare,
 		fairnessID:          reqCtx.SchedulingRequest.FairnessID,
 		priority:            priority,
 		requestByteSize:     clamp.Uint64(reqCtx.RequestSize),
@@ -223,6 +229,7 @@ func (fcac *FlowControlAdmissionController) ReleaseDispatchReservation(requestID
 
 // flowControlRequest is an adapter that implements the FlowControlRequest interface.
 type flowControlRequest struct {
+	prepare             flowcontrol.PrepareDispatchFunc
 	fairnessID          string
 	priority            int
 	requestByteSize     uint64
@@ -299,6 +306,12 @@ func translateFlowControlError(err error, poolEmpty func() bool) error {
 	case errors.Is(err, types.ErrContextCancelled):
 		return errcommon.Error{Code: errcommon.ServiceUnavailable, Msg: "client disconnected: " + msg, Headers: map[string]string{errcommon.RequestDroppedReasonHeaderKey: string(errcommon.RequestDroppedReasonContextCancelled)}}
 	default:
+		var typed errcommon.Error
+		if errors.As(err, &typed) {
+			return typed
+		}
 		return errcommon.Error{Code: errcommon.Internal, Msg: "internal flow control error: " + msg, Headers: map[string]string{errcommon.RequestDroppedReasonHeaderKey: string(errcommon.RequestDroppedReasonInternal)}}
 	}
 }
+
+func (r *flowControlRequest) DispatchPreparation() flowcontrol.PrepareDispatchFunc { return r.prepare }

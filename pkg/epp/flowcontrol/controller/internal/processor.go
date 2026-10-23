@@ -444,18 +444,8 @@ func (p *Processor) recordCapacityUtilization() {
 	}
 }
 
-// dispatchCycle attempts to dispatch a single item by offering priority bands a dispatch opportunity in the
-// order chosen by the BandSelectionPolicy. It applies the configured policies for each band to select an item
-// and then attempts to dispatch it. It returns true if an item was successfully dispatched, and false
-// otherwise. It enforces Head-of-Line (HoL) blocking for bands the UsageLimitPolicy gates.
-//
-// # Work Conservation and Head-of-Line (HoL) Blocking
-//
-// The cycle attempts to be work-conserving by skipping bands where selection fails.
-// A band gated by its usage ceiling is skipped for the same reason: dispatching it would exacerbate the
-// saturation holding back higher-priority work. Ceilings are monotonically non-increasing across descending
-// priority, so gated bands form a contiguous tail and a skip under strict order only ever reaches further
-// gated bands.
+// dispatchCycle applies band and flow policies, then admits a request against the stages its placement requires.
+// Requests without a dispatch preparer use the pool-wide saturation signal.
 func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	dispatchCycleStart := time.Now()
 	defer func() {
@@ -476,6 +466,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	prefill = append(prefill, interleaved...)
 	decode = append(decode, interleaved...)
 
+	stageSaturation := map[string]float64{flowcontrol.SaturationStagePrefill: 1, flowcontrol.SaturationStageDecode: 1}
 	saturation := -1.0
 	for _, part := range []struct {
 		name      string
@@ -491,6 +482,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 			continue
 		}
 		stageSat := p.saturationDetector.Saturation(flowcontrol.WithSaturationStage(ctx, part.name), part.endpoints)
+		stageSaturation[part.name] = stageSat
 		metrics.RecordFlowControlPoolSaturation(p.poolName, part.name, stageSat)
 		if stageSat > saturation {
 			saturation = stageSat
@@ -511,7 +503,24 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 
 	priorities := p.registry.AllOrderedPriorityLevels()
 	ceilings := p.ceilingsBuffer(len(priorities))
-	p.usageLimitPolicy.ComputeLimit(ctx, saturation, priorities, ceilings)
+	stageSaturation[""] = saturation
+	stageCeilings := map[string][]float64{"": ceilings}
+	for _, stage := range []string{flowcontrol.SaturationStagePrefill, flowcontrol.SaturationStageDecode} {
+		stageCeilings[stage] = make([]float64, len(priorities))
+		for i := range priorities {
+			stageCeilings[stage][i] = 1
+		}
+	}
+	if policy, ok := p.usageLimitPolicy.(flowcontrol.StageUsageLimitPolicy); ok {
+		policy.ComputeStageLimits(ctx, stageSaturation, priorities, stageCeilings)
+	} else {
+		p.usageLimitPolicy.ComputeLimit(ctx, saturation, priorities, ceilings)
+		for stage, out := range stageCeilings {
+			if stage != "" {
+				copy(out, ceilings)
+			}
+		}
+	}
 
 	// --- Viability Check (Saturation/HoL Blocking) ---
 	// Ceilings are monotonically non-increasing per the UsageLimitPolicy contract, so the gated bands form a
@@ -533,8 +542,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 
 	for _, i := range order {
 		priority := priorities[i]
-		// Gating is per band, so a gated band is skipped wherever it is ranked rather than ending the cycle.
-		if saturation >= ceilings[i] {
+		if saturation >= ceilings[i] && stageSaturation[flowcontrol.SaturationStageDecode] >= stageCeilings[flowcontrol.SaturationStageDecode][i] {
 			continue
 		}
 
@@ -554,15 +562,22 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 			continue
 		}
 
+		plan, eligible := p.prepareItem(ctx, item, i, stageSaturation, stageCeilings)
+		if !eligible {
+			continue
+		}
 		// --- Dispatch ---
 		req := item.OriginalRequest()
-		if err := p.dispatchItem(item); err != nil {
+		dispatched, err := p.dispatchPreparedItem(item, plan)
+		if err != nil {
 			p.logger.Error(err, "Failed to dispatch item, skipping priority band for this cycle",
 				"flowKey", req.FlowKey(), "requestID", req.ID())
 			continue // Continue to the next band to maximize work conservation.
 		}
-		p.bandSelectionPolicy.RecordDispatch(ctx, priority)
-		return true
+		if dispatched {
+			p.bandSelectionPolicy.RecordDispatch(ctx, priority)
+			return true
+		}
 	}
 
 	// The cycle dispatched nothing. When a band is gated, the break is where head-of-line blocking bit, and
@@ -662,42 +677,95 @@ func (p *Processor) selectItem(
 }
 
 // dispatchItem handles the final steps of dispatching an item: removing it from the queue and finalizing its outcome.
-func (p *Processor) dispatchItem(itemAcc flowcontrol.QueueItemAccessor) error {
+func (p *Processor) dispatchItem(item flowcontrol.QueueItemAccessor) error {
+	_, err := p.dispatchPreparedItem(item, nil)
+	return err
+}
+
+func (p *Processor) dispatchPreparedItem(itemAcc flowcontrol.QueueItemAccessor, plan *flowcontrol.DispatchPlan) (bool, error) {
 	req := itemAcc.OriginalRequest()
-	key := req.FlowKey()
-	managedQ, err := p.registry.ManagedQueue(key)
+	managedQ, err := p.registry.ManagedQueue(req.FlowKey())
 	if err != nil {
-		return fmt.Errorf("failed to get ManagedQueue for flow %s: %w", key, err)
+		return false, fmt.Errorf("failed to get ManagedQueue for flow %s: %w", req.FlowKey(), err)
 	}
-
-	removedItemAcc, err := managedQ.Remove(itemAcc.Handle())
+	removed, err := managedQ.Remove(itemAcc.Handle())
 	if err != nil {
-		// This happens benignly if the item was already removed by the cleanup sweep loop.
-		// We log it at a low level for visibility but return nil so the dispatch cycle proceeds.
-		p.logger.V(logutil.DEBUG).Info("Failed to remove item during dispatch (likely already finalized and swept).",
-			"flowKey", key, "requestID", req.ID(), "err", err)
-		return nil
+		return false, nil
 	}
-
-	removedItem, ok := removedItemAcc.(*FlowItem)
+	item, ok := removed.(*FlowItem)
 	if !ok {
-		// Nothing to finalize on an unknown type; surface the error so the cycle moves to the next band.
-		return fmt.Errorf("internal error: item %q for flow %s has unexpected type %T", req.ID(), key, removedItemAcc)
+		return false, fmt.Errorf("internal error: item %q has unexpected type %T", req.ID(), removed)
 	}
-	// The request can be finalized asynchronously while it is being removed. Do not create a
-	// reservation for work that will not proceed past flow control.
-	if removedItem.FinalState() != nil {
-		return nil
+	if !p.itemLive(item) {
+		return false, nil
 	}
+	tracker, tracks := p.saturationDetector.(flowcontrol.DispatchReservationTracker)
+	reserved := false
+	if stageTracker, ok := p.saturationDetector.(flowcontrol.StageDispatchReservationTracker); ok && plan != nil {
+		stages := plan.ReservationStages
+		if len(stages) == 0 {
+			stages = plan.Stages
+		}
+		reserved = stageTracker.ReserveDispatchStages(req.ID(), stages)
+	} else if tracks {
+		reserved = tracker.ReserveDispatch(req.ID())
+	}
+	var commit func()
+	if plan != nil {
+		commit = plan.Commit
+	}
+	dispatched := item.dispatch(commit)
+	if reserved && !dispatched {
+		tracker.ReleaseDispatch(req.ID())
+	}
+	return dispatched, nil
+}
 
-	reservationTracker, tracksReservations := p.saturationDetector.(flowcontrol.DispatchReservationTracker)
-	reserved := tracksReservations && reservationTracker.ReserveDispatch(req.ID())
-	p.logger.V(logutil.TRACE).Info("Item dispatched.", "flowKey", req.FlowKey(), "requestID", req.ID())
-	removedItem.FinalizeWithError(nil)
-	if reserved && removedItem.FinalState().Outcome != types.QueueOutcomeDispatched {
-		reservationTracker.ReleaseDispatch(req.ID())
+func (p *Processor) itemLive(item *FlowItem) bool {
+	if item.FinalState() != nil {
+		return false
 	}
-	return nil
+	regime := p.regime.Load()
+	if isExpired(item, p.clock.Now(), regime, p.noEndpointRequestTTL) {
+		item.FinalizeWithError(expiryError(regime.empty))
+		return false
+	}
+	return true
+}
+
+func (p *Processor) prepareItem(ctx context.Context, item flowcontrol.QueueItemAccessor, band int,
+	saturation map[string]float64, ceilings map[string][]float64) (*flowcontrol.DispatchPlan, bool) {
+	if fi, ok := item.(*FlowItem); ok && !p.itemLive(fi) {
+		return nil, false
+	}
+	preparer, ok := item.OriginalRequest().(flowcontrol.DispatchPreparer)
+	if !ok || preparer.DispatchPreparation() == nil {
+		return nil, saturation[""] < ceilings[""][band]
+	}
+	if saturation[flowcontrol.SaturationStageDecode] >= ceilings[flowcontrol.SaturationStageDecode][band] {
+		return nil, false
+	}
+	plan, err := preparer.DispatchPreparation()(ctx)
+	if err != nil {
+		if fi, ok := item.(*FlowItem); ok {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				fi.Finalize(err)
+			} else {
+				fi.FinalizeWithError(fmt.Errorf("%w: %w", types.ErrEvicted, err))
+			}
+		}
+		return nil, false
+	}
+	if plan == nil || len(plan.Stages) == 0 {
+		return nil, false
+	}
+	for _, stage := range plan.Stages {
+		limits, known := ceilings[stage]
+		if !known || saturation[stage] >= limits[band] {
+			return nil, false
+		}
+	}
+	return plan, true
 }
 
 // runCleanupSweep starts a background goroutine that periodically scans all queues for externally finalized items

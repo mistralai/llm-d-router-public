@@ -170,3 +170,17 @@ func runSchedulerProfile(ctx context.Context, name string, profile fwksched.Sche
 
 	return profile.Run(profileCtx, request, candidateEndpoints)
 }
+
+func (s *Scheduler) SupportsDispatchPreparation() bool {
+	if handler, ok := s.profileHandler.(fwksched.DispatchProfileHandler); ok {
+		return handler.SupportsDispatchPreparation()
+	}
+	return false
+}
+
+func (s *Scheduler) DispatchUsesPrefill(request *fwksched.InferenceRequest, result *fwksched.SchedulingResult) bool {
+	if handler, ok := s.profileHandler.(fwksched.DispatchProfileHandler); ok {
+		return handler.DispatchUsesPrefill(request, result)
+	}
+	return true
+}

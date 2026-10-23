@@ -153,8 +153,8 @@ func SaturationStageFromContext(ctx context.Context) string {
 // before a request is released from the flow-control queue and removed after PreRequest hooks
 // have published the request to the endpoint load signal.
 //
-// Reservations are pool-wide: scheduling chooses the destination after dispatch, so a reservation
-// is not scoped to a stage or endpoint. An implementation that watches a subset of endpoints
+// ReserveDispatch creates a pool-wide reservation. StageDispatchReservationTracker can restrict a reservation
+// to the stages a prepared placement uses. An implementation that watches a subset of endpoints
 // (for example a stage-scoped child of a composite detector) counts every outstanding
 // reservation against its own capacity.
 //
@@ -186,7 +186,8 @@ type DispatchReservationTracker interface {
 // priority, requests at that priority are gated (not dispatched). Gating is decided per band, independent of
 // the order in which bands are visited and of the outcome at any other band.
 //
-// The framework calls ComputeLimit exactly once per dispatch cycle. This is a contract term, not an
+// The framework calls ComputeLimit once per cycle, or ComputeStageLimits when the policy implements StageUsageLimitPolicy.
+// Each call advances dispatch-spreading state once. This is a contract term, not an
 // implementation detail: dispatch-spreading policies use the call itself as their time base (one tick
 // per cycle), and computing all ceilings in one call is what lets every gated band observe the same
 // open/closed decision within a cycle. The batch shape exists to preserve both properties.

@@ -645,3 +645,19 @@ func (h *Handler) PreRequest(ctx context.Context, request *scheduling.InferenceR
 	)
 	return nil
 }
+
+func (h *Handler) SupportsDispatchPreparation() bool {
+	return h.stageOrder == StageOrderDecodeFirst && h.pdDecider != nil && h.encodeDecider == nil
+}
+
+func (h *Handler) DispatchUsesPrefill(request *scheduling.InferenceRequest, result *scheduling.SchedulingResult) bool {
+	if result.ProfileResults[h.prefillProfile].FirstEndpoint() != nil {
+		return true
+	}
+	// An unreadable prefix estimate cannot establish eligibility to bypass prefill capacity.
+	if _, ok := h.pdDecider.(*PrefixBasedPDDecider); ok {
+		decision, found := scheduling.ReadRequestAttribute[remotePrefillDecision](request, remotePrefillDecisionAttributeKey)
+		return !found || decision.err != nil || decision.needs
+	}
+	return false
+}

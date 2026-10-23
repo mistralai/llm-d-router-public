@@ -63,7 +63,7 @@ See the upstream [Request Scheduler](https://github.com/llm-d/llm-d/blob/main/do
 
 #### Request Control
 
-Request control runs once per request before any scheduling profiles:
+The ordinary request-control path uses this sequence:
 
 1. Request headers are processed and flow-control admission completes
 2. Endpoint candidates are located
@@ -74,6 +74,19 @@ Request control runs once per request before any scheduling profiles:
 4. Data producers prepare per-request data using the filtered candidate set
 5. Admission plugins may reject the request
 6. The scheduler runs the configured scheduling profiles using the filtered candidate set
+
+With flow control and decode-first P/D disaggregation, placement preparation runs while the request remains queued.
+It uses the configured screeners, data producers, profiles, and P/D decider. Admission checks decode capacity for
+local execution and both stage capacities when remote prefill is required. The accepted placement passes to the
+request lifecycle without a second scheduling run. Admission and PreRequest plugins run only after admission.
+
+Retries refresh endpoint and prefix-cache snapshots. Tokenization is reused after successful production.
+Unavailable cache data cannot authorize a prefill-capacity bypass. Prefill-first scheduling, encode disaggregation,
+and handlers without dispatch preparation use the ordinary path.
+
+The built-in usage-limit policies evaluate stage-specific ceilings in one dispatch cycle. Custom policies without
+`StageUsageLimitPolicy` retain ceilings derived from pool-wide saturation. Capacity signals remain estimates from
+the configured detectors; admission does not reserve KV blocks on the engine.
 
 #### Scheduling
 

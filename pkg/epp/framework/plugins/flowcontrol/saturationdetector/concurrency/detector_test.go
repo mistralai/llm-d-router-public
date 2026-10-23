@@ -29,6 +29,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
@@ -1306,4 +1307,30 @@ func TestDetector_NilEndpointInList(t *testing.T) {
 		filtered := d.Filter(t.Context(), nil, []fwksched.Endpoint{nil})
 		require.Empty(t, filtered, "nil endpoint should be skipped by filter")
 	})
+}
+
+func TestStageDispatchReservations(t *testing.T) {
+	for _, aggregation := range []poolAggregation{aggregationAverage, aggregationLeastLoaded} {
+		t.Run(string(aggregation), func(t *testing.T) {
+			cfg, err := buildConfig(&apiConfig{MaxConcurrency: ptr.To(int64(2)), PoolAggregation: ptr.To(aggregation)})
+			require.NoError(t, err)
+			d := newDetector("stages", *cfg, logr.Discard())
+			endpoints := []datalayer.Endpoint{newFakeEndpoint(newLocalRegistry(), "worker")}
+			prefill := flowcontrol.WithSaturationStage(context.Background(), flowcontrol.SaturationStagePrefill)
+			decode := flowcontrol.WithSaturationStage(context.Background(), flowcontrol.SaturationStageDecode)
+			require.True(t, d.ReserveDispatchStages("local", []string{flowcontrol.SaturationStageDecode}))
+			require.False(t, d.ReserveDispatchStages("local", []string{flowcontrol.SaturationStageDecode}))
+			require.Equal(t, 0.0, d.Saturation(prefill, endpoints))
+			require.Equal(t, 0.5, d.Saturation(decode, endpoints))
+			require.True(t, d.ReserveDispatch("legacy"))
+			require.Equal(t, 0.5, d.Saturation(prefill, endpoints))
+			require.Equal(t, 1.0, d.Saturation(decode, endpoints))
+			require.True(t, d.ReleaseDispatch("local"))
+			require.False(t, d.ReleaseDispatch("local"))
+			require.True(t, d.ReleaseDispatch("legacy"))
+			require.Zero(t, d.Saturation(prefill, endpoints))
+			require.Zero(t, d.Saturation(decode, endpoints))
+
+		})
+	}
 }
