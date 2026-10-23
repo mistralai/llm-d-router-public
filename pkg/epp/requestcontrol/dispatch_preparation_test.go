@@ -310,3 +310,7 @@ func TestPendingProbeResultsRetainCapacity(t *testing.T) {
 	cancel()
 	require.Eventually(t, func() bool { return len(director.dispatchPreparationSlots) == 0 }, time.Second, time.Millisecond)
 }
+
+func (*handoffScheduler) FilterDecodeCandidates(_ context.Context, _ *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
+	return endpoints
+}

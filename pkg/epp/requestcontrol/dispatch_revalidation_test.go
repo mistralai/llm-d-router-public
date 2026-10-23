@@ -102,3 +102,46 @@ func TestDispatchCompletionRechecksMandatoryScreeners(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ready, "a destination rejected by the mandatory screener must not dispatch")
 }
+
+func TestDispatchCompletionPreservesFailOpenPoolFiltering(t *testing.T) {
+	handle := utils.NewTestHandle(t.Context())
+	detector, err := concurrency.ConcurrencyDetectorFactory("review-limit", plugin.StrictDecoder([]byte(`{"maxConcurrency":1,"failOpen":true}`)), handle)
+	require.NoError(t, err)
+	filter := detector.(fwksched.Filter)
+	decider, err := disagg.NewPrefixBasedPDDecider(disagg.PrefixBasedPDDeciderConfig{NonCachedTokens: 4})
+	require.NoError(t, err)
+	handler := disagg.NewDisaggProfileHandler("decode", "prefill", "", decider, nil)
+	producer := &dispatchPrefixProducer{}
+	producer.cached.Store(10)
+	picker := maxscore.NewMaxScorePicker(1)
+	datalayer.RegisterScopeSpecs([]plugin.Plugin{detector, decider, handler, producer, picker})
+	profile := schedulerpkg.NewSchedulerProfile().WithFilters(filter).WithPicker(picker)
+	scheduler := schedulerpkg.NewSchedulerWithConfig(schedulerpkg.NewSchedulerConfig(handler, map[string]fwksched.SchedulerProfile{"decode": profile, "prefill": dispatchTestProfile{name: "prefill"}}))
+	live := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "decoder"}}, nil)
+	live.GetAttributes().Put(attrconcurrency.InFlightLoadDataKey, &attrconcurrency.InFlightLoad{})
+	other := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "other"}}, nil)
+	other.GetAttributes().Put(attrconcurrency.InFlightLoadDataKey, &attrconcurrency.InFlightLoad{})
+	director := &Director{scheduler: scheduler, endpointCandidates: &mocks.MockEndpointCandidates{Candidates: []fwkdl.Endpoint{live}}, requestControlPlugins: Config{dataProducerPlugins: []fwkrc.DataProducer{producer}}}
+	request := newSeamRequestContext("stale-load").SchedulingRequest
+	request.Body = &fwkrh.InferenceRequestBody{TokenizedRequest: &fwksched.TokenizedRequest{Prompts: []fwkrh.PromptTokens{{TokenIDs: make([]uint32, 10)}}}}
+	prepared := director.prepareScheduling(t.Context(), scheduler, request, nil)
+	require.NoError(t, prepared.err)
+	require.NotNil(t, prepared.prepared)
+	control := director.prepareScheduling(t.Context(), scheduler, copyDispatchRequest(request), nil)
+	controlReady, controlErr := director.completeDispatch(t.Context(), scheduler, nil, control.prepared)
+	require.NoError(t, controlErr)
+	require.True(t, controlReady, "an unchanged idle decoder must be accepted")
+	live.GetAttributes().Put(attrconcurrency.InFlightLoadDataKey, &attrconcurrency.InFlightLoad{Requests: 1})
+	director.endpointCandidates.(*mocks.MockEndpointCandidates).Candidates = []fwkdl.Endpoint{live, other}
+	fresh := director.toSchedulerEndpoints([]fwkdl.Endpoint{live, other})
+	allowed := filter.Filter(t.Context(), request, fresh)
+	require.Len(t, allowed, 1)
+	require.Equal(t, "other", allowed[0].GetMetadata().ID.Name)
+	ready, err := director.completeDispatch(t.Context(), scheduler, nil, prepared.prepared)
+	require.NoError(t, err)
+	require.False(t, ready, "the chosen decoder is at its configured concurrency limit")
+	other.GetAttributes().Put(attrconcurrency.InFlightLoadDataKey, &attrconcurrency.InFlightLoad{Requests: 1})
+	ready, err = director.completeDispatch(t.Context(), scheduler, nil, prepared.prepared)
+	require.NoError(t, err)
+	require.True(t, ready, "pool-wide fallback remains available when every decoder is busy")
+}

@@ -208,3 +208,15 @@ func (s *Scheduler) ProbeDecodeLocal(ctx context.Context, request *fwksched.Infe
 	}
 	return nil, nil //nolint:nilnil
 }
+
+func (s *Scheduler) FilterDecodeCandidates(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
+	handler, ok := s.profileHandler.(fwksched.DispatchProfileHandler)
+	if !ok || !handler.SupportsDispatchPreparation() {
+		return nil
+	}
+	profile, ok := s.profiles[handler.DecodeProfileName()].(fwksched.DispatchFilter)
+	if !ok {
+		return nil
+	}
+	return profile.FilterCandidates(ctx, request, endpoints)
+}

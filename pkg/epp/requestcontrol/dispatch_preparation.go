@@ -53,6 +53,7 @@ type dispatchScheduler interface {
 	SupportsDispatchPreparation() bool
 	DispatchUsesPrefill(*fwksched.InferenceRequest, *fwksched.SchedulingResult) bool
 	ProbeDecodeLocal(context.Context, *fwksched.InferenceRequest, []fwksched.Endpoint) (fwksched.Endpoint, error)
+	FilterDecodeCandidates(context.Context, *fwksched.InferenceRequest, []fwksched.Endpoint) []fwksched.Endpoint
 }
 
 type preparedScheduling struct {
@@ -338,6 +339,17 @@ func (d *Director) completeDispatch(ctx context.Context, scheduler dispatchSched
 		if value, ok := prepared.endpoints[0].Get(key); ok {
 			selected.Put(key, value)
 		}
+	}
+	// Pool-wide filtering preserves fallback rules before scheduling is restricted to the retained decoder.
+	eligible := false
+	for _, candidate := range scheduler.FilterDecodeCandidates(ctx, prepared.request, candidates) {
+		if sameDestination(candidate, selected) {
+			eligible = true
+			break
+		}
+	}
+	if !eligible {
+		return false, nil
 	}
 	prepared.endpoints = []fwksched.Endpoint{selected}
 	result, err := scheduler.Schedule(ctx, prepared.request, prepared.endpoints)
