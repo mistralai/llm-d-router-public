@@ -297,3 +297,55 @@ func TestFlowControlAdmissionController_RealControllerSeam(t *testing.T) {
 		requireDropped(t, err, errcommon.ServiceUnavailable, errcommon.RequestDroppedReasonShuttingDown)
 	})
 }
+
+func TestAdmissionLookaheadRetainsQueueAccounting(t *testing.T) {
+	h := newRealFlowControlHarness(t, realFlowControlOpts{candidates: []fwkdl.Endpoint{fwkdl.NewEndpoint(nil, nil)}})
+	remoteCtx, cancelRemote := context.WithCancel(t.Context())
+	defer cancelRemote()
+	remoteDone := make(chan error, 1)
+	go func() {
+		remoteDone <- h.ac.AdmitPrepared(remoteCtx, newSeamRequestContext("remote"), 0,
+			func(context.Context) (*flowcontrol.DispatchPlan, error) {
+				return &flowcontrol.DispatchPlan{Stages: []string{flowcontrol.SaturationStageDecode, flowcontrol.SaturationStagePrefill}}, nil
+			})
+	}()
+	key := flowcontrol.FlowKey{ID: "seam-flow", Priority: 0}
+	var queued flowcontrol.QueueItemAccessor
+	require.Eventually(t, func() bool {
+		q, err := h.reg.ManagedQueue(key)
+		if err != nil || q.FlowQueueAccessor().Len() != 1 {
+			return false
+		}
+		queued = q.FlowQueueAccessor().Peek()
+		return queued != nil
+	}, time.Second, time.Millisecond)
+	enqueueTime, ttl, handle := queued.EnqueueTime(), queued.EffectiveTTL(), queued.Handle()
+	localCtx, cancelLocal := context.WithTimeout(t.Context(), time.Second)
+	defer cancelLocal()
+	require.NoError(t, h.ac.AdmitPrepared(localCtx, newSeamRequestContext("local"), 0,
+		func(context.Context) (*flowcontrol.DispatchPlan, error) {
+			return &flowcontrol.DispatchPlan{Stages: []string{flowcontrol.SaturationStageDecode}}, nil
+		}))
+	q, err := h.reg.ManagedQueue(key)
+	require.NoError(t, err)
+	require.Equal(t, 1, q.FlowQueueAccessor().Len())
+	require.Equal(t, uint64(100), q.FlowQueueAccessor().ByteSize())
+	require.Same(t, queued, q.FlowQueueAccessor().Peek())
+	require.Same(t, handle, queued.Handle())
+	require.False(t, handle.IsInvalidated())
+	require.Equal(t, enqueueTime, queued.EnqueueTime())
+	require.Equal(t, ttl, queued.EffectiveTTL())
+	snapshot, err := h.reg.CapacitySnapshot(0)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), snapshot.Band.Len)
+	require.Equal(t, uint64(100), snapshot.Band.ByteSize)
+	cancelRemote()
+	select {
+	case err := <-remoteDone:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled request did not finish")
+	}
+	require.Eventually(t, func() bool { return q.FlowQueueAccessor().Len() == 0 && q.FlowQueueAccessor().ByteSize() == 0 }, time.Second, time.Millisecond)
+	require.True(t, handle.IsInvalidated())
+}

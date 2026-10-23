@@ -255,3 +255,54 @@ func (pq *priorityQueue) Drain() []flowcontrol.QueueItemAccessor {
 
 	return drainedItems
 }
+
+// Candidates keeps heap indices under the read lock because queue mutations can move them.
+func (pq *priorityQueue) Candidates(limit int) []flowcontrol.QueueItemAccessor {
+	pq.mu.RLock()
+	defer pq.mu.RUnlock()
+	limit = min(limit, len(pq.heap.items))
+	if limit <= 0 {
+		return nil
+	}
+	candidates := make([]flowcontrol.QueueItemAccessor, 0, limit)
+	frontier := &candidateHeap{queue: pq.heap, entries: make([]*heapItem, 1, limit+1)}
+	frontier.entries[0] = pq.heap.items[0]
+	for len(candidates) < limit {
+		entry := heap.Pop(frontier).(*heapItem)
+		index := entry.index
+		candidates = append(candidates, entry.item)
+		if len(candidates) == limit {
+			break
+		}
+		for child := 2*index + 1; child <= 2*index+2 && child < len(pq.heap.items); child++ {
+			heap.Push(frontier, pq.heap.items[child])
+		}
+	}
+	return candidates
+}
+
+type candidateHeap struct {
+	queue   *itemHeap
+	entries []*heapItem
+}
+
+func (h candidateHeap) Len() int { return len(h.entries) }
+func (h candidateHeap) Less(i, j int) bool {
+	a, b := h.entries[i], h.entries[j]
+	if h.queue.policy.Less(a.item, b.item) {
+		return true
+	}
+	if h.queue.policy.Less(b.item, a.item) {
+		return false
+	}
+	return a.index < b.index
+}
+func (h candidateHeap) Swap(i, j int)   { h.entries[i], h.entries[j] = h.entries[j], h.entries[i] }
+func (h *candidateHeap) Push(value any) { h.entries = append(h.entries, value.(*heapItem)) }
+func (h *candidateHeap) Pop() any {
+	last := len(h.entries) - 1
+	value := h.entries[last]
+	h.entries[last] = nil
+	h.entries = h.entries[:last]
+	return value
+}

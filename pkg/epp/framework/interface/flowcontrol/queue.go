@@ -30,3 +30,9 @@ type QueueInspectionMethods interface {
 	// Returns nil if the queue is empty.
 	Peek() QueueItemAccessor
 }
+
+// QueueCandidates exposes a bounded, policy-ordered view without removing items.
+// Items and handles remain owned by the queue. A concurrent removal can make a snapshot entry stale.
+type QueueCandidates interface {
+	Candidates(limit int) []QueueItemAccessor
+}

@@ -540,6 +540,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 		Ceilings:   ceilings,
 	}, order)
 
+	remaining := maxLookaheadCandidates
 	for _, i := range order {
 		priority := priorities[i]
 		if saturation >= ceilings[i] && stageSaturation[flowcontrol.SaturationStageDecode] >= stageCeilings[flowcontrol.SaturationStageDecode][i] {
@@ -552,7 +553,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 			continue
 		}
 
-		item, err := p.selectItem(ctx, originalBand)
+		item, plan, err := p.selectPreparedItem(ctx, originalBand, i, &remaining, stageSaturation, stageCeilings)
 		if err != nil {
 			p.logger.Error(err, "Failed to select item, skipping priority band for this cycle",
 				"priority", priority)
@@ -562,10 +563,6 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 			continue
 		}
 
-		plan, eligible := p.prepareItem(ctx, item, i, stageSaturation, stageCeilings)
-		if !eligible {
-			continue
-		}
 		// --- Dispatch ---
 		req := item.OriginalRequest()
 		dispatched, err := p.dispatchPreparedItem(item, plan)

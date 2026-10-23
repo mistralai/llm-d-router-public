@@ -95,6 +95,11 @@ Unknown cache state cannot authorize a bypass.
 Prefill-first scheduling, encode disaggregation, non-prefix PD deciders, and profiles without dispatch filtering
 use the ordinary admission path.
 
+P/D bypass lookahead examines at most 32 candidates per dispatch cycle across priority bands and flows. Requests
+beyond that budget can remain queued even when they could run. Heap traversal copies only the bounded candidate
+set and does not sort the entire queue. Skipped requests retain their timestamps, TTLs, handles, and capacity
+charges. Custom queues without `QueueCandidates` expose only their first request.
+
 The built-in usage-limit policies evaluate stage-specific ceilings in one dispatch cycle. Custom policies without
 `StageUsageLimitPolicy` retain ceilings derived from pool-wide saturation. Capacity signals remain estimates from
 the configured detectors; admission does not reserve KV blocks on the engine.

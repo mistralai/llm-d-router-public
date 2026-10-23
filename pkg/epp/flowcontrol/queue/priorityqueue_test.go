@@ -19,6 +19,7 @@ package queue
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -485,4 +486,92 @@ func TestPriorityQueue_ByteSize_BookedAtAdd(t *testing.T) {
 		assert.Equal(t, uint64(75), q.ByteSize(), "Cleanup must debit the booked size, not the re-read size")
 		assert.Equal(t, 1, q.Len())
 	})
+}
+
+func TestCandidatesPreservesQueue(t *testing.T) {
+	q := newPriorityQueue(byteSizePolicy)
+	for _, size := range []uint64{100, 20, 80, 30, 60} {
+		q.Add(itemAt(size, strconv.FormatUint(size, 10), time.Now()))
+	}
+	items := q.Candidates(32)
+	sizes := make([]uint64, len(items))
+	for i, item := range items {
+		sizes[i] = item.OriginalRequest().ByteSize()
+		require.False(t, item.Handle().IsInvalidated())
+	}
+	require.Equal(t, []uint64{20, 30, 60, 80, 100}, sizes)
+	require.Equal(t, 5, q.Len())
+	require.Equal(t, uint64(290), q.ByteSize())
+	removed, err := q.Remove(items[2].Handle())
+	require.NoError(t, err)
+	require.Same(t, items[2], removed)
+	require.Equal(t, 4, q.Len())
+	require.Equal(t, uint64(230), q.ByteSize())
+	require.Same(t, items[0], q.Peek())
+	_, err = q.Remove(items[2].Handle())
+	require.ErrorIs(t, err, contracts.ErrInvalidQueueItemHandle)
+	assertHeapProperty(t, q)
+}
+
+func TestCandidatesConcurrentCleanup(t *testing.T) {
+	q := newPriorityQueue(enqueueTimePolicy)
+	for i := range 100 {
+		q.Add(itemAt(1, strconv.Itoa(i), time.Now()))
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			q.Candidates(32)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			q.Cleanup(func(flowcontrol.QueueItemAccessor) bool { return true })
+			q.Add(itemAt(1, "concurrent", time.Now()))
+		}
+	}()
+	wg.Wait()
+	assertHeapProperty(t, q)
+	require.Equal(t, uint64(q.Len()), q.ByteSize())
+}
+
+func BenchmarkCandidates(b *testing.B) {
+	for _, size := range []int{32, 1024, 10000} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			q := newPriorityQueue(byteSizePolicy)
+			for i := range size {
+				q.Add(itemAt(uint64(size-i), strconv.Itoa(i), time.Now()))
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				q.Candidates(32)
+			}
+		})
+	}
+}
+
+func TestCandidatesBoundedWork(t *testing.T) {
+	comparisons := 0
+	policy := &mocks.MockOrderingPolicy{LessFunc: func(a, b flowcontrol.QueueItemAccessor) bool {
+		comparisons++
+		return a.OriginalRequest().ByteSize() < b.OriginalRequest().ByteSize()
+	}}
+	q := newPriorityQueue(policy)
+	for i := range 10000 {
+		q.Add(itemAt(uint64(10000-i), strconv.Itoa(i), time.Now()))
+	}
+	comparisons = 0
+	items := q.Candidates(8)
+	require.Len(t, items, 8)
+	for i, item := range items {
+		require.Equal(t, uint64(i+1), item.OriginalRequest().ByteSize())
+	}
+	require.Less(t, comparisons, 128)
+	require.Equal(t, 10000, q.Len())
+	require.Empty(t, q.Candidates(0))
+	require.Empty(t, q.Candidates(-1))
 }

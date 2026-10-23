@@ -243,3 +243,16 @@ func (a *flowQueueAccessor) Len() int                                   { return
 func (a *flowQueueAccessor) ByteSize() uint64                           { return a.mq.ByteSize() }
 func (a *flowQueueAccessor) OrderingPolicy() flowcontrol.OrderingPolicy { return a.mq.policy }
 func (a *flowQueueAccessor) FlowKey() flowcontrol.FlowKey               { return a.mq.key }
+
+func (a *flowQueueAccessor) Candidates(limit int) []flowcontrol.QueueItemAccessor {
+	if limit <= 0 {
+		return nil
+	}
+	if queue, ok := a.mq.queue.(flowcontrol.QueueCandidates); ok {
+		return queue.Candidates(limit)
+	}
+	if item := a.Peek(); item != nil {
+		return []flowcontrol.QueueItemAccessor{item}
+	}
+	return nil
+}

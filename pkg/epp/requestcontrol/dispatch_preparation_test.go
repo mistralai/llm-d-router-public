@@ -31,11 +31,13 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/contracts/mocks"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	fwkfcmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
+	programaware "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/fairness/program-aware"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/openai"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/profilehandler/disagg"
@@ -313,4 +315,68 @@ func TestPendingProbeResultsRetainCapacity(t *testing.T) {
 
 func (*handoffScheduler) FilterDecodeCandidates(_ context.Context, _ *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
 	return endpoints
+}
+
+func TestDispatchPreparationPreservesFairnessAttributes(t *testing.T) {
+	live := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "decoder"}}, nil)
+	endpoint := fwksched.NewEndpoint(live.GetMetadata(), nil, nil)
+	result := &fwksched.SchedulingResult{PrimaryProfileName: "decode", ProfileResults: map[string]*fwksched.ProfileRunResult{"decode": {TargetEndpoints: []fwksched.Endpoint{endpoint}}}}
+	scheduler := &handoffScheduler{mockScheduler: mockScheduler{scheduleResults: result}}
+	producer := &dispatchRequestAttributeProducer{}
+	datalayer.RegisterScopeSpecs([]plugin.Plugin{producer})
+	director := &Director{scheduler: scheduler, endpointCandidates: &mocks.MockEndpointCandidates{Candidates: []fwkdl.Endpoint{live}}, requestControlPlugins: Config{dataProducerPlugins: []fwkrc.DataProducer{producer}}}
+	reqCtx := newSeamRequestContext("fairness-attributes")
+	reqCtx.SchedulingRequest.Body = &fwkrh.InferenceRequestBody{}
+	reqCtx.SchedulingRequest.Headers = map[string]string{}
+	reqCtx.SchedulingRequest.PutAttribute(testKeyA, 0)
+	prepare := director.newDispatchPreparation(t.Context(), reqCtx, func(prepared *preparedScheduling) { reqCtx.SchedulingRequest = prepared.request })
+	var plan *flowcontrol.DispatchPlan
+	require.Eventually(t, func() bool {
+		var err error
+		plan, err = prepare(t.Context())
+		require.NoError(t, err)
+		return plan != nil
+	}, time.Second, time.Millisecond)
+	key := flowcontrol.FlowKey{ID: "flow", Priority: 0}
+	item := fwkfcmocks.NewMockQueueItemAccessor(1, "fairness-attributes", key, func(req *fwkfcmocks.MockFlowControlRequest) { req.InferenceRequestV = reqCtx.SchedulingRequest })
+	item.EnqueueTimeV = time.Now().Add(-time.Second)
+	queue := &fwkfcmocks.MockFlowQueueAccessor{LenV: 1, FlowKeyV: key, PeekV: item}
+	band := &fwkfcmocks.MockPriorityBandAccessor{IterateQueuesFunc: func(visit func(flowcontrol.FlowQueueAccessor) bool) { visit(queue) }}
+	plug, err := programaware.ProgramAwarePluginFactory("test", nil, nil)
+	require.NoError(t, err)
+	chosen, err := plug.(flowcontrol.FairnessPolicy).Pick(t.Context(), band)
+	require.NoError(t, err)
+	require.Same(t, queue, chosen)
+	var enqueueKey plugin.DataKey
+	for key := range plug.(plugin.ProducerPlugin).Produces() {
+		enqueueKey = key
+	}
+	value, ok := reqCtx.SchedulingRequest.GetAttribute(enqueueKey)
+	require.True(t, ok)
+	require.Equal(t, item.EnqueueTimeV, value)
+	ready, err := plan.Complete()
+	require.NoError(t, err)
+	require.True(t, ready)
+	plan.Commit()
+	value, ok = reqCtx.SchedulingRequest.GetAttribute(enqueueKey)
+	require.True(t, ok, "the selection-time enqueue timestamp must survive the prepared handoff")
+	require.Equal(t, item.EnqueueTimeV, value)
+	value, ok = reqCtx.SchedulingRequest.GetAttribute(testKeyA)
+	require.True(t, ok)
+	require.Equal(t, 1, value, "probe-produced attributes must retain their values")
+}
+
+type dispatchRequestAttributeProducer struct{}
+
+func (*dispatchRequestAttributeProducer) TypedName() plugin.TypedName {
+	return plugin.TypedName{Type: "dispatch-test-attribute"}
+}
+
+func (*dispatchRequestAttributeProducer) Produces() map[plugin.DataKey]any {
+	return map[plugin.DataKey]any{testKeyA: 0}
+}
+
+func (*dispatchRequestAttributeProducer) Produce(_ context.Context, request *fwksched.InferenceRequest, _ []fwksched.Endpoint) error {
+	request.PutAttribute(testKeyA, 1)
+	return nil
 }
