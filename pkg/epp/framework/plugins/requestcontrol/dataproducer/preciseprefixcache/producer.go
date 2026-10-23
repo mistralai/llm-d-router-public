@@ -366,6 +366,10 @@ func (p *Producer) Consumes() plugin.DataDependencies {
 func (p *Producer) Produce(ctx context.Context,
 	request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint,
 ) error {
+	return p.produce(ctx, request, endpoints, nil)
+}
+
+func (p *Producer) produce(ctx context.Context, request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint, probe *probeProducer) error {
 	ctx, span := tracing.Tracer(rcplugins.TracerScope).Start(ctx, "produce_precise_prefix_cache",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
@@ -381,7 +385,14 @@ func (p *Producer) Produce(ctx context.Context,
 		}
 	}
 
-	perPromptKeys, perPromptMMContent, err := computeBlockKeys(ctx, p.kvCacheIndexer, request, p.blockSizeTokens)
+	var perPromptKeys [][]kvblock.BlockHash
+	var perPromptMMContent []*mmPromptContent
+	var err error
+	if probe == nil {
+		perPromptKeys, perPromptMMContent, err = computeBlockKeys(ctx, p.kvCacheIndexer, request, p.blockSizeTokens)
+	} else {
+		perPromptKeys, perPromptMMContent, err = probe.cachedBlockKeys(ctx, request)
+	}
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("failed to compute block keys: %w", err)

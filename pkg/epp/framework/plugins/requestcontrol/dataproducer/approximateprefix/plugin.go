@@ -127,7 +127,7 @@ func (p *dataProducer) snapshotState() prefixIndexState {
 
 // Produces returns the data produced by the plugin.
 func (p *dataProducer) Produces() map[plugin.DataKey]any {
-	return map[plugin.DataKey]any{p.dk: attrprefix.PrefixCacheMatchInfo{}}
+	return map[plugin.DataKey]any{p.dk: attrprefix.PrefixCacheMatchInfo{}, p.probeStateKey(): SchedulingContextState{}}
 }
 
 // Consumes declares the TokenizedRequest dependency so the data-layer DAG orders
@@ -234,6 +234,10 @@ func (p *dataProducer) PluginState() *plugin.PluginState {
 func (p *dataProducer) Produce(ctx context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint) error {
 	blockSize := p.GetBlockSize(pods)
 	perPromptHashes, perPromptTokens := prefixhash.GetBlockHashesWithPromptTokens(ctx, request, blockSize, p.resolveMaxBlocks(blockSize))
+	return p.produceHashes(ctx, request, pods, blockSize, perPromptHashes, perPromptTokens, false)
+}
+
+func (p *dataProducer) produceHashes(ctx context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint, blockSize int, perPromptHashes [][]blockHash, perPromptTokens []int, probe bool) error {
 
 	candidates := make([]ServerID, len(pods))
 	for i, pod := range pods {
@@ -274,7 +278,11 @@ func (p *dataProducer) Produce(ctx context.Context, request *fwksched.InferenceR
 		BestAvailableCachedTokens: bestAvailable,
 	}
 
-	p.pluginState.Write(request.RequestID, plugin.StateKey(p.typedName.Name), state)
+	if probe {
+		request.PutAttribute(p.probeStateKey(), state)
+	} else {
+		p.pluginState.Write(request.RequestID, plugin.StateKey(p.typedName.Name), state)
+	}
 
 	return nil
 }
