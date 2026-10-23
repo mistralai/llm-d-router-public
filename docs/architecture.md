@@ -75,22 +75,23 @@ The ordinary request-control path uses this sequence:
 5. Admission plugins may reject the request
 6. The scheduler runs the configured scheduling profiles using the filtered candidate set
 
-With flow control and decode-first P/D disaggregation, placement preparation runs while the request remains queued.
-It uses the configured screeners, data producers, profiles, and P/D decider. Admission checks decode capacity for
-local execution and both stage capacities when remote prefill is required. The accepted placement passes to the
-request lifecycle without a second scheduling run. Admission and PreRequest plugins run only after admission.
+With flow control and prefix-based decode-first P/D disaggregation, requests use ordinary admission when both
+stages permit their priority band. When prefill admission is blocked and decode admission is available, a probe
+runs data producers and decode filters, then checks cache eligibility without running scorers or a picker.
 
-Within each flow, dispatch inspects requests in the configured ordering policy until it finds an eligible placement.
-The fairness policy selects among these eligible flow candidates. Skipped requests remain queued with their original
-timestamps, TTLs, handles, and capacity charges. Snapshot inspection does not remove or re-enqueue them.
+A successful probe retains only its candidate decoder. Full scheduling runs after request selection against that
+candidate, and the accepted result passes to the request lifecycle. A failed completion leaves the request queued.
+Admission and PreRequest plugins run only after flow-control admission.
 
-Lookahead examines at most 32 candidates per dispatch cycle across priority bands and flows. Requests beyond that
-budget can remain queued even when they could run. Heap traversal copies only the bounded candidate set and does
-not sort the entire queue. Custom queues without `QueueCandidates` expose only their first request.
+At most 32 probes can be running or waiting for their results to be consumed. Retries refresh endpoint and
+prefix-cache snapshots and reuse successful tokenization. Unknown cache state cannot authorize a bypass.
+Prefill-first scheduling, encode disaggregation, non-prefix PD deciders, and profiles without dispatch filtering
+use the ordinary admission path.
 
-Retries refresh endpoint and prefix-cache snapshots. Tokenization is reused after successful production.
-Unavailable cache data cannot authorize a prefill-capacity bypass. Prefill-first scheduling, encode disaggregation,
-and handlers without dispatch preparation use the ordinary path.
+P/D bypass lookahead examines at most 32 candidates per dispatch cycle across priority bands and flows. Requests
+beyond that budget can remain queued even when they could run. Heap traversal copies only the bounded candidate
+set and does not sort the entire queue. Skipped requests retain their timestamps, TTLs, handles, and capacity
+charges. Custom queues without `QueueCandidates` expose only their first request.
 
 The built-in usage-limit policies evaluate stage-specific ceilings in one dispatch cycle. Custom policies without
 `StageUsageLimitPolicy` retain ceilings derived from pool-wide saturation. Capacity signals remain estimates from

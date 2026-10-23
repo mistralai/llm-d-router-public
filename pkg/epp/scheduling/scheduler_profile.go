@@ -132,7 +132,7 @@ func (p *SchedulerProfile) String() string {
 // Run runs a SchedulerProfile. It invokes all the SchedulerProfile plugins for the given request in this
 // order - Filters, Scorers, Picker. After completing all, it returns the result.
 func (p *SchedulerProfile) Run(ctx context.Context, request *fwksched.InferenceRequest, candidateEndpoints []fwksched.Endpoint) (*fwksched.ProfileRunResult, error) {
-	endpoints := p.runFilterPlugins(ctx, request, candidateEndpoints)
+	endpoints := p.FilterCandidates(ctx, request, candidateEndpoints)
 	if len(endpoints) == 0 {
 		return nil, errcommon.Error{
 			Code:    errcommon.ServiceUnavailable,
@@ -439,4 +439,8 @@ func enforceScoreRange(score float64) float64 {
 		return 1
 	}
 	return score
+}
+
+func (p *SchedulerProfile) FilterCandidates(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
+	return p.runFilterPlugins(ctx, request, endpoints)
 }

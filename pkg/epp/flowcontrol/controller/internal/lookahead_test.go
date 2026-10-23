@@ -89,7 +89,8 @@ func TestLookaheadPreservesSkippedRequests(t *testing.T) {
 	}
 	prefill = 0.2
 	require.True(t, h.processor.dispatchCycle(context.Background()))
-	require.Equal(t, []int{1, 0, 1}, commits)
+	require.Equal(t, []int{0, 0, 1}, commits)
+	require.NotNil(t, items[0].FinalState())
 	require.Same(t, items[1], q.Peek())
 }
 
@@ -112,7 +113,24 @@ func TestLookaheadAcrossFlows(t *testing.T) {
 			h.PriorityBandAccessorFunc = func(priority int) (flowcontrol.PriorityBandAccessor, error) {
 				band, err := h.priorityBandAccessor(priority)
 				if err == nil {
-					band.(*fwkfcmocks.MockPriorityBandAccessor).PolicyStateV = state
+					mockBand := band.(*fwkfcmocks.MockPriorityBandAccessor)
+					mockBand.PolicyStateV = state
+					mockBand.FlowKeysFunc = func() []flowcontrol.FlowKey {
+						var keys []flowcontrol.FlowKey
+						band.IterateQueues(func(q flowcontrol.FlowQueueAccessor) bool { keys = append(keys, q.FlowKey()); return true })
+						return keys
+					}
+					mockBand.QueueFunc = func(id string) flowcontrol.FlowQueueAccessor {
+						var found flowcontrol.FlowQueueAccessor
+						band.IterateQueues(func(q flowcontrol.FlowQueueAccessor) bool {
+							if q.FlowKey().ID == id {
+								found = q
+								return false
+							}
+							return true
+						})
+						return found
+					}
 				}
 				return band, err
 			}
@@ -162,16 +180,33 @@ func TestLookaheadGlobalOrderingUsesEligibleCandidates(t *testing.T) {
 
 func TestLookaheadSkipsExpiredAndCancelledItems(t *testing.T) {
 	h := newTestHarness(t, testCleanupTick)
+	h.endpointCandidates.Candidates = []fwkdl.Endpoint{
+		fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{Labels: map[string]string{bylabel.RoleLabel: bylabel.RolePrefill}}, nil),
+		fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{Labels: map[string]string{bylabel.RoleLabel: bylabel.RoleDecode}}, nil),
+	}
+	h.saturationDetector.SaturationFunc = func(ctx context.Context, _ []fwkdl.Endpoint) float64 {
+		if flowcontrol.SaturationStageFromContext(ctx) == flowcontrol.SaturationStagePrefill {
+			return 1.2
+		}
+		return 0.2
+	}
+	makeItem := func(id string, ttl time.Duration) *FlowItem {
+		item := h.newTestItem(id, testFlow, ttl)
+		item.originalRequest = &preparedRequest{FlowControlRequest: item.OriginalRequest(), prepare: func(context.Context) (*flowcontrol.DispatchPlan, error) {
+			return &flowcontrol.DispatchPlan{Stages: []string{flowcontrol.SaturationStageDecode}}, nil
+		}}
+		return item
+	}
 	q := h.addQueue(testFlow)
 	q.OrderingPolicyFunc = func() flowcontrol.OrderingPolicy { return lookaheadOrdering{} }
-	expired := h.newTestItem("expired", testFlow, time.Millisecond)
+	expired := makeItem("expired", time.Millisecond)
 	require.NoError(t, q.Add(expired))
 	h.clock.Step(2 * time.Millisecond)
-	cancelled := h.newTestItem("cancelled", testFlow, testTTL)
+	cancelled := makeItem("cancelled", testTTL)
 	require.NoError(t, q.Add(cancelled))
 	cancelled.Finalize(context.Canceled)
 	h.clock.Step(time.Millisecond)
-	ready := h.newTestItem("ready", testFlow, testTTL)
+	ready := makeItem("ready", testTTL)
 	require.NoError(t, q.Add(ready))
 	require.True(t, h.processor.dispatchCycle(context.Background()))
 	require.NotNil(t, ready.FinalState())
@@ -221,4 +256,20 @@ func TestLookaheadBudgetIsSharedAcrossBands(t *testing.T) {
 	require.False(t, h.processor.dispatchCycle(context.Background()))
 	require.Equal(t, maxLookaheadCandidates, probes)
 	require.Nil(t, last.FinalState())
+}
+
+func TestHealthySelectionDoesNotConsumeLookaheadBudget(t *testing.T) {
+	h := newTestHarness(t, testCleanupTick)
+	item := h.newTestItem("ordinary", testFlow, testTTL)
+	require.NoError(t, h.addQueue(testFlow).Add(item))
+	band, err := h.priorityBandAccessor(testFlow.Priority)
+	require.NoError(t, err)
+	remaining := maxLookaheadCandidates
+	signals := map[string]float64{"": 0.2, flowcontrol.SaturationStageDecode: 0.2, flowcontrol.SaturationStagePrefill: 0.2}
+	limits := map[string][]float64{"": {1}, flowcontrol.SaturationStageDecode: {1}, flowcontrol.SaturationStagePrefill: {1}}
+	got, plan, err := h.processor.selectPreparedItem(t.Context(), band, 0, &remaining, signals, limits)
+	require.NoError(t, err)
+	require.Same(t, item, got)
+	require.Nil(t, plan)
+	require.Equal(t, maxLookaheadCandidates, remaining)
 }

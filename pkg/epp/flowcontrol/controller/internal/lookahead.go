@@ -68,6 +68,15 @@ func (b *eligibleBand) IterateQueues(visit func(flowcontrol.FlowQueueAccessor) b
 func (p *Processor) selectPreparedItem(ctx context.Context, band flowcontrol.PriorityBandAccessor,
 	priorityIndex int, remaining *int, saturation map[string]float64, ceilings map[string][]float64,
 ) (flowcontrol.QueueItemAccessor, *flowcontrol.DispatchPlan, error) {
+	if saturation[""] < ceilings[""][priorityIndex] {
+		item, err := p.selectItem(ctx, band)
+		if err != nil || item == nil {
+			return nil, nil, err
+		}
+		if !hasDispatchPreparation(item) || (saturation[flowcontrol.SaturationStagePrefill] < ceilings[flowcontrol.SaturationStagePrefill][priorityIndex] && saturation[flowcontrol.SaturationStageDecode] < ceilings[flowcontrol.SaturationStageDecode][priorityIndex]) {
+			return item, nil, nil
+		}
+	}
 	view := &eligibleBand{PriorityBandAccessor: band, byID: make(map[string]*dispatchCandidate)}
 	band.IterateQueues(func(queue flowcontrol.FlowQueueAccessor) bool {
 		if ctx.Err() != nil || *remaining == 0 {
@@ -84,6 +93,9 @@ func (p *Processor) selectPreparedItem(ctx context.Context, band flowcontrol.Pri
 		plan, eligible := p.prepareItem(ctx, first, priorityIndex, saturation, ceilings)
 		candidate := &dispatchCandidate{FlowQueueAccessor: queue, item: first, plan: plan}
 		if !eligible {
+			if !hasDispatchPreparation(first) {
+				return true
+			}
 			snapshotter, ok := queue.(flowcontrol.QueueCandidates)
 			if !ok {
 				return true
@@ -120,4 +132,9 @@ func (p *Processor) selectPreparedItem(ctx context.Context, band flowcontrol.Pri
 		return nil, nil, nil
 	}
 	return item, candidate.plan, nil
+}
+
+func hasDispatchPreparation(item flowcontrol.QueueItemAccessor) bool {
+	preparer, ok := item.OriginalRequest().(flowcontrol.DispatchPreparer)
+	return ok && preparer.DispatchPreparation() != nil
 }

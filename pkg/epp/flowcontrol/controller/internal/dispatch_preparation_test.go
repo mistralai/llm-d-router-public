@@ -78,7 +78,7 @@ func TestDispatchPreparationStageGating(t *testing.T) {
 			handle := item.Handle()
 			enqueued := item.EnqueueTime()
 			require.Equal(t, tc.dispatch, h.processor.dispatchCycle(context.Background()))
-			require.Equal(t, tc.dispatch, committed)
+			require.Equal(t, tc.dispatch && tc.prefill >= 1, committed)
 			if !tc.dispatch {
 				require.Nil(t, item.FinalState())
 				require.Same(t, handle, item.Handle())
@@ -156,4 +156,50 @@ func TestDispatchPreparationSharedReservation(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, dispatched)
 	require.Equal(t, []string{flowcontrol.SaturationStageDecode, flowcontrol.SaturationStagePrefill}, detector.stages)
+}
+
+func TestHealthyPDAdmissionDoesNotPrepare(t *testing.T) {
+	h := newTestHarness(t, testCleanupTick)
+	h.endpointCandidates.Candidates = []fwkdl.Endpoint{
+		fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{Labels: map[string]string{bylabel.RoleLabel: bylabel.RolePrefill}}, nil),
+		fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{Labels: map[string]string{bylabel.RoleLabel: bylabel.RoleDecode}}, nil),
+	}
+	preparations := 0
+	req := &preparedRequest{FlowControlRequest: fwkfcmocks.NewMockFlowControlRequest(100, "healthy", testFlow)}
+	req.prepare = func(context.Context) (*flowcontrol.DispatchPlan, error) {
+		preparations++
+		return &flowcontrol.DispatchPlan{Stages: []string{flowcontrol.SaturationStageDecode}}, nil
+	}
+	item := NewItem(req, testTTL, h.clock.Now(), logr.Discard())
+	require.NoError(t, h.addQueue(testFlow).Add(item))
+	require.True(t, h.processor.dispatchCycle(context.Background()))
+	require.Zero(t, preparations)
+}
+
+func TestDispatchCompletionFailureLeavesItemQueued(t *testing.T) {
+	h := newTestHarness(t, testCleanupTick)
+	item := h.newTestItem("retry", testFlow, testTTL)
+	q := h.addQueue(testFlow)
+	require.NoError(t, q.Add(item))
+	handle := item.Handle()
+	committed := false
+	dispatched, err := h.processor.dispatchPreparedItem(item, &flowcontrol.DispatchPlan{
+		Complete: func() (bool, error) { return false, nil }, Commit: func() { committed = true },
+	})
+	require.NoError(t, err)
+	require.False(t, dispatched)
+	require.False(t, committed)
+	require.Nil(t, item.FinalState())
+	require.Same(t, handle, item.Handle())
+	require.Equal(t, 1, q.Len())
+}
+
+func TestDispatchCompletionPreservesCancellationCause(t *testing.T) {
+	h := newTestHarness(t, testCleanupTick)
+	item := h.newTestItem("cancel-completion", testFlow, testTTL)
+	require.NoError(t, h.addQueue(testFlow).Add(item))
+	dispatched, err := h.processor.dispatchPreparedItem(item, &flowcontrol.DispatchPlan{Complete: func() (bool, error) { return false, context.Canceled }})
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, dispatched)
+	require.ErrorIs(t, item.FinalState().Err, types.ErrContextCancelled)
 }

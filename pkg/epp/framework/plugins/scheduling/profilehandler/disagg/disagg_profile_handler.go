@@ -647,7 +647,8 @@ func (h *Handler) PreRequest(ctx context.Context, request *scheduling.InferenceR
 }
 
 func (h *Handler) SupportsDispatchPreparation() bool {
-	return h.stageOrder == StageOrderDecodeFirst && h.pdDecider != nil && h.encodeDecider == nil
+	_, prefixBased := h.pdDecider.(*PrefixBasedPDDecider)
+	return h.stageOrder == StageOrderDecodeFirst && prefixBased && h.encodeDecider == nil
 }
 
 func (h *Handler) DispatchUsesPrefill(request *scheduling.InferenceRequest, result *scheduling.SchedulingResult) bool {
@@ -660,4 +661,16 @@ func (h *Handler) DispatchUsesPrefill(request *scheduling.InferenceRequest, resu
 		return !found || decision.err != nil || decision.needs
 	}
 	return false
+}
+
+func (h *Handler) DecodeProfileName() string { return h.decodeProfile }
+
+func (h *Handler) CanDecodeLocally(ctx context.Context, request *scheduling.InferenceRequest, endpoint scheduling.Endpoint) bool {
+	decider, ok := h.pdDecider.(*PrefixBasedPDDecider)
+	if !ok {
+		return false
+	}
+	// A probe can inspect several endpoints. Its result must not enter the request-wide decision memo.
+	needs, err := decider.computeNeedsRemotePrefill(ctx, request, endpoint)
+	return err == nil && !needs
 }

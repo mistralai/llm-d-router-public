@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"sync"
 
 	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
@@ -29,8 +30,8 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/handlers"
 )
 
-// Concurrent probes must not create one producer worker for every queued request.
-const maxConcurrentDispatchPreparations = 32
+// Slots cover running probes and completed results that the dispatcher has not consumed.
+const maxPendingDispatchPreparations = 32
 
 type preparedAdmissionController interface {
 	AdmitPrepared(context.Context, *handlers.RequestContext, int, flowcontrol.PrepareDispatchFunc) error
@@ -38,7 +39,9 @@ type preparedAdmissionController interface {
 
 type dispatchScheduler interface {
 	Scheduler
-	fwksched.DispatchProfileHandler
+	SupportsDispatchPreparation() bool
+	DispatchUsesPrefill(*fwksched.InferenceRequest, *fwksched.SchedulingResult) bool
+	ProbeDecodeLocal(context.Context, *fwksched.InferenceRequest, []fwksched.Endpoint) (fwksched.Endpoint, error)
 }
 
 type preparedScheduling struct {
@@ -55,21 +58,23 @@ type preparationResult struct {
 	tokenized         *fwksched.TokenizedRequest
 }
 
+type pendingPreparation struct {
+	result  chan preparationResult
+	release func()
+}
+
 func (d *Director) supportsDispatchPreparation() bool {
 	scheduler, ok := d.scheduler.(dispatchScheduler)
-	if !ok {
-		return false
-	}
-	return scheduler.SupportsDispatchPreparation()
+	return ok && scheduler.SupportsDispatchPreparation()
 }
 
 func (d *Director) newDispatchPreparation(ctx context.Context, reqCtx *handlers.RequestContext, commit func(*preparedScheduling)) flowcontrol.PrepareDispatchFunc {
-	d.dispatchPreparationOnce.Do(func() { d.dispatchPreparationSlots = make(chan struct{}, maxConcurrentDispatchPreparations) })
+	d.dispatchPreparationOnce.Do(func() { d.dispatchPreparationSlots = make(chan struct{}, maxPendingDispatchPreparations) })
 	base := reqCtx.SchedulingRequest
 	metadata := reqCtx.Request.Metadata
 	scheduler := d.scheduler.(dispatchScheduler)
 	// Only the dispatch goroutine accesses pending. Each worker owns its request and endpoint snapshots.
-	var pending chan preparationResult
+	var pending *pendingPreparation
 	var tokenized *fwksched.TokenizedRequest
 	return func(processorCtx context.Context) (*flowcontrol.DispatchPlan, error) {
 		if ctx.Err() != nil {
@@ -77,7 +82,8 @@ func (d *Director) newDispatchPreparation(ctx context.Context, reqCtx *handlers.
 		}
 		if pending != nil {
 			select {
-			case result := <-pending:
+			case result := <-pending.result:
+				pending.release()
 				pending = nil
 				if result.err != nil {
 					return nil, result.err
@@ -85,17 +91,14 @@ func (d *Director) newDispatchPreparation(ctx context.Context, reqCtx *handlers.
 				if result.tokenized != nil {
 					tokenized = result.tokenized
 				}
-				if result.prepared == nil && len(result.stages) == 0 {
+				if result.prepared == nil || !d.endpointsAvailable(ctx, metadata, result.prepared.endpoints) {
 					return nil, nil
 				}
-				if result.prepared != nil && !d.placementAvailable(ctx, metadata, result.prepared.result) {
-					return nil, nil
-				}
-				return &flowcontrol.DispatchPlan{Stages: result.stages, ReservationStages: result.reservationStages, Commit: func() {
-					if result.prepared != nil {
-						commit(result.prepared)
-					}
-				}}, nil
+				return &flowcontrol.DispatchPlan{
+					Stages: result.stages, ReservationStages: result.reservationStages,
+					Complete: func() (bool, error) { return d.completeDispatch(ctx, scheduler, metadata, result.prepared) },
+					Commit:   func() { commit(result.prepared) },
+				}, nil
 			default:
 				return nil, nil
 			}
@@ -105,20 +108,25 @@ func (d *Director) newDispatchPreparation(ctx context.Context, reqCtx *handlers.
 		default:
 			return nil, nil
 		}
+		var once sync.Once
+		release := func() { once.Do(func() { <-d.dispatchPreparationSlots }) }
+		stopRequest := context.AfterFunc(ctx, release)
+		stopProcessor := context.AfterFunc(processorCtx, release)
+		pending = &pendingPreparation{result: make(chan preparationResult, 1), release: func() { stopRequest(); stopProcessor(); release() }}
+		resultCh := pending.result
 		request := copyDispatchRequest(base)
 		if request.Body != nil && tokenized != nil {
 			request.Body.TokenizedRequest = tokenized
 		}
-		pending = make(chan preparationResult, 1)
-		resultCh := pending
 		attemptCtx, cancel := context.WithCancel(ctx)
 		stop := context.AfterFunc(processorCtx, cancel)
 		go func() {
-			defer func() { <-d.dispatchPreparationSlots }()
 			defer cancel()
 			defer stop()
 			result := d.prepareScheduling(attemptCtx, scheduler, request, metadata)
-			resultCh <- result
+			if ctx.Err() == nil && processorCtx.Err() == nil {
+				resultCh <- result
+			}
 		}()
 		return nil, nil
 	}
@@ -126,9 +134,8 @@ func (d *Director) newDispatchPreparation(ctx context.Context, reqCtx *handlers.
 
 func copyDispatchRequest(base *fwksched.InferenceRequest) *fwksched.InferenceRequest {
 	request := &fwksched.InferenceRequest{
-		RequestID: base.RequestID, TargetModel: base.TargetModel,
-		Headers: maps.Clone(base.Headers), Objectives: base.Objectives,
-		FairnessID: base.FairnessID, RequestSizeBytes: base.RequestSizeBytes,
+		RequestID: base.RequestID, TargetModel: base.TargetModel, Headers: maps.Clone(base.Headers),
+		Objectives: base.Objectives, FairnessID: base.FairnessID, RequestSizeBytes: base.RequestSizeBytes,
 	}
 	if base.Body != nil {
 		body := *base.Body
@@ -149,37 +156,25 @@ func (d *Director) prepareScheduling(ctx context.Context, scheduler dispatchSche
 		return preparationResult{}
 	}
 	if err := d.runDataProducerPlugins(ctx, request, endpoints); err != nil {
-		if ctx.Err() != nil {
-			return preparationResult{err: ctx.Err()}
-		}
-		// Failed preparation uses conservative admission and the director's ordinary producer error handling.
-		return preparationResult{stages: []string{flowcontrol.SaturationStageDecode, flowcontrol.SaturationStagePrefill}}
+		// Missing data cannot authorize a prefill bypass. Ordinary admission retains its own error handling.
+		return preparationResult{}
 	}
 	prepared := preparationResult{}
 	if request.Body != nil {
 		prepared.tokenized = request.Body.TokenizedRequest
 	}
-	result, err := scheduler.Schedule(ctx, request, endpoints)
+	endpoint, err := scheduler.ProbeDecodeLocal(ctx, request, endpoints)
 	if err != nil {
-		var typed errcommon.Error
-		if errors.As(err, &typed) && (typed.Code == errcommon.ServiceUnavailable || typed.Code == errcommon.ResourceExhausted) {
-			return prepared
-		}
-		if errors.As(err, &typed) {
-			prepared.err = err
-		} else {
-			prepared.err = errcommon.Error{Code: errcommon.ResourceExhausted, Msg: err.Error()}
-		}
+		prepared.err = err
 		return prepared
 	}
-	stages := []string{flowcontrol.SaturationStageDecode}
-	if scheduler.DispatchUsesPrefill(request, result) {
-		stages = append(stages, flowcontrol.SaturationStagePrefill)
+	if endpoint == nil {
+		return prepared
 	}
-	prepared.prepared = &preparedScheduling{request: request, endpoints: endpoints, result: result}
-	prepared.stages = stages
-	if endpoint := result.PrimaryEndpoint(); endpoint != nil && endpoint.GetMetadata() != nil {
-		switch endpoint.GetMetadata().Labels[bylabel.RoleLabel] {
+	prepared.prepared = &preparedScheduling{request: request, endpoints: []fwksched.Endpoint{endpoint}}
+	prepared.stages = []string{flowcontrol.SaturationStageDecode}
+	if meta := endpoint.GetMetadata(); meta != nil {
+		switch meta.Labels[bylabel.RoleLabel] {
 		case bylabel.RolePrefillDecode, bylabel.RoleEncodePrefillDecode:
 			prepared.reservationStages = []string{flowcontrol.SaturationStageDecode, flowcontrol.SaturationStagePrefill}
 		}
@@ -187,32 +182,57 @@ func (d *Director) prepareScheduling(ctx context.Context, scheduler dispatchSche
 	return prepared
 }
 
-// Admission can wait across several policy cycles. Confirm that selected destinations still exist before publication.
-func (d *Director) placementAvailable(ctx context.Context, metadata map[string]any, result *fwksched.SchedulingResult) bool {
-	candidates := d.endpointCandidates.Locate(ctx, metadata)
-	for _, profile := range result.ProfileResults {
-		if profile == nil {
-			continue
+func (d *Director) completeDispatch(ctx context.Context, scheduler dispatchScheduler, metadata map[string]any, prepared *preparedScheduling) (bool, error) {
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	if !d.endpointsAvailable(ctx, metadata, prepared.endpoints) {
+		return false, nil
+	}
+	result, err := scheduler.Schedule(ctx, prepared.request, prepared.endpoints)
+	if err != nil {
+		var typed errcommon.Error
+		if errors.As(err, &typed) && (typed.Code == errcommon.ServiceUnavailable || typed.Code == errcommon.ResourceExhausted) {
+			return false, nil
 		}
-		for _, selected := range profile.TargetEndpoints {
-			if selected == nil || selected.GetMetadata() == nil {
-				return false
+		return false, err
+	}
+	if result.PrimaryEndpoint() == nil || scheduler.DispatchUsesPrefill(prepared.request, result) {
+		return false, nil
+	}
+	// The full schedule must use the decoder whose cache state authorized the bypass.
+	if result.PrimaryEndpoint().GetMetadata() == nil || !sameDestination(result.PrimaryEndpoint(), prepared.endpoints[0]) {
+		return false, nil
+	}
+	prepared.result = result
+	return true, nil
+}
+
+func sameDestination(a, b fwksched.Endpoint) bool {
+	am, bm := a.GetMetadata(), b.GetMetadata()
+	return am != nil && bm != nil && am.ID == bm.ID && am.Address == bm.Address && am.Port == bm.Port
+}
+
+func (d *Director) endpointsAvailable(ctx context.Context, metadata map[string]any, selected []fwksched.Endpoint) bool {
+	candidates := d.endpointCandidates.Locate(ctx, metadata)
+	for _, endpoint := range selected {
+		if endpoint == nil || endpoint.GetMetadata() == nil {
+			return false
+		}
+		wanted := endpoint.GetMetadata()
+		found := false
+		for _, candidate := range candidates {
+			if candidate == nil || candidate.GetMetadata() == nil {
+				continue
 			}
-			wanted := selected.GetMetadata()
-			found := false
-			for _, candidate := range candidates {
-				if candidate == nil || candidate.GetMetadata() == nil {
-					continue
-				}
-				current := candidate.GetMetadata()
-				if current.ID == wanted.ID && current.Address == wanted.Address && current.Port == wanted.Port {
-					found = true
-					break
-				}
+			current := candidate.GetMetadata()
+			if current.ID == wanted.ID && current.Address == wanted.Address && current.Port == wanted.Port {
+				found = true
+				break
 			}
-			if !found {
-				return false
-			}
+		}
+		if !found {
+			return false
 		}
 	}
 	return true

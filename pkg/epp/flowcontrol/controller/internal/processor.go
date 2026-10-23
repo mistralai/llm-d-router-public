@@ -569,11 +569,17 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 		if err != nil {
 			p.logger.Error(err, "Failed to dispatch item, skipping priority band for this cycle",
 				"flowKey", req.FlowKey(), "requestID", req.ID())
+			if plan != nil && plan.Complete != nil {
+				return false
+			}
 			continue // Continue to the next band to maximize work conservation.
 		}
 		if dispatched {
 			p.bandSelectionPolicy.RecordDispatch(ctx, priority)
 			return true
+		}
+		if plan != nil && plan.Complete != nil {
+			return false
 		}
 	}
 
@@ -680,6 +686,21 @@ func (p *Processor) dispatchItem(item flowcontrol.QueueItemAccessor) error {
 }
 
 func (p *Processor) dispatchPreparedItem(itemAcc flowcontrol.QueueItemAccessor, plan *flowcontrol.DispatchPlan) (bool, error) {
+	if item, ok := itemAcc.(*FlowItem); ok && !p.itemLive(item) {
+		return false, nil
+	}
+	if plan != nil && plan.Complete != nil {
+		ready, err := plan.Complete()
+		if err != nil {
+			if item, ok := itemAcc.(*FlowItem); ok {
+				item.Finalize(err)
+			}
+			return false, err
+		}
+		if !ready {
+			return false, nil
+		}
+	}
 	req := itemAcc.OriginalRequest()
 	managedQ, err := p.registry.ManagedQueue(req.FlowKey())
 	if err != nil {
@@ -741,6 +762,9 @@ func (p *Processor) prepareItem(ctx context.Context, item flowcontrol.QueueItemA
 	}
 	if saturation[flowcontrol.SaturationStageDecode] >= ceilings[flowcontrol.SaturationStageDecode][band] {
 		return nil, false
+	}
+	if saturation[flowcontrol.SaturationStagePrefill] < ceilings[flowcontrol.SaturationStagePrefill][band] {
+		return nil, saturation[""] < ceilings[""][band]
 	}
 	plan, err := preparer.DispatchPreparation()(ctx)
 	if err != nil {

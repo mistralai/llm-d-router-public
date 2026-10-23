@@ -919,3 +919,14 @@ func TestDispatchUsesPrefillRequiresReadableCache(t *testing.T) {
 	result := &scheduling.SchedulingResult{ProfileResults: map[string]*scheduling.ProfileRunResult{defaultDecodeProfile: {TargetEndpoints: []scheduling.Endpoint{endpoint}}}}
 	require.True(t, handler.DispatchUsesPrefill(request, result))
 }
+
+func TestDecodeLocalProbeDoesNotMemoizeAcrossEndpoints(t *testing.T) {
+	decider, err := NewPrefixBasedPDDecider(PrefixBasedPDDeciderConfig{NonCachedTokens: 4})
+	require.NoError(t, err)
+	handler := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "", decider, nil)
+	request := withTokens(makeRequestWithTokens(10), 10)
+	require.False(t, handler.CanDecodeLocally(t.Context(), request, makeTestEndpoint(0)))
+	require.True(t, handler.CanDecodeLocally(t.Context(), request, makeTestEndpoint(10)))
+	_, memoized := request.GetAttribute(remotePrefillDecisionAttributeKey)
+	require.False(t, memoized)
+}
