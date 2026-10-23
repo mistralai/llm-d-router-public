@@ -244,9 +244,12 @@ func (a *flowQueueAccessor) ByteSize() uint64                           { return
 func (a *flowQueueAccessor) OrderingPolicy() flowcontrol.OrderingPolicy { return a.mq.policy }
 func (a *flowQueueAccessor) FlowKey() flowcontrol.FlowKey               { return a.mq.key }
 
-func (a *flowQueueAccessor) OrderedSnapshot() []flowcontrol.QueueItemAccessor {
-	if queue, ok := a.mq.queue.(flowcontrol.QueueSnapshotter); ok {
-		return queue.OrderedSnapshot()
+func (a *flowQueueAccessor) Candidates(limit int) []flowcontrol.QueueItemAccessor {
+	if limit <= 0 {
+		return nil
+	}
+	if queue, ok := a.mq.queue.(flowcontrol.QueueCandidates); ok {
+		return queue.Candidates(limit)
 	}
 	if item := a.Peek(); item != nil {
 		return []flowcontrol.QueueItemAccessor{item}

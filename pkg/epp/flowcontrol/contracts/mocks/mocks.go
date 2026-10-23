@@ -361,7 +361,7 @@ func (m *MockManagedQueue) ByteSize() uint64 {
 // Peek returns the first item found in the mock queue. Note: map iteration order is not guaranteed.
 func (m *MockManagedQueue) Peek() flowcontrol.QueueItemAccessor {
 	if m.OrderingPolicyFunc != nil {
-		items := m.OrderedSnapshot()
+		items := m.Candidates(1)
 		if len(items) == 0 {
 			return nil
 		}
@@ -376,7 +376,10 @@ func (m *MockManagedQueue) Peek() flowcontrol.QueueItemAccessor {
 	return nil // Queue is empty
 }
 
-func (m *MockManagedQueue) OrderedSnapshot() []flowcontrol.QueueItemAccessor {
+func (m *MockManagedQueue) Candidates(limit int) []flowcontrol.QueueItemAccessor {
+	if limit <= 0 {
+		return nil
+	}
 	m.mu.Lock()
 	m.init()
 	items := make([]flowcontrol.QueueItemAccessor, 0, len(m.items))
@@ -396,5 +399,5 @@ func (m *MockManagedQueue) OrderedSnapshot() []flowcontrol.QueueItemAccessor {
 			return 0
 		})
 	}
-	return items
+	return items[:min(limit, len(items))]
 }

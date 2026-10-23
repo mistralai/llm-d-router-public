@@ -19,7 +19,6 @@ package queue
 
 import (
 	"container/heap"
-	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -257,23 +256,50 @@ func (pq *priorityQueue) Drain() []flowcontrol.QueueItemAccessor {
 	return drainedItems
 }
 
-// OrderedSnapshot sorts outside the lock so dispatch probes cannot delay cancellation or expiry removal.
-func (pq *priorityQueue) OrderedSnapshot() []flowcontrol.QueueItemAccessor {
+// Candidates keeps heap indices under the read lock because queue mutations can move them.
+func (pq *priorityQueue) Candidates(limit int) []flowcontrol.QueueItemAccessor {
 	pq.mu.RLock()
-	items := make([]flowcontrol.QueueItemAccessor, len(pq.heap.items))
-	for i, entry := range pq.heap.items {
-		items[i] = entry.item
+	defer pq.mu.RUnlock()
+	limit = min(limit, len(pq.heap.items))
+	if limit <= 0 {
+		return nil
 	}
-	policy := pq.heap.policy
-	pq.mu.RUnlock()
-	slices.SortStableFunc(items, func(a, b flowcontrol.QueueItemAccessor) int {
-		if policy.Less(a, b) {
-			return -1
+	candidates := make([]flowcontrol.QueueItemAccessor, 0, limit)
+	frontier := &candidateHeap{queue: pq.heap, indices: make([]int, 1, limit+1)}
+	for len(candidates) < limit {
+		index := heap.Pop(frontier).(int)
+		candidates = append(candidates, pq.heap.items[index].item)
+		if len(candidates) == limit {
+			break
 		}
-		if policy.Less(b, a) {
-			return 1
+		for child := 2*index + 1; child <= 2*index+2 && child < len(pq.heap.items); child++ {
+			heap.Push(frontier, child)
 		}
-		return 0
-	})
-	return items
+	}
+	return candidates
+}
+
+type candidateHeap struct {
+	queue   *itemHeap
+	indices []int
+}
+
+func (h candidateHeap) Len() int { return len(h.indices) }
+func (h candidateHeap) Less(i, j int) bool {
+	a, b := h.indices[i], h.indices[j]
+	if h.queue.Less(a, b) {
+		return true
+	}
+	if h.queue.Less(b, a) {
+		return false
+	}
+	return a < b
+}
+func (h candidateHeap) Swap(i, j int)   { h.indices[i], h.indices[j] = h.indices[j], h.indices[i] }
+func (h *candidateHeap) Push(value any) { h.indices = append(h.indices, value.(int)) }
+func (h *candidateHeap) Pop() any {
+	last := len(h.indices) - 1
+	value := h.indices[last]
+	h.indices = h.indices[:last]
+	return value
 }

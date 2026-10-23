@@ -23,6 +23,9 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 )
 
+// A bounded scan can leave a runnable request beyond the inspected prefix queued.
+const maxLookaheadCandidates = 32
+
 type dispatchCandidate struct {
 	flowcontrol.FlowQueueAccessor
 	item flowcontrol.QueueItemAccessor
@@ -63,11 +66,11 @@ func (b *eligibleBand) IterateQueues(visit func(flowcontrol.FlowQueueAccessor) b
 }
 
 func (p *Processor) selectPreparedItem(ctx context.Context, band flowcontrol.PriorityBandAccessor,
-	priorityIndex int, saturation map[string]float64, ceilings map[string][]float64,
+	priorityIndex int, remaining *int, saturation map[string]float64, ceilings map[string][]float64,
 ) (flowcontrol.QueueItemAccessor, *flowcontrol.DispatchPlan, error) {
 	view := &eligibleBand{PriorityBandAccessor: band, byID: make(map[string]*dispatchCandidate)}
 	band.IterateQueues(func(queue flowcontrol.FlowQueueAccessor) bool {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || *remaining == 0 {
 			return false
 		}
 		if queue == nil {
@@ -77,22 +80,24 @@ func (p *Processor) selectPreparedItem(ctx context.Context, band flowcontrol.Pri
 		if first == nil {
 			return true
 		}
+		*remaining--
 		plan, eligible := p.prepareItem(ctx, first, priorityIndex, saturation, ceilings)
 		candidate := &dispatchCandidate{FlowQueueAccessor: queue, item: first, plan: plan}
 		if !eligible {
-			snapshotter, ok := queue.(flowcontrol.QueueSnapshotter)
+			snapshotter, ok := queue.(flowcontrol.QueueCandidates)
 			if !ok {
 				return true
 			}
 			candidate = nil
-			for _, item := range snapshotter.OrderedSnapshot() {
-				if ctx.Err() != nil {
+			for _, item := range snapshotter.Candidates(*remaining + 1) {
+				if ctx.Err() != nil || *remaining == 0 {
 					return false
 				}
 				// The first item was already probed. Probing it twice could consume two different placement attempts.
 				if item == first {
 					continue
 				}
+				*remaining--
 				plan, eligible := p.prepareItem(ctx, item, priorityIndex, saturation, ceilings)
 				if eligible {
 					candidate = &dispatchCandidate{FlowQueueAccessor: queue, item: item, plan: plan}

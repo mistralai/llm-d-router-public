@@ -31,8 +31,8 @@ type QueueInspectionMethods interface {
 	Peek() QueueItemAccessor
 }
 
-// QueueSnapshotter exposes policy-ordered candidates without removing them.
+// QueueCandidates exposes a bounded, policy-ordered view without removing items.
 // Items and handles remain owned by the queue. A concurrent removal can make a snapshot entry stale.
-type QueueSnapshotter interface {
-	OrderedSnapshot() []QueueItemAccessor
+type QueueCandidates interface {
+	Candidates(limit int) []QueueItemAccessor
 }

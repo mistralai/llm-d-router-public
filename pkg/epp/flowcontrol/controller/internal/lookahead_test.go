@@ -19,6 +19,7 @@ package internal
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -183,4 +184,41 @@ func TestLookaheadSkipsExpiredAndCancelledItems(t *testing.T) {
 
 func pendingPreparation(context.Context) (*flowcontrol.DispatchPlan, error) {
 	return nil, nil //nolint:nilnil // A nil plan represents pending preparation.
+}
+
+func TestLookaheadBudgetIsSharedAcrossBands(t *testing.T) {
+	h := newTestHarness(t, testCleanupTick)
+	h.endpointCandidates.Candidates = []fwkdl.Endpoint{
+		fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{Labels: map[string]string{bylabel.RoleLabel: bylabel.RolePrefill}}, nil),
+		fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{Labels: map[string]string{bylabel.RoleLabel: bylabel.RoleDecode}}, nil),
+	}
+	h.saturationDetector.SaturationFunc = func(ctx context.Context, _ []fwkdl.Endpoint) float64 {
+		if flowcontrol.SaturationStageFromContext(ctx) == flowcontrol.SaturationStagePrefill {
+			return 1.2
+		}
+		return 0.2
+	}
+	probes := 0
+	var last *FlowItem
+	for band := range 2 {
+		key := flowcontrol.FlowKey{ID: strconv.Itoa(band), Priority: 10 - band}
+		q := h.addQueue(key)
+		q.OrderingPolicyFunc = func() flowcontrol.OrderingPolicy { return lookaheadOrdering{} }
+		for i := range 20 {
+			req := &preparedRequest{FlowControlRequest: fwkfcmocks.NewMockFlowControlRequest(100, strconv.Itoa(band*20+i), key)}
+			req.prepare = func(context.Context) (*flowcontrol.DispatchPlan, error) {
+				probes++
+				if band == 1 && i == 19 {
+					return &flowcontrol.DispatchPlan{Stages: []string{flowcontrol.SaturationStageDecode}}, nil
+				}
+				return nil, nil //nolint:nilnil // A nil plan keeps the request queued.
+			}
+			last = NewItem(req, testTTL, h.clock.Now(), logr.Discard())
+			require.NoError(t, q.Add(last))
+			h.clock.Step(time.Millisecond)
+		}
+	}
+	require.False(t, h.processor.dispatchCycle(context.Background()))
+	require.Equal(t, maxLookaheadCandidates, probes)
+	require.Nil(t, last.FinalState())
 }

@@ -84,9 +84,9 @@ Within each flow, dispatch inspects requests in the configured ordering policy u
 The fairness policy selects among these eligible flow candidates. Skipped requests remain queued with their original
 timestamps, TTLs, handles, and capacity charges. Snapshot inspection does not remove or re-enqueue them.
 
-Lookahead has no fixed request-count cutoff. Its worst case scans every queued request and sorts each blocked flow's
-snapshot. Placement preparation has bounded concurrency, and a slow producer does not block the dispatch loop.
-Custom queues without `QueueSnapshotter` expose only their first request.
+Lookahead examines at most 32 candidates per dispatch cycle across priority bands and flows. Requests beyond that
+budget can remain queued even when they could run. Heap traversal copies only the bounded candidate set and does
+not sort the entire queue. Custom queues without `QueueCandidates` expose only their first request.
 
 Retries refresh endpoint and prefix-cache snapshots. Tokenization is reused after successful production.
 Unavailable cache data cannot authorize a prefill-capacity bypass. Prefill-first scheduling, encode disaggregation,

@@ -488,12 +488,12 @@ func TestPriorityQueue_ByteSize_BookedAtAdd(t *testing.T) {
 	})
 }
 
-func TestOrderedSnapshotPreservesQueue(t *testing.T) {
+func TestCandidatesPreservesQueue(t *testing.T) {
 	q := newPriorityQueue(byteSizePolicy)
 	for _, size := range []uint64{100, 20, 80, 30, 60} {
 		q.Add(itemAt(size, strconv.FormatUint(size, 10), time.Now()))
 	}
-	items := q.OrderedSnapshot()
+	items := q.Candidates(32)
 	sizes := make([]uint64, len(items))
 	for i, item := range items {
 		sizes[i] = item.OriginalRequest().ByteSize()
@@ -513,7 +513,7 @@ func TestOrderedSnapshotPreservesQueue(t *testing.T) {
 	assertHeapProperty(t, q)
 }
 
-func TestOrderedSnapshotConcurrentCleanup(t *testing.T) {
+func TestCandidatesConcurrentCleanup(t *testing.T) {
 	q := newPriorityQueue(enqueueTimePolicy)
 	for i := range 100 {
 		q.Add(itemAt(1, strconv.Itoa(i), time.Now()))
@@ -523,7 +523,7 @@ func TestOrderedSnapshotConcurrentCleanup(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for range 100 {
-			q.OrderedSnapshot()
+			q.Candidates(32)
 		}
 	}()
 	go func() {
@@ -538,7 +538,7 @@ func TestOrderedSnapshotConcurrentCleanup(t *testing.T) {
 	require.Equal(t, uint64(q.Len()), q.ByteSize())
 }
 
-func BenchmarkOrderedSnapshot(b *testing.B) {
+func BenchmarkCandidates(b *testing.B) {
 	for _, size := range []int{32, 1024, 10000} {
 		b.Run(strconv.Itoa(size), func(b *testing.B) {
 			q := newPriorityQueue(byteSizePolicy)
@@ -548,8 +548,30 @@ func BenchmarkOrderedSnapshot(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				q.OrderedSnapshot()
+				q.Candidates(32)
 			}
 		})
 	}
+}
+
+func TestCandidatesBoundedWork(t *testing.T) {
+	comparisons := 0
+	policy := &mocks.MockOrderingPolicy{LessFunc: func(a, b flowcontrol.QueueItemAccessor) bool {
+		comparisons++
+		return a.OriginalRequest().ByteSize() < b.OriginalRequest().ByteSize()
+	}}
+	q := newPriorityQueue(policy)
+	for i := range 10000 {
+		q.Add(itemAt(uint64(10000-i), strconv.Itoa(i), time.Now()))
+	}
+	comparisons = 0
+	items := q.Candidates(8)
+	require.Len(t, items, 8)
+	for i, item := range items {
+		require.Equal(t, uint64(i+1), item.OriginalRequest().ByteSize())
+	}
+	require.Less(t, comparisons, 128)
+	require.Equal(t, 10000, q.Len())
+	require.Empty(t, q.Candidates(0))
+	require.Empty(t, q.Candidates(-1))
 }
