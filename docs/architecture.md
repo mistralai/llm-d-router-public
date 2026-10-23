@@ -80,6 +80,14 @@ It uses the configured screeners, data producers, profiles, and P/D decider. Adm
 local execution and both stage capacities when remote prefill is required. The accepted placement passes to the
 request lifecycle without a second scheduling run. Admission and PreRequest plugins run only after admission.
 
+Within each flow, dispatch inspects requests in the configured ordering policy until it finds an eligible placement.
+The fairness policy selects among these eligible flow candidates. Skipped requests remain queued with their original
+timestamps, TTLs, handles, and capacity charges. Snapshot inspection does not remove or re-enqueue them.
+
+Lookahead has no fixed request-count cutoff. Its worst case scans every queued request and sorts each blocked flow's
+snapshot. Placement preparation has bounded concurrency, and a slow producer does not block the dispatch loop.
+Custom queues without `QueueSnapshotter` expose only their first request.
+
 Retries refresh endpoint and prefix-cache snapshots. Tokenization is reused after successful production.
 Unavailable cache data cannot authorize a prefill-capacity bypass. Prefill-first scheduling, encode disaggregation,
 and handlers without dispatch preparation use the ordinary path.

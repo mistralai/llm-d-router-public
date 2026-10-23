@@ -34,6 +34,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -359,6 +360,13 @@ func (m *MockManagedQueue) ByteSize() uint64 {
 
 // Peek returns the first item found in the mock queue. Note: map iteration order is not guaranteed.
 func (m *MockManagedQueue) Peek() flowcontrol.QueueItemAccessor {
+	if m.OrderingPolicyFunc != nil {
+		items := m.OrderedSnapshot()
+		if len(items) == 0 {
+			return nil
+		}
+		return items[0]
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.init()
@@ -366,4 +374,27 @@ func (m *MockManagedQueue) Peek() flowcontrol.QueueItemAccessor {
 		return item // Return first item found
 	}
 	return nil // Queue is empty
+}
+
+func (m *MockManagedQueue) OrderedSnapshot() []flowcontrol.QueueItemAccessor {
+	m.mu.Lock()
+	m.init()
+	items := make([]flowcontrol.QueueItemAccessor, 0, len(m.items))
+	for _, item := range m.items {
+		items = append(items, item)
+	}
+	m.mu.Unlock()
+	if m.OrderingPolicyFunc != nil {
+		policy := m.OrderingPolicyFunc()
+		slices.SortStableFunc(items, func(a, b flowcontrol.QueueItemAccessor) int {
+			if policy.Less(a, b) {
+				return -1
+			}
+			if policy.Less(b, a) {
+				return 1
+			}
+			return 0
+		})
+	}
+	return items
 }

@@ -30,3 +30,9 @@ type QueueInspectionMethods interface {
 	// Returns nil if the queue is empty.
 	Peek() QueueItemAccessor
 }
+
+// QueueSnapshotter exposes policy-ordered candidates without removing them.
+// Items and handles remain owned by the queue. A concurrent removal can make a snapshot entry stale.
+type QueueSnapshotter interface {
+	OrderedSnapshot() []QueueItemAccessor
+}

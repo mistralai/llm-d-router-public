@@ -552,7 +552,7 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 			continue
 		}
 
-		item, err := p.selectItem(ctx, originalBand)
+		item, plan, err := p.selectPreparedItem(ctx, originalBand, i, stageSaturation, stageCeilings)
 		if err != nil {
 			p.logger.Error(err, "Failed to select item, skipping priority band for this cycle",
 				"priority", priority)
@@ -562,10 +562,6 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 			continue
 		}
 
-		plan, eligible := p.prepareItem(ctx, item, i, stageSaturation, stageCeilings)
-		if !eligible {
-			continue
-		}
 		// --- Dispatch ---
 		req := item.OriginalRequest()
 		dispatched, err := p.dispatchPreparedItem(item, plan)

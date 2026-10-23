@@ -19,6 +19,7 @@ package queue
 
 import (
 	"container/heap"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -254,4 +255,25 @@ func (pq *priorityQueue) Drain() []flowcontrol.QueueItemAccessor {
 	pq.byteSize.Store(0)
 
 	return drainedItems
+}
+
+// OrderedSnapshot sorts outside the lock so dispatch probes cannot delay cancellation or expiry removal.
+func (pq *priorityQueue) OrderedSnapshot() []flowcontrol.QueueItemAccessor {
+	pq.mu.RLock()
+	items := make([]flowcontrol.QueueItemAccessor, len(pq.heap.items))
+	for i, entry := range pq.heap.items {
+		items[i] = entry.item
+	}
+	policy := pq.heap.policy
+	pq.mu.RUnlock()
+	slices.SortStableFunc(items, func(a, b flowcontrol.QueueItemAccessor) int {
+		if policy.Less(a, b) {
+			return -1
+		}
+		if policy.Less(b, a) {
+			return 1
+		}
+		return 0
+	})
+	return items
 }
