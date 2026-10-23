@@ -77,14 +77,21 @@ The ordinary request-control path uses this sequence:
 
 With flow control and prefix-based decode-first P/D disaggregation, requests use ordinary admission when both
 stages permit their priority band. When prefill admission is blocked and decode admission is available, a probe
-runs data producers and decode filters, then checks cache eligibility without running scorers or a picker.
+samples at most four decode candidates, then runs data producers, decode filters, and cache eligibility checks
+without scorers or a picker. A decoder found by an earlier probe keeps one sample slot when it remains eligible.
+Configured screeners receive the full pool before sampling so cross-role rollout checks retain their input.
 
 A successful probe retains only its candidate decoder. Full scheduling runs after request selection against that
-candidate, and the accepted result passes to the request lifecycle. A failed completion leaves the request queued.
+candidate, and the accepted result passes to the request lifecycle. Completion checks current screening, metadata,
+metrics, and source-owned attributes. Request-produced cache estimates remain best-effort probe observations.
+A failed completion leaves the request queued.
 Admission and PreRequest plugins run only after flow-control admission.
 
 At most 32 probes can be running or waiting for their results to be consumed. Retries refresh endpoint and
-prefix-cache snapshots and reuse successful tokenization. Unknown cache state cannot authorize a bypass.
+prefix-cache snapshots and reuse successful tokenization. Failed probes wait 10 ms before retrying, independently
+of queue expiry. Approximate and precise prefix probes cache immutable block hashes while refreshing index matches.
+Approximate-prefix probe state is published only for a dispatched request and is cleaned up if admission aborts.
+Unknown cache state cannot authorize a bypass.
 Prefill-first scheduling, encode disaggregation, non-prefix PD deciders, and profiles without dispatch filtering
 use the ordinary admission path.
 

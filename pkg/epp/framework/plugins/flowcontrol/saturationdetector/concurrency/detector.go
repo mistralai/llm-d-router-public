@@ -276,20 +276,29 @@ func (d *detector) Saturation(ctx context.Context, endpoints []datalayer.Endpoin
 // reservation has been assigned, one request at a time, to the endpoint that is least loaded at that point.
 // Reservations count as requests, so they are not assigned in "tokens" mode.
 func (d *detector) leastLoadedSaturation(endpoints []datalayer.Endpoint, pending int64) float64 {
+	if pending == 0 || d.config.mode == modeTokens {
+		lowest, found := 0.0, false
+		for _, endpoint := range endpoints {
+			if endpoint == nil {
+				continue
+			}
+			load := d.loadForSaturation(endpoint)
+			if !found || load.saturation < lowest {
+				lowest = load.saturation
+				found = true
+			}
+		}
+		if !found {
+			return 1.0
+		}
+		return lowest
+	}
 	loads := make(endpointLoadHeap, 0, len(endpoints))
 	for _, e := range endpoints {
 		if e == nil {
 			continue
 		}
-		load := &attrconcurrency.InFlightLoad{}
-		if e.GetMetadata() != nil {
-			load = d.getLoad(e.GetAttributes())
-		}
-		loads = append(loads, endpointLoad{
-			requests:   load.Requests,
-			tokens:     load.Tokens,
-			saturation: d.endpointSaturation(load.Requests, load.Tokens),
-		})
+		loads = append(loads, d.loadForSaturation(e))
 	}
 	if len(loads) == 0 {
 		return 1.0
@@ -304,6 +313,14 @@ func (d *detector) leastLoadedSaturation(endpoints []datalayer.Endpoint, pending
 		}
 	}
 	return loads[0].saturation
+}
+
+func (d *detector) loadForSaturation(endpoint datalayer.Endpoint) endpointLoad {
+	load := &attrconcurrency.InFlightLoad{}
+	if endpoint.GetMetadata() != nil {
+		load = d.getLoad(endpoint.GetAttributes())
+	}
+	return endpointLoad{requests: load.Requests, tokens: load.Tokens, saturation: d.endpointSaturation(load.Requests, load.Tokens)}
 }
 
 // endpointSaturation returns the saturation of a single endpoint for the active mode.

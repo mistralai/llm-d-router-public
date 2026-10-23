@@ -30,6 +30,8 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/utils/clock"
+
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -155,6 +157,7 @@ func (q *responseBodyQueue) closeAndWait() {
 type Director struct {
 	dispatchPreparationOnce  sync.Once
 	dispatchPreparationSlots chan struct{}
+	dispatchProbeClock       clock.PassiveClock
 	datastore                Datastore
 	scheduler                Scheduler
 	admissionController      AdmissionController

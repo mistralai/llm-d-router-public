@@ -141,3 +141,15 @@ type RequestHeaderProcessor interface {
 	plugin.Plugin
 	RequestHeader(ctx context.Context, request *fwksched.InferenceRequest) error
 }
+
+// ProbeDataProducerFactory creates request-local scratch storage for repeated admission probes.
+// The producer must tolerate a timed-out invocation finishing after another invocation starts.
+type ProbeDataProducerFactory interface {
+	NewProbeDataProducer() DataProducer
+}
+
+// ProbeDataPublisher transfers scratch data only after dispatch wins finalization.
+// Publication must not block. Context cancellation must release unconsumed published state.
+type ProbeDataPublisher interface {
+	PublishProbe(context.Context, *fwksched.InferenceRequest)
+}
