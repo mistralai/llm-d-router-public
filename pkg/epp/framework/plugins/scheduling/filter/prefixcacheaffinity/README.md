@@ -13,9 +13,8 @@ of the prompt cached. This filter steers requests toward endpoints that hold a c
 converting expensive prefill into a near-free cache lookup and significantly reducing
 time-to-first-token (TTFT).
 
-If your workload consists of unique, non-overlapping prompts, this filter has no effect
-because no endpoint will accumulate cache hits, and the filter falls through to keeping all
-candidates (no-op).
+For workloads with unique, non-overlapping prompts, see
+[Load balancing `no_match`](#load-balancing-no_match).
 
 ## Difference from `prefix-cache-scorer`
 
@@ -55,7 +54,7 @@ Can be instantiated multiple times with different thresholds (e.g., 0.99 for glo
 ## Behavior
 
 - Keep only endpoints with prefix cache score >= `affinityThreshold`
-- If no endpoints pass, all are kept (no-op)
+- If no endpoints pass, follow the [`no_match` policy](#load-balancing-no_match)
 - With probability `explorationProbability` (default 0, disabled), skip the gate entirely for exploration
 - TTFT load gate: if best sticky endpoint's TTFT exceeds best non-sticky by more than
   `maxTTFTPenaltyMs`, break stickiness and keep all endpoints (0 = always stick). The
@@ -67,7 +66,23 @@ Can be instantiated multiple times with different thresholds (e.g., 0.99 for glo
   (`LatencyPredictionInfo` or `InFlightLoad`), the TTFT load gate is skipped and all
   endpoints are kept; the `missing_signal` outcome is recorded. If no endpoints have
   `PrefixCacheMatchInfo`, all prefix scores default to 0 and no endpoints pass the affinity
-  threshold, so all are kept (no-op)
+  threshold, so the `no_match` policy applies
+
+## Load balancing `no_match`
+
+When no endpoint meets `affinityThreshold`, the filter keeps all candidates by default.
+Set `enableLoadBalanceNoMatch: true` to keep only endpoints with the best
+`active-request-scorer` score. Tied endpoints proceed to the configured scorers and picker;
+for example, `token-load-scorer` can choose among endpoints with equal active-request counts.
+Partial cache matches below the threshold also take this path.
+
+The option does not apply to exploration, a disabled affinity threshold, or a TTFT gate
+that releases affinity. Missing in-flight load is treated as zero active requests by
+`active-request-scorer`.
+
+Run capacity and eligibility filters before this filter so they can exclude unsuitable
+endpoints before the candidate set is narrowed. This option favors request-count balance
+and can assign more prefill work to an endpoint with fewer, longer requests.
 
 ## Composition requirements
 
@@ -118,6 +133,7 @@ documents the strategy and its calibration.
 | `maxTTFTPenaltyMs` | `float64` | No | `18000` | Max TTFT penalty (ms) before breaking stickiness. 0 = always stick |
 | `ttftSource` | `string` | No | `prefillThroughput` | TTFT source for the load gate: `prefillThroughput` or `latencyPredictor` |
 | `peakPrefillThroughput` | `float64` | No | `15928` | Peak prefill throughput (tokens/sec), used to estimate TTFT when `ttftSource` is `prefillThroughput` |
+| `enableLoadBalanceNoMatch` | `bool` | No | `false` | Enable the [active-request policy for `no_match`](#load-balancing-no_match) |
 
 The `peakPrefillThroughput` default of `15928` tokens/sec is calibrated for Qwen 32B on
 2x H100 80GB (TP=2) with vLLM 0.19, measured as the prefill throughput of a single
@@ -128,7 +144,7 @@ to `latencyPredictor` to source TTFT from the latency predictor instead.
 ## Dependencies
 
 - Reads `PrefixCacheMatchInfo` from endpoint attributes (from `prefix-cache-scorer`)
-- Reads `InFlightLoad` for the TTFT load gate when `ttftSource` is `prefillThroughput` (from `in-flight-load-producer`)
+- Reads `InFlightLoad` for the TTFT load gate when `ttftSource` is `prefillThroughput`, or when `enableLoadBalanceNoMatch` is enabled (from `in-flight-load-producer`)
 - Reads `LatencyPredictionInfo` for the TTFT load gate when `ttftSource` is `latencyPredictor` (from `predicted-latency-producer`)
 
 **Configuration Example:**

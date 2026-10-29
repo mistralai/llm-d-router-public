@@ -42,6 +42,7 @@ import (
 	attrlatency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/latency"
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	schedplugins "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/scorer/activerequest"
 )
 
 const (
@@ -91,6 +92,10 @@ type Config struct {
 	// (tokens / (tokens/sec) * 1000 = ms). Default: 15928.
 	PeakPrefillThroughput float64 `json:"peakPrefillThroughput,omitempty"`
 
+	// EnableLoadBalanceNoMatch keeps only endpoints with the best active-request
+	// score when none meet AffinityThreshold. Downstream scorers break ties.
+	EnableLoadBalanceNoMatch bool `json:"enableLoadBalanceNoMatch,omitempty"`
+
 	PrefixMatchInfoProducerName       string `json:"prefixMatchInfoProducerName,omitempty"`
 	LatencyPredictionInfoProducerName string `json:"latencyPredictionInfoProducerName,omitempty"`
 	InFlightLoadProducerName          string `json:"inFlightLoadProducerName,omitempty"`
@@ -112,6 +117,7 @@ type Plugin struct {
 	prefixMatchDataKey           fwkplugin.DataKey
 	latencyPredictionInfoDataKey fwkplugin.DataKey
 	inFlightLoadDataKey          fwkplugin.DataKey
+	activeRequestScorer          *activerequest.ActiveRequest
 }
 
 func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) (fwkplugin.Plugin, error) {
@@ -135,6 +141,9 @@ func Factory(name string, rawParameters *json.Decoder, handle fwkplugin.Handle) 
 		prefixMatchDataKey:           attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(config.PrefixMatchInfoProducerName),
 		latencyPredictionInfoDataKey: attrlatency.LatencyPredictionInfoDataKey.WithNonEmptyProducerName(config.LatencyPredictionInfoProducerName),
 		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(config.InFlightLoadProducerName),
+		activeRequestScorer: activerequest.NewActiveRequest(context.Background(), &activerequest.Parameters{
+			InFlightLoadProducerName: config.InFlightLoadProducerName,
+		}),
 	}, nil
 }
 
@@ -221,12 +230,27 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 
 	span.SetAttributes(semconv.LLMDEPPFilterStickyEndpoints(len(sticky)))
 
-	// No sticky endpoints found, keep all.
 	if len(sticky) == 0 {
 		logger.V(logutil.DEBUG).Info("PrefixCacheAffinityFilter: no sticky endpoints",
 			"affinityThreshold", p.config.AffinityThreshold, "total", len(endpoints))
 		recordDecision(p.typedName.Name, outcomeNoMatch)
 		span.SetAttributes(semconv.LLMDEPPFilterDecision(outcomeNoMatch))
+		if p.config.EnableLoadBalanceNoMatch {
+			scores := p.activeRequestScorer.Score(ctx, request, endpoints)
+			bestScore := -1.0
+			var best []fwksched.Endpoint
+			for _, ep := range endpoints {
+				score := scores[ep]
+				if score > bestScore {
+					bestScore = score
+					best = best[:0]
+				}
+				if score == bestScore {
+					best = append(best, ep)
+				}
+			}
+			return best
+		}
 		return endpoints
 	}
 
@@ -270,6 +294,9 @@ func (p *Plugin) Consumes() fwkplugin.DataDependencies {
 		} else {
 			required[p.inFlightLoadDataKey] = attrconcurrency.InFlightLoad{}
 		}
+	}
+	if p.config.EnableLoadBalanceNoMatch {
+		required[p.inFlightLoadDataKey] = attrconcurrency.InFlightLoad{}
 	}
 	return fwkplugin.DataDependencies{Required: required}
 }
