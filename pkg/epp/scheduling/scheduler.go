@@ -33,6 +33,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
 )
@@ -47,6 +48,12 @@ const (
 
 // NewSchedulerWithConfig returns a new scheduler with the given scheduler plugins configuration.
 func NewSchedulerWithConfig(config *SchedulerConfig) *Scheduler {
+	// On init, mark the shceduler profiles as bodyless if they are.
+	for _, profile := range config.profiles {
+		if sp, ok := profile.(*SchedulerProfile); ok {
+			sp.bodylessCompatible = sp.computeBodylessCompatible()
+		}
+	}
 	return &Scheduler{
 		profileHandler: config.profileHandler,
 		profiles:       config.profiles,
@@ -56,6 +63,29 @@ func NewSchedulerWithConfig(config *SchedulerConfig) *Scheduler {
 type Scheduler struct {
 	profileHandler fwksched.ProfileHandler
 	profiles       map[string]fwksched.SchedulerProfile
+}
+
+// BodylessCompatible returns the precomputed result of whether every plugin
+// in the profile can handle a request with no body.
+func (p *SchedulerProfile) BodylessCompatible() bool {
+	return p.bodylessCompatible
+}
+
+func (p *SchedulerProfile) computeBodylessCompatible() bool {
+	for _, filter := range p.filters {
+		if bc, ok := filter.(plugin.BodylessCapable); !ok || !bc.BodylessCompatible() {
+			return false
+		}
+	}
+	for _, scorer := range p.scorers {
+		if bc, ok := scorer.Scorer.(plugin.BodylessCapable); !ok || !bc.BodylessCompatible() {
+			return false
+		}
+	}
+	if bc, ok := p.picker.(plugin.BodylessCapable); !ok || !bc.BodylessCompatible() {
+		return false
+	}
+	return true
 }
 
 // Schedule finds the target pod based on metrics and the requested lora adapter.
@@ -97,7 +127,14 @@ func (s *Scheduler) Schedule(ctx context.Context, request *fwksched.InferenceReq
 			break
 		}
 
+		bodylessSkipped := 0
 		for name, profile := range profiles {
+			// Skip the run for bodyless request and bodyless incompatible scheduler.
+			if request.Bodyless && !profile.BodylessCompatible() {
+				loggerVerbose.Info("Skipping bodyless incompatible profile", "profile", name)
+				bodylessSkipped++
+				continue
+			}
 			if verboseEnabled {
 				loggerVerbose.Info("Running scheduler profile", "profile", name)
 			}
@@ -119,6 +156,9 @@ func (s *Scheduler) Schedule(ctx context.Context, request *fwksched.InferenceReq
 			}
 
 			profileRunResults[name] = profileRunResult // if profile failed to run, the run result is nil
+		}
+		if bodylessSkipped > 0 && bodylessSkipped == len(profiles) {
+			return nil, fmt.Errorf("no bodyless-compatible scheduler profile for request %s", request.RequestID)
 		}
 	}
 

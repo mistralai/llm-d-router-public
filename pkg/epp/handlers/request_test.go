@@ -655,6 +655,58 @@ func TestIsWebSocketUpgrade(t *testing.T) {
 	}
 }
 
+func TestIsGrpcBidirectionalStream(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    bool
+	}{
+		{
+			name:    "header set to true",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "true"},
+			want:    true,
+		},
+		{
+			name:    "case-insensitive value",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "True"},
+			want:    true,
+		},
+		{
+			name:    "header set to false",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "false"},
+			want:    false,
+		},
+		{
+			name:    "empty value",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: ""},
+			want:    false,
+		},
+		{
+			name:    "value other than true",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "1"},
+			want:    false,
+		},
+		{
+			name:    "header absent",
+			headers: map[string]string{"content-type": "application/grpc"},
+			want:    false,
+		},
+		{
+			name:    "empty headers",
+			headers: map[string]string{},
+			want:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isGrpcBidirectionalStream(tc.headers))
+		})
+	}
+}
+
 func TestFallbackToRandomEndpoint(t *testing.T) {
 	t.Parallel()
 
@@ -753,6 +805,89 @@ func (m *mockDirectorRequest) GetRandomEndpoint() *datalayer.EndpointMetadata {
 	return &datalayer.EndpointMetadata{
 		Address: "1.2.3.4",
 		Port:    "80",
+	}
+}
+
+func TestHandleRequestHeadersBodyless(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name               string
+		headers            map[string]string
+		endOfStream        bool
+		wantBodyless       bool
+		wantRandomEndpoint bool
+	}{
+		{
+			name:    "request with a body is not flagged",
+			headers: map[string]string{"content-type": "application/json"},
+		},
+		{
+			name:         "grpc bidirectional stream is flagged and left for scheduling",
+			headers:      map[string]string{metadata.GRPCBidirectionalStream: "true"},
+			wantBodyless: true,
+		},
+		{
+			name:         "header name and value are case-insensitive",
+			headers:      map[string]string{strings.ToUpper(metadata.GRPCBidirectionalStream): "TRUE"},
+			wantBodyless: true,
+		},
+		{
+			name:    "grpc bidirectional header set to false",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "false"},
+		},
+		{
+			name:               "websocket upgrade is routed to a random endpoint without flagging",
+			headers:            map[string]string{"upgrade": "websocket", "connection": "upgrade"},
+			wantRandomEndpoint: true,
+		},
+		{
+			name: "websocket upgrade takes precedence over the grpc header",
+			headers: map[string]string{
+				"upgrade":                        "websocket",
+				"connection":                     "upgrade",
+				metadata.GRPCBidirectionalStream: "true",
+			},
+			wantRandomEndpoint: true,
+		},
+		{
+			name:               "end of stream takes precedence over the grpc header",
+			headers:            map[string]string{metadata.GRPCBidirectionalStream: "true"},
+			endOfStream:        true,
+			wantRandomEndpoint: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &StreamingServer{director: &mockDirectorRequest{}}
+			reqCtx := &RequestContext{
+				Request:  &Request{Headers: make(map[string]string)},
+				Response: &Response{Headers: make(map[string]string)},
+			}
+			values := make([]*configPb.HeaderValue, 0, len(tc.headers))
+			for key, value := range tc.headers {
+				values = append(values, &configPb.HeaderValue{Key: key, RawValue: []byte(value)})
+			}
+			req := &extProcPb.ProcessingRequest_RequestHeaders{
+				RequestHeaders: &extProcPb.HttpHeaders{
+					Headers:     &configPb.HeaderMap{Headers: values},
+					EndOfStream: tc.endOfStream,
+				},
+			}
+
+			require.NoError(t, server.HandleRequestHeaders(context.Background(), reqCtx, req))
+
+			assert.Equal(t, tc.wantBodyless, reqCtx.bodyless)
+			assert.Equal(t, tc.wantBodyless, reqCtx.grpcBidirectional)
+			if tc.wantRandomEndpoint {
+				assert.Equal(t, "1.2.3.4:80", reqCtx.TargetEndpoint)
+				assert.NotNil(t, reqCtx.reqHeaderResp)
+			} else {
+				assert.Empty(t, reqCtx.TargetEndpoint, "scheduling is left to the Director")
+				assert.Nil(t, reqCtx.reqHeaderResp)
+			}
+		})
 	}
 }
 

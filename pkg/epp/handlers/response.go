@@ -109,6 +109,23 @@ func (s *StreamingServer) HandleResponseBody(ctx context.Context, reqCtx *Reques
 	return s.director.HandleResponseBody(ctx, reqCtx, endOfStream)
 }
 
+// HandleResponseTrail processes response trail for the grpc path.
+//
+// We actually only run it for grpc bidirectional streams for the moment.
+func (s *StreamingServer) HandleResponseTrail(ctx context.Context, reqCtx *RequestContext) *RequestContext {
+	logger := log.FromContext(ctx)
+	// The Enabled() guard is intentional: passing arguments to a disabled logger
+	// still boxes them into a heap-allocated slice.
+	if debug := logger.V(logutil.DEBUG); debug.Enabled() {
+		debug.Info("HandleResponseTrail is triggered")
+	}
+
+	fairnessID, priority := extractFairnessAndPriority(reqCtx)
+
+	metrics.RecordTunnelRequestDuration(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.RequestReceivedTimestamp, reqCtx.responseCompleteTimestamp)
+	return s.director.HandleResponseTrail(ctx, reqCtx)
+}
+
 // mergeUsage folds a parsed usage block into the usage accumulated for the request.
 // Anthropic streaming reports usage on message_start and again on message_delta, and a
 // block may carry only some of the fields, so a zero is read as "not reported" and

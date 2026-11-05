@@ -2392,6 +2392,279 @@ func TestDirector_SharedRequestIDHeaderReleasesInFlightLoad(t *testing.T) {
 	require.Equal(t, int64(0), producer.GetRequests(endpointID), "in-flight requests leaked")
 }
 
+const bodylessModel = "bodyless-model"
+
+// newBodylessTestRequestContext builds the context the handler passes to the Director for a
+// gRPC bidirectional stream: headers only, with the target model already taken from them.
+func newBodylessTestRequestContext(requestID, model string) *handlers.RequestContext {
+	return &handlers.RequestContext{
+		Request: &handlers.Request{
+			ID: requestID,
+			Headers: map[string]string{
+				reqcommon.RequestIDHeaderKey:     requestID,
+				metadata.GRPCBidirectionalStream: "true",
+			},
+		},
+		Response:        &handlers.Response{Headers: map[string]string{}},
+		TargetModelName: model,
+	}
+}
+
+// newPod1SchedulingResult returns a scheduling result targeting the pod that
+// newSinglePodDirector creates, along with that endpoint's ID.
+func newPod1SchedulingResult() (*fwksched.SchedulingResult, string) {
+	endpoint := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{
+		Address: "192.168.1.100",
+		Port:    "8000",
+		ID:      types.NamespacedName{Name: "pod1", Namespace: "default"},
+	}, nil, fwkdl.NewAttributes())
+	return &fwksched.SchedulingResult{
+		PrimaryProfileName: "default",
+		ProfileResults: map[string]*fwksched.ProfileRunResult{
+			"default": {TargetEndpoints: []fwksched.Endpoint{endpoint}},
+		},
+	}, endpoint.GetMetadata().ID.String()
+}
+
+// targetModelRewriteHeaderPlugin rewrites the scheduling request's target model, as a
+// header-driven model router would.
+type targetModelRewriteHeaderPlugin struct {
+	to string
+}
+
+func (p *targetModelRewriteHeaderPlugin) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Name: "rewrite-target-model", Type: "mock-request-header"}
+}
+
+func (p *targetModelRewriteHeaderPlugin) RequestHeader(_ context.Context, request *fwksched.InferenceRequest) error {
+	request.TargetModel = p.to
+	return nil
+}
+
+// trailerRecorderPlugin reports every ResponseTrailer invocation through record.
+type trailerRecorderPlugin struct {
+	name   string
+	err    error
+	record func(name string, request *fwksched.InferenceRequest)
+}
+
+func (p *trailerRecorderPlugin) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Name: p.name, Type: "mock-response-trailer"}
+}
+
+func (p *trailerRecorderPlugin) ResponseTrailer(_ context.Context, request *fwksched.InferenceRequest) error {
+	p.record(p.name, request)
+	return p.err
+}
+
+func TestDirector_HandleBodylessRequest(t *testing.T) {
+	tests := []struct {
+		name           string
+		fairnessHeader string
+		headerPlugins  []fwkrc.RequestHeaderProcessor
+		wantTarget     string
+		wantFairnessID string
+	}{
+		{
+			name:           "model and fairness ID come from the request headers",
+			fairnessHeader: "tenant-a",
+			wantTarget:     bodylessModel,
+			wantFairnessID: "tenant-a",
+		},
+		{
+			name:           "fairness ID defaults when the header is absent",
+			wantTarget:     bodylessModel,
+			wantFairnessID: reqcommon.DefaultFairnessID,
+		},
+		{
+			name:           "target model rewritten by a header processor is kept on the context",
+			headerPlugins:  []fwkrc.RequestHeaderProcessor{&targetModelRewriteHeaderPlugin{to: "rewritten-model"}},
+			wantTarget:     "rewritten-model",
+			wantFairnessID: reqcommon.DefaultFairnessID,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, _ := newPod1SchedulingResult()
+			dir, ctx := newSinglePodDirector(t, result)
+			dir.requestControlPlugins = *NewConfig().WithRequestHeaderPlugins(tt.headerPlugins...)
+
+			reqCtx := newBodylessTestRequestContext("req-1", bodylessModel)
+			if tt.fairnessHeader != "" {
+				reqCtx.Request.Headers[metadata.FlowFairnessIDKey] = tt.fairnessHeader
+			}
+
+			got, err := dir.HandleBodylessRequest(ctx, reqCtx)
+			require.NoError(t, err)
+			require.Same(t, reqCtx, got)
+
+			assert.Equal(t, bodylessModel, got.IncomingModelName,
+				"the client-facing model is recorded before header processors can rewrite it")
+			assert.Equal(t, tt.wantTarget, got.TargetModelName)
+
+			schedReq := got.SchedulingRequest
+			require.NotNil(t, schedReq)
+			assert.True(t, schedReq.Bodyless)
+			assert.Nil(t, schedReq.Body)
+			assert.Zero(t, schedReq.RequestSizeBytes)
+			assert.Equal(t, "req-1", schedReq.RequestID)
+			assert.Equal(t, tt.wantTarget, schedReq.TargetModel)
+			assert.Equal(t, tt.wantFairnessID, schedReq.FairnessID)
+			assert.Same(t, result, schedReq.SchedulingResult)
+
+			require.NotNil(t, got.TargetPod)
+			assert.Equal(t, "192.168.1.100:8000", got.TargetEndpoint)
+			assert.Empty(t, got.Request.RawBody, "a bodyless request must not gain a body")
+			assert.Zero(t, got.RequestSize)
+		})
+	}
+}
+
+// TestDirector_HandleRequestSchedulingRequest pins the bodied path next to the bodyless
+// one: the same orchestration must still carry the parsed body and its size.
+func TestDirector_HandleRequestSchedulingRequest(t *testing.T) {
+	result, _ := newPod1SchedulingResult()
+	dir, ctx := newSinglePodDirector(t, result)
+
+	body, err := json.Marshal(map[string]any{"model": "m", "prompt": "p"})
+	require.NoError(t, err)
+	reqCtx := &handlers.RequestContext{
+		Request: &handlers.Request{
+			ID: "req-1",
+			Headers: map[string]string{
+				reqcommon.RequestIDHeaderKey: "req-1",
+				":path":                      "/v1/completions",
+			},
+			RawBody: body,
+		},
+		RequestSize: len(body),
+		Parser:      openai.NewOpenAIParser(),
+	}
+	parseResult, err := reqCtx.Parser.ParseRequest(ctx, body, reqCtx.Request.Headers)
+	require.NoError(t, err)
+
+	got, err := dir.HandleRequest(ctx, reqCtx, parseResult.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, "m", got.IncomingModelName)
+	assert.Equal(t, "m", got.TargetModelName)
+	schedReq := got.SchedulingRequest
+	require.NotNil(t, schedReq)
+	assert.False(t, schedReq.Bodyless)
+	assert.Same(t, parseResult.Body, schedReq.Body)
+	assert.Equal(t, len(body), schedReq.RequestSizeBytes)
+}
+
+// TestDirector_HandleBodylessRequestSchedulingFailure verifies that a request the scheduler
+// rejects comes back as a typed error and with no target pod, which is what keeps the
+// handler from running response-side cleanup for a request that never reached an endpoint.
+func TestDirector_HandleBodylessRequestSchedulingFailure(t *testing.T) {
+	dir, ctx := newSinglePodDirector(t, nil)
+	dir.scheduler = &mockScheduler{scheduleErr: errors.New("no bodyless-compatible scheduler profile for request req-1")}
+
+	reqCtx := newBodylessTestRequestContext("req-1", bodylessModel)
+	got, err := dir.HandleBodylessRequest(ctx, reqCtx)
+
+	var typedErr errcommon.Error
+	require.ErrorAs(t, err, &typedErr)
+	assert.Contains(t, typedErr.Msg, "no bodyless-compatible scheduler profile")
+	require.Same(t, reqCtx, got)
+	assert.Nil(t, got.TargetPod)
+}
+
+func TestDirector_HandleResponseTrail(t *testing.T) {
+	type trailerCall struct {
+		plugin  string
+		request *fwksched.InferenceRequest
+	}
+
+	t.Run("runs every trailer plugin in order with the scheduling request", func(t *testing.T) {
+		ctx := logutil.NewTestLoggerIntoContext(context.Background())
+		var calls []trailerCall
+		record := func(name string, request *fwksched.InferenceRequest) {
+			calls = append(calls, trailerCall{plugin: name, request: request})
+		}
+		dir := NewDirectorWithConfig(nil, &mockScheduler{}, nil, nil, NewConfig().WithResponseTrailerPlugins(
+			&trailerRecorderPlugin{name: "first", record: record},
+			&trailerRecorderPlugin{name: "second", record: record},
+		))
+		reqCtx := newBodylessTestRequestContext("req-1", bodylessModel)
+		reqCtx.SchedulingRequest = &fwksched.InferenceRequest{RequestID: "req-1"}
+
+		got := dir.HandleResponseTrail(ctx, reqCtx)
+
+		assert.Same(t, reqCtx, got)
+		require.Len(t, calls, 2)
+		assert.Equal(t, "first", calls[0].plugin)
+		assert.Equal(t, "second", calls[1].plugin)
+		assert.Same(t, reqCtx.SchedulingRequest, calls[0].request)
+		assert.Same(t, reqCtx.SchedulingRequest, calls[1].request)
+	})
+
+	t.Run("a failing plugin does not stop the remaining plugins", func(t *testing.T) {
+		ctx := logutil.NewTestLoggerIntoContext(context.Background())
+		var invoked []string
+		record := func(name string, _ *fwksched.InferenceRequest) { invoked = append(invoked, name) }
+		dir := NewDirectorWithConfig(nil, &mockScheduler{}, nil, nil, NewConfig().WithResponseTrailerPlugins(
+			&trailerRecorderPlugin{name: "first", err: errors.New("first plugin boom"), record: record},
+			&trailerRecorderPlugin{name: "second", record: record},
+		))
+
+		dir.HandleResponseTrail(ctx, newBodylessTestRequestContext("req-1", bodylessModel))
+
+		assert.Equal(t, []string{"first", "second"}, invoked)
+	})
+
+	t.Run("a request aborted before scheduling reaches the plugins as nil", func(t *testing.T) {
+		ctx := logutil.NewTestLoggerIntoContext(context.Background())
+		var calls []trailerCall
+		record := func(name string, request *fwksched.InferenceRequest) {
+			calls = append(calls, trailerCall{plugin: name, request: request})
+		}
+		dir := NewDirectorWithConfig(nil, &mockScheduler{}, nil, nil, NewConfig().WithResponseTrailerPlugins(
+			&trailerRecorderPlugin{name: "only", record: record},
+		))
+
+		require.NotPanics(t, func() {
+			dir.HandleResponseTrail(ctx, newBodylessTestRequestContext("req-1", bodylessModel))
+		})
+
+		require.Len(t, calls, 1)
+		assert.Nil(t, calls[0].request)
+	})
+
+	t.Run("no trailer plugins registered", func(t *testing.T) {
+		ctx := logutil.NewTestLoggerIntoContext(context.Background())
+		dir := NewDirectorWithConfig(nil, &mockScheduler{}, nil, nil, NewConfig())
+		reqCtx := newBodylessTestRequestContext("req-1", bodylessModel)
+
+		assert.Same(t, reqCtx, dir.HandleResponseTrail(ctx, reqCtx))
+	})
+}
+
+// TestDirector_BodylessRequestReleasesInFlightLoadAtTrailer verifies that a bodyless request
+// counts against its endpoint from scheduling until the response trailer arrives, which is
+// the only completion signal such a request produces.
+func TestDirector_BodylessRequestReleasesInFlightLoadAtTrailer(t *testing.T) {
+	result, endpointID := newPod1SchedulingResult()
+	dir, ctx := newSinglePodDirector(t, result)
+	plugin, err := inflightload.InFlightLoadProducerFactory("inflight-load-producer", nil, testutils.NewTestHandle(ctx))
+	require.NoError(t, err)
+	producer := plugin.(*inflightload.InFlightLoadProducer)
+	dir.requestControlPlugins = *NewConfig().WithPreRequestPlugins(producer).WithResponseTrailerPlugins(producer)
+
+	reqCtx, err := dir.HandleBodylessRequest(ctx, newBodylessTestRequestContext("req-1", bodylessModel))
+	require.NoError(t, err)
+	require.Equal(t, int64(1), producer.GetRequests(endpointID))
+
+	dir.HandleResponseTrail(ctx, reqCtx)
+	require.Equal(t, int64(0), producer.GetRequests(endpointID), "in-flight request leaked")
+
+	dir.HandleResponseTrail(ctx, reqCtx)
+	require.Equal(t, int64(0), producer.GetRequests(endpointID), "a repeated trailer must not release twice")
+}
+
 // TestRunPreRequestPlugins_NoPlugins verifies that runPreRequestPlugins returns
 // nil when no PreRequest plugins are registered.
 func TestRunPreRequestPlugins_NoPlugins(t *testing.T) {

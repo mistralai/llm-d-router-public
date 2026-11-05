@@ -61,9 +61,16 @@ func (s *StreamingServer) HandleRequestHeaders(ctx context.Context, reqCtx *Requ
 	reqCtx.ObjectiveKey, _ = metadata.GetLowerCaseHeaderValue(reqCtx.Request.Headers, metadata.ObjectiveKey)
 	reqCtx.TargetModelName, _ = metadata.GetLowerCaseHeaderValue(reqCtx.Request.Headers, metadata.ModelNameRewriteKey)
 
-	// A websocket upgrade is a bodyless request. Schedule it with RandomEndpoint.
+	// A websocket upgrade is a bodyless request. Schedule it with RandomEndpoint picking.
 	if isWebsocketUpgrade(reqCtx.Request.Headers) {
 		return s.fallbackToRandomEndpoint(ctx, reqCtx, 0)
+	}
+
+	// Grpc bidirectional streams are handled as bodyless requests (too complicated to actually parse the request body,
+	// and does not make sense as it will end only at the end of the whole stream)
+	if isGrpcBidirectionalStream(reqCtx.Request.Headers) {
+		reqCtx.bodyless = true
+		reqCtx.grpcBidirectional = true
 	}
 	return nil
 }
@@ -90,6 +97,13 @@ func isWebsocketUpgrade(headers map[string]string) bool {
 		}
 	}
 	return false
+}
+
+// isGrpcBidirectionalStream reports wether the request is meant to be a grpc bidirectional stream.
+// There is no way to know this from the request, so we just trust the client headers.
+func isGrpcBidirectionalStream(headers map[string]string) bool {
+	val, ok := headers[metadata.GRPCBidirectionalStream]
+	return ok && strings.ToLower(val) == "true"
 }
 
 func (s *StreamingServer) fallbackToRandomEndpoint(ctx context.Context, reqCtx *RequestContext, requestSize int) error {

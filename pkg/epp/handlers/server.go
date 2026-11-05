@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	extProcFilterPb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
@@ -90,8 +91,10 @@ func (s *StreamingServer) SetEmitEndpointScores(enabled bool) {
 
 type Director interface {
 	HandleRequest(ctx context.Context, reqCtx *RequestContext, inferenceRequestBody *fwkrh.InferenceRequestBody) (*RequestContext, error)
+	HandleBodylessRequest(ctx context.Context, reqCtx *RequestContext) (*RequestContext, error)
 	HandleResponseHeader(ctx context.Context, reqCtx *RequestContext) *RequestContext
 	HandleResponseBody(ctx context.Context, reqCtx *RequestContext, endOfStream bool) *RequestContext
+	HandleResponseTrail(ctx context.Context, reqCtx *RequestContext) *RequestContext
 	GetRandomEndpoint() *fwkdl.EndpointMetadata
 }
 
@@ -150,6 +153,12 @@ type RequestContext struct {
 	// FlowControlQueueDuration is the wall-clock time the request spent in flow control admission
 	// (enqueue-and-wait). Meaningful only when FlowControlAdmitted is true.
 	FlowControlQueueDuration time.Duration
+
+	// bodyless is a boolean set to true only if the request is handled without looking at the body.
+	// Because there is none, or it's not parsable.
+	bodyless bool
+	// grpcBidirectional represents whether the request is a grpc bidirectional stream.
+	grpcBidirectional bool
 
 	// Lifecycle bookkeeping.
 	firstTokenTimestamp        time.Time
@@ -436,7 +445,11 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			// Use a fresh context as the request context might be canceled (Client Disconnect).
 			// We only need logging from the original context.
 			cleanupCtx := log.IntoContext(context.Background(), logger)
-			s.director.HandleResponseBody(cleanupCtx, reqCtx, true)
+			if reqCtx.bodyless {
+				s.director.HandleResponseTrail(cleanupCtx, reqCtx)
+			} else {
+				s.director.HandleResponseBody(cleanupCtx, reqCtx, true)
+			}
 		}
 	}()
 
@@ -506,6 +519,33 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			logger.V(logutil.DEFAULT).Info("EPP received request") // Request ID and trace fields are logged as logger context values.
 
 			err = s.HandleRequestHeaders(ctx, reqCtx, v)
+			if err == nil && reqCtx.bodyless {
+				reqCtx, err = s.director.HandleBodylessRequest(ctx, reqCtx)
+				// The Director may resolve agent identity after this request span opened.
+				tracing.AttributeRequest(ctx, span)
+				if err != nil {
+					break
+				}
+
+				// After scheduling, look up the eviction channel for eviction support.
+				// Setting evictCh from nil to a real channel dynamically enables the
+				// eviction case in the main select.
+				if s.evictionLookup != nil {
+					evictionRequestID = reqCtx.Request.ID
+					evictCh = s.evictionLookup.Get(evictionRequestID)
+				}
+
+				reqCtx.reqHeaderResp = s.generateRequestHeaderResponse(ctx, reqCtx)
+				reqCtx.reqHeaderResp.ModeOverride = &extProcFilterPb.ProcessingMode{
+					RequestBodyMode:     extProcFilterPb.ProcessingMode_NONE,
+					ResponseBodyMode:    extProcFilterPb.ProcessingMode_NONE,
+					ResponseTrailerMode: extProcFilterPb.ProcessingMode_SEND,
+				}
+				fairnessID, _ := extractFairnessAndPriority(reqCtx)
+				metrics.RecordTunneledRequestCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, reqCtx.Priority)
+
+				recordRequestProcessing()
+			}
 		case *extProcPb.ProcessingRequest_RequestBody:
 			loggerTrace.Info("Incoming body chunk", "EoS", v.RequestBody.EndOfStream)
 			// In the stream case, we can receive multiple request bodies.
@@ -628,7 +668,11 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			if cause := terminationCauseFromGRPCTrailers(v.ResponseTrailers); cause != "" {
 				reqCtx.TerminationCause = cause
 			}
-			s.finishResponse(ctx, reqCtx, respBody, reqCtx.modelServerStreaming, false)
+			if reqCtx.bodyless {
+				s.finishTunnel(ctx, reqCtx)
+			} else {
+				s.finishResponse(ctx, reqCtx, respBody, reqCtx.modelServerStreaming, false)
+			}
 			reqCtx.respTrailerResp = &extProcPb.ProcessingResponse{
 				Response: &extProcPb.ProcessingResponse_ResponseTrailers{
 					ResponseTrailers: &extProcPb.TrailersResponse{},
@@ -667,6 +711,20 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			// See: https://github.com/envoyproxy/envoy/blob/0533de0acca281110945e5726bbb306fbb12bde5/api/envoy/service/ext_proc/v3/external_processor.proto#L40-L41
 			return nil
 		}
+	}
+}
+
+func (s *StreamingServer) finishTunnel(ctx context.Context, reqCtx *RequestContext) {
+	// Return early if the response has already been finished to prevent
+	// duplicate execution of side effects and metrics.
+	if reqCtx.responseComplete {
+		return
+	}
+
+	reqCtx.responseComplete = true
+	if reqCtx.grpcBidirectional {
+		reqCtx.responseCompleteTimestamp = time.Now()
+		s.HandleResponseTrail(ctx, reqCtx)
 	}
 }
 
