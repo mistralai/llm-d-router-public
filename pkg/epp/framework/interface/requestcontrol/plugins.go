@@ -35,6 +35,7 @@ const (
 	ResponseReceivedExtensionPoint  = "ResponseReceived"
 	ResponseStreamingExtensionPoint = "ResponseStreaming"
 	ResponseCompleteExtensionPoint  = "ResponseComplete"
+	ResponseTrailerExtensionPoint   = "ResponseTrailer"
 )
 
 // ConditionalDecodeHandledAttributeKey is the request-attribute key a
@@ -140,4 +141,10 @@ type Admitter interface {
 type RequestHeaderProcessor interface {
 	plugin.Plugin
 	RequestHeader(ctx context.Context, request *fwksched.InferenceRequest) error
+}
+
+// ResponseTrailerProcessor runs after a response trailer has been received.
+type ResponseTrailerProcessor interface {
+	plugin.Plugin
+	ResponseTrailer(ctx context.Context, request *fwksched.InferenceRequest) error
 }

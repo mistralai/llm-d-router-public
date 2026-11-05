@@ -194,9 +194,22 @@ func (d *Director) getInferenceObjective(ctx context.Context, reqCtx *handlers.R
 	return infObjective
 }
 
+// HandleBodylessRequest orchestrates requests ignoring the body, such as WebSocket upgrades or grpc bidirectional streams.
+func (d *Director) HandleBodylessRequest(ctx context.Context, reqCtx *handlers.RequestContext) (_ *handlers.RequestContext, err error) {
+	return d.handleRequest(ctx, reqCtx, nil)
+}
+
 // HandleRequest orchestrates the request lifecycle.
 // It always returns the requestContext even in the error case, as the request context is used in error handling.
 func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestContext, inferenceRequestBody *fwkrh.InferenceRequestBody) (_ *handlers.RequestContext, err error) {
+	// Record the client-facing model for every request, including forwarded-unchanged ones.
+	reqCtx.IncomingModelName = inferenceRequestBody.Model
+	return d.handleRequest(ctx, reqCtx, inferenceRequestBody)
+}
+
+// handleRequest is the shared orchestration core for both bodied and bodyless requests.
+// A nil inferenceRequestBody signals a bodyless request (e.g. WebSocket upgrade).
+func (d *Director) handleRequest(ctx context.Context, reqCtx *handlers.RequestContext, inferenceRequestBody *fwkrh.InferenceRequestBody) (_ *handlers.RequestContext, err error) {
 	tracer := tracing.Tracer("llm-d-router/pkg/epp/requestcontrol")
 	ctx, span := tracer.Start(ctx, "request_orchestration", trace.WithSpanKind(trace.SpanKindServer))
 	defer func() {
@@ -209,23 +222,29 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 
 	logger := log.FromContext(ctx)
 
-	// Record the client-facing model for every request, including forwarded-unchanged ones.
-	reqCtx.IncomingModelName = inferenceRequestBody.Model
-
 	if err := d.modelRewriteIfNeeded(ctx, reqCtx, inferenceRequestBody); err != nil {
 		return reqCtx, err
 	}
 
 	fairnessID, _ := metadata.GetLowerCaseHeaderValue(reqCtx.Request.Headers, metadata.FlowFairnessIDKey)
 
-	// Prepare InferenceRequest (needed for both saturation detection and Scheduler)
+	// For bodyless requests the client-facing model comes from headers, not the
+	// body. Record it before header processors may rewrite TargetModel.
+	if inferenceRequestBody == nil {
+		reqCtx.IncomingModelName = reqCtx.TargetModelName
+	}
+
 	reqCtx.SchedulingRequest = &fwksched.InferenceRequest{
-		RequestID:        reqCtx.Request.ID,
-		TargetModel:      reqCtx.TargetModelName,
-		Body:             inferenceRequestBody,
-		Headers:          reqCtx.Request.Headers,
-		FairnessID:       fairnessID,
-		RequestSizeBytes: reqCtx.RequestSize,
+		RequestID:   reqCtx.Request.ID,
+		TargetModel: reqCtx.TargetModelName,
+		Headers:     reqCtx.Request.Headers,
+		FairnessID:  fairnessID,
+	}
+	if inferenceRequestBody != nil {
+		reqCtx.SchedulingRequest.Body = inferenceRequestBody
+		reqCtx.SchedulingRequest.RequestSizeBytes = reqCtx.RequestSize
+	} else {
+		reqCtx.SchedulingRequest.Bodyless = true
 	}
 
 	logger = logger.WithValues("incomingModelName", reqCtx.IncomingModelName, "targetModelName", reqCtx.TargetModelName)
@@ -234,6 +253,12 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	if err := d.runRequestHeaderProcessors(ctx, reqCtx.SchedulingRequest); err != nil {
 		return reqCtx, err
 	}
+
+	// Header processors may rewrite SchedulingRequest.TargetModel. Sync it back.
+	if inferenceRequestBody == nil {
+		reqCtx.TargetModelName = reqCtx.SchedulingRequest.TargetModel
+	}
+
 	// Derive FairnessID from agent identity when no explicit header supplied it.
 	source := tracing.AttributionSourceHeader
 	if reqCtx.SchedulingRequest.FairnessID == "" {
@@ -344,8 +369,10 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 	if err := d.priorityRewriteIfNeeded(ctx, reqCtx, inferenceRequestBody); err != nil {
 		return reqCtx, err
 	}
-	if err := d.repackage(ctx, reqCtx, inferenceRequestBody); err != nil {
-		return reqCtx, err
+	if inferenceRequestBody != nil {
+		if err := d.repackage(ctx, reqCtx, inferenceRequestBody); err != nil {
+			return reqCtx, err
+		}
 	}
 	return reqCtx, nil
 }
@@ -358,6 +385,9 @@ func (d *Director) modelRewriteIfNeeded(ctx context.Context, reqCtx *handlers.Re
 	rewriter, ok := reqCtx.Parser.(fwkrh.ModelNameRewriter)
 	if !ok {
 		logger.Info("Warning: parser does not implement ModelNameRewriter, skipping model rewrite")
+		return nil
+	}
+	if inferenceRequestBody == nil {
 		return nil
 	}
 	payload, ok := inferenceRequestBody.Payload.(fwkrh.MarshalablePayload)
@@ -394,6 +424,9 @@ func (d *Director) priorityRewriteIfNeeded(ctx context.Context, reqCtx *handlers
 	rewriter, ok := reqCtx.Parser.(fwkrh.PriorityRewriter)
 	if !ok {
 		logger.V(logutil.DEBUG).Info("parser does not implement PriorityRewriter, skipping priority rewrite")
+		return nil
+	}
+	if inferenceRequestBody == nil {
 		return nil
 	}
 	payload, ok := inferenceRequestBody.Payload.(fwkrh.MarshalablePayload)
@@ -664,6 +697,11 @@ func (d *Director) HandleResponseBody(ctx context.Context, reqCtx *handlers.Requ
 	return reqCtx
 }
 
+func (d *Director) HandleResponseTrail(ctx context.Context, reqCtx *handlers.RequestContext) *handlers.RequestContext {
+	d.runResponseTrailerPlugins(ctx, reqCtx.SchedulingRequest)
+	return reqCtx
+}
+
 func (d *Director) loadOrCreateResponseBodyQueue(reqCtx *handlers.RequestContext) *responseBodyQueue {
 	if val, ok := d.responseBodyQueues.Load(reqCtx); ok {
 		return val.(*responseBodyQueue)
@@ -852,6 +890,22 @@ func (d *Director) runResponseBodyPlugins(ctx context.Context, request *fwksched
 		metrics.RecordPluginProcessingLatency(fwkrc.ResponseStreamingExtensionPoint, name.Type, name.Name, time.Since(before))
 		if loggerTrace.Enabled() {
 			loggerTrace.Info("Completed running ResponseStreaming plugin successfully", "plugin", name)
+		}
+	}
+}
+
+func (d *Director) runResponseTrailerPlugins(ctx context.Context, request *fwksched.InferenceRequest) {
+	loggerTrace := log.FromContext(ctx).V(logutil.TRACE)
+	for _, plugin := range d.requestControlPlugins.responseTrailerPlugins {
+		name := plugin.TypedName()
+		if loggerTrace.Enabled() {
+			loggerTrace.Info("Running ResponseTrailer plugin", "plugin", name)
+		}
+		before := time.Now()
+		plugin.ResponseTrailer(ctx, request)
+		metrics.RecordPluginProcessingLatency(fwkrc.ResponseTrailerExtensionPoint, name.Type, name.Name, time.Since(before))
+		if loggerTrace.Enabled() {
+			loggerTrace.Info("Completed running ResponseTrailer plugin successfully", "plugin", name)
 		}
 	}
 }

@@ -46,6 +46,8 @@ func Register(customCollectors ...prometheus.Collector) {
 	registerMetrics.Do(func() {
 		// Register other metrics
 		metrics.Registry.MustRegister(llmdRequestCounter)
+		metrics.Registry.MustRegister(llmdTunnelCounter)
+		metrics.Registry.MustRegister(llmdTunnelDuration)
 		metrics.Registry.MustRegister(llmdRequestErrCounter)
 		metrics.Registry.MustRegister(llmdRequestLatencies)
 		metrics.Registry.MustRegister(llmdRequestSizes)
@@ -105,6 +107,8 @@ func Register(customCollectors ...prometheus.Collector) {
 func Reset() {
 	// Reset other metrics
 	llmdRequestCounter.Reset()
+	llmdTunnelCounter.Reset()
+	llmdTunnelDuration.Reset()
 	llmdRequestErrCounter.Reset()
 	llmdRequestLatencies.Reset()
 	llmdRequestSizes.Reset()
@@ -162,6 +166,14 @@ func RecordRequestCounter(modelName, targetModelName, fairnessID string, priorit
 	llmdRequestCounter.WithLabelValues(modelName, targetModelName, fairnessID, prioStr).Inc()
 }
 
+// RecordTunneledRequestCounter records the number of tunneled requests.
+func RecordTunneledRequestCounter(modelName, targetModelName, fairnessID string, priority int) {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
+	prioStr := strconv.Itoa(priority)
+	llmdTunnelCounter.WithLabelValues(modelName, targetModelName, fairnessID, prioStr).Inc()
+}
+
 // RecordRequestErrCounter records the number of error requests.
 func RecordRequestErrCounter(modelName, targetModelName, fairnessID, priority string, code string) {
 	modelName, targetModelName = boundModels(modelName, targetModelName)
@@ -190,6 +202,22 @@ func RecordRequestLatencies(ctx context.Context, modelName, targetModelName, fai
 	elapsedSeconds := complete.Sub(received).Seconds()
 	observeWithTraceExemplar(ctx,
 		llmdRequestLatencies.WithLabelValues(modelName, targetModelName, fairnessID, priority),
+		elapsedSeconds)
+	return true
+}
+
+// RecordTunnelRequestDuration records duration of a tunneled request.
+func RecordTunnelRequestDuration(ctx context.Context, modelName, targetModelName, fairnessID, priority string, received time.Time, complete time.Time) bool {
+	modelName, targetModelName = boundModels(modelName, targetModelName)
+	fairnessID = boundFairnessID(fairnessID)
+	if !complete.After(received) {
+		log.FromContext(ctx).V(logutil.DEFAULT).Error(nil, "Request latency values are invalid",
+			"modelName", modelName, "targetModelName", targetModelName, "completeTime", complete, "receivedTime", received)
+		return false
+	}
+	elapsedSeconds := complete.Sub(received).Seconds()
+	observeWithTraceExemplar(ctx,
+		llmdTunnelDuration.WithLabelValues(modelName, targetModelName, fairnessID, priority),
 		elapsedSeconds)
 	return true
 }

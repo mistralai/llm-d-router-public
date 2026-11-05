@@ -36,6 +36,13 @@ type ReadinessChecker interface {
 	CheckReady() error
 }
 
+// BodylessCapable is an optional interface for plugins that declare whether
+// they can operate on a bodyless request (e.g. a WebSocket upgrade or a gRPC
+// bidirectional stream).
+type BodylessCapable interface {
+	BodylessCompatible() bool
+}
+
 // DataDependencies holds the data keys a plugin consumes, split by whether they
 // are required (framework errors if no producer exists) or optional (framework
 // logs a warning but continues if no producer exists).

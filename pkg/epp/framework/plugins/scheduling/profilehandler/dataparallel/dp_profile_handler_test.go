@@ -75,6 +75,8 @@ func (p *mockSchedulerProfile) Run(_ context.Context, _ *scheduling.InferenceReq
 	return &scheduling.ProfileRunResult{}, nil
 }
 
+func (p *mockSchedulerProfile) BodylessCompatible() bool { return false }
+
 func TestProfileHandlerFactory(t *testing.T) {
 	tests := []struct {
 		name         string
