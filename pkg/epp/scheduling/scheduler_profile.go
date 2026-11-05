@@ -54,9 +54,10 @@ func NewSchedulerProfile() *SchedulerProfile {
 
 // SchedulerProfile provides a profile configuration for the scheduler which influence routing decisions.
 type SchedulerProfile struct {
-	filters []fwksched.Filter
-	scorers []*WeightedScorer
-	picker  fwksched.Picker
+	filters            []fwksched.Filter
+	scorers            []*WeightedScorer
+	picker             fwksched.Picker
+	bodylessCompatible bool
 }
 
 // WithFilters sets the given filter plugins as the Filter plugins.

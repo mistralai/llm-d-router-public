@@ -488,6 +488,12 @@ func (ts *testDirector) HandleResponseBody(ctx context.Context, reqCtx *handlers
 	}
 	return reqCtx
 }
+func (ts *testDirector) HandleBodylessRequest(ctx context.Context, reqCtx *handlers.RequestContext) (*handlers.RequestContext, error) {
+	return reqCtx, nil
+}
+func (ts *testDirector) HandleResponseTrail(ctx context.Context, reqCtx *handlers.RequestContext) *handlers.RequestContext {
+	return reqCtx
+}
 func (ts *testDirector) GetRandomEndpoint() *fwkdl.EndpointMetadata {
 	return &fwkdl.EndpointMetadata{
 		Address: podAddress,

@@ -35,6 +35,7 @@ const (
 	ResponseReceivedExtensionPoint  = "ResponseReceived"
 	ResponseStreamingExtensionPoint = "ResponseStreaming"
 	ResponseCompleteExtensionPoint  = "ResponseComplete"
+	ResponseTrailerExtensionPoint   = "ResponseTrailer"
 )
 
 // ConditionalDecodeHandledAttributeKey is the request-attribute key a
@@ -170,4 +171,10 @@ type Responder interface {
 	// remaining Responders and to normal routing once all decline. A non-nil error fails
 	// the request through the standard error path.
 	Respond(ctx context.Context, request *RequestLine, endpoints []datalayer.Endpoint) (*LocalResponse, error)
+}
+
+// ResponseTrailerProcessor runs after a response trailer has been received.
+type ResponseTrailerProcessor interface {
+	plugin.Plugin
+	ResponseTrailer(ctx context.Context, request *fwksched.InferenceRequest) error
 }

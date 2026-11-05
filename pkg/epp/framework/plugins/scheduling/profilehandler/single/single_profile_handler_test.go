@@ -33,6 +33,8 @@ func (f *fakeSchedulerProfile) Run(_ context.Context, _ *fwksched.InferenceReque
 	return &fwksched.ProfileRunResult{}, nil
 }
 
+func (f *fakeSchedulerProfile) BodylessCompatible() bool { return false }
+
 func TestNewSingleProfileHandler(t *testing.T) {
 	handler := NewSingleProfileHandler()
 

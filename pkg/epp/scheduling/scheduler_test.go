@@ -207,6 +207,230 @@ func TestScheduleFilterDrainReturnsTypedError(t *testing.T) {
 	assert.Equal(t, string(errcommon.RequestDroppedReasonNoEndpoints), typedErr.Headers[errcommon.RequestDroppedReasonHeaderKey])
 }
 
+// bodylessPlugin is a testPlugin that also answers the BodylessCapable query.
+// A bare testPlugin does not implement BodylessCapable.
+type bodylessPlugin struct {
+	testPlugin
+	bodyless bool
+}
+
+func (p *bodylessPlugin) BodylessCompatible() bool { return p.bodyless }
+
+func newBodylessPlugin(name string, bodyless bool) *bodylessPlugin {
+	return &bodylessPlugin{
+		testPlugin: testPlugin{
+			typedName: fwkplugin.TypedName{Type: "bodyless-test", Name: name},
+			PickRes:   k8stypes.NamespacedName{Name: "pod1"},
+		},
+		bodyless: bodyless,
+	}
+}
+
+var (
+	_ fwkplugin.BodylessCapable = &bodylessPlugin{}
+	_ fwksched.Filter           = &bodylessPlugin{}
+	_ fwksched.Scorer           = &bodylessPlugin{}
+	_ fwksched.Picker           = &bodylessPlugin{}
+)
+
+// A profile is bodyless-compatible only when its picker and every filter and
+// scorer declare so. A plugin that does not implement BodylessCapable counts as
+// incompatible.
+func TestSchedulerProfileBodylessCompatible(t *testing.T) {
+	tests := []struct {
+		name    string
+		filters []fwksched.Filter
+		scorers []fwksched.Scorer
+		picker  fwksched.Picker
+		want    bool
+	}{
+		{
+			name:   "compatible picker only",
+			picker: newBodylessPlugin("picker", true),
+			want:   true,
+		},
+		{
+			name:    "every plugin compatible",
+			filters: []fwksched.Filter{newBodylessPlugin("f1", true), newBodylessPlugin("f2", true)},
+			scorers: []fwksched.Scorer{newBodylessPlugin("s1", true), newBodylessPlugin("s2", true)},
+			picker:  newBodylessPlugin("picker", true),
+			want:    true,
+		},
+		{
+			name: "no picker",
+			want: false,
+		},
+		{
+			name:   "picker does not implement BodylessCapable",
+			picker: &testPlugin{typedName: fwkplugin.TypedName{Type: "plain", Name: "picker"}},
+			want:   false,
+		},
+		{
+			name:   "picker reports incompatible",
+			picker: newBodylessPlugin("picker", false),
+			want:   false,
+		},
+		{
+			name:    "filter does not implement BodylessCapable",
+			filters: []fwksched.Filter{newBodylessPlugin("f1", true), &testPlugin{typedName: fwkplugin.TypedName{Type: "plain", Name: "f2"}}},
+			picker:  newBodylessPlugin("picker", true),
+			want:    false,
+		},
+		{
+			name:    "filter reports incompatible",
+			filters: []fwksched.Filter{newBodylessPlugin("f1", true), newBodylessPlugin("f2", false)},
+			picker:  newBodylessPlugin("picker", true),
+			want:    false,
+		},
+		{
+			name:    "scorer does not implement BodylessCapable",
+			scorers: []fwksched.Scorer{newBodylessPlugin("s1", true), &testPlugin{typedName: fwkplugin.TypedName{Type: "plain", Name: "s2"}}},
+			picker:  newBodylessPlugin("picker", true),
+			want:    false,
+		},
+		{
+			name:    "scorer reports incompatible",
+			scorers: []fwksched.Scorer{newBodylessPlugin("s1", true), newBodylessPlugin("s2", false)},
+			picker:  newBodylessPlugin("picker", true),
+			want:    false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			weighted := make([]*WeightedScorer, 0, len(test.scorers))
+			for _, scorer := range test.scorers {
+				weighted = append(weighted, NewWeightedScorer(scorer, 1))
+			}
+			profile := NewSchedulerProfile().WithFilters(test.filters...).WithScorers(weighted...)
+			if test.picker != nil {
+				profile.WithPicker(test.picker)
+			}
+
+			// The result is computed when the scheduler is built.
+			NewSchedulerWithConfig(NewSchedulerConfig(single.NewSingleProfileHandler(), map[string]fwksched.SchedulerProfile{"default": profile}))
+
+			assert.Equal(t, test.want, profile.BodylessCompatible())
+		})
+	}
+}
+
+func TestScheduleBodyless(t *testing.T) {
+	const noBodylessProfile = "no bodyless-compatible scheduler profile"
+
+	tests := []struct {
+		name          string
+		bodyless      bool
+		compatible    bool
+		wantErr       string
+		wantPickCalls int
+	}{
+		{
+			name:          "bodyless request runs a compatible profile",
+			bodyless:      true,
+			compatible:    true,
+			wantPickCalls: 1,
+		},
+		{
+			name:          "bodyless request fails when the only profile is incompatible",
+			bodyless:      true,
+			compatible:    false,
+			wantErr:       noBodylessProfile,
+			wantPickCalls: 0,
+		},
+		{
+			name:          "request with a body runs a compatible profile",
+			bodyless:      false,
+			compatible:    true,
+			wantPickCalls: 1,
+		},
+		{
+			name:          "request with a body runs an incompatible profile",
+			bodyless:      false,
+			compatible:    false,
+			wantPickCalls: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			picker := newBodylessPlugin("picker", test.compatible)
+			profile := NewSchedulerProfile().WithPicker(picker)
+			scheduler := NewSchedulerWithConfig(NewSchedulerConfig(
+				single.NewSingleProfileHandler(), map[string]fwksched.SchedulerProfile{"default": profile}))
+
+			req := &fwksched.InferenceRequest{RequestID: uuid.NewString(), TargetModel: "any-model", Bodyless: test.bodyless}
+			input := []fwksched.Endpoint{
+				fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}}, &fwkdl.Metrics{}, nil),
+			}
+
+			got, err := scheduler.Schedule(context.Background(), req, input)
+
+			assert.Equal(t, test.wantPickCalls, picker.PickCallCount, "picker call count")
+			if test.wantErr != "" {
+				assert.ErrorContains(t, err, test.wantErr)
+				assert.Nil(t, got)
+				return
+			}
+			assert.NoError(t, err)
+			if assert.NotNil(t, got) {
+				assert.Equal(t, "default", got.PrimaryProfileName)
+			}
+		})
+	}
+}
+
+// pickAllOnceHandler picks every profile in the first round and none afterwards.
+type pickAllOnceHandler struct {
+	primary string
+}
+
+func (h *pickAllOnceHandler) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Type: "pick-all-once", Name: "pick-all-once"}
+}
+
+func (h *pickAllOnceHandler) Pick(_ context.Context, _ *fwksched.InferenceRequest, profiles map[string]fwksched.SchedulerProfile,
+	profileResults map[string]*fwksched.ProfileRunResult) map[string]fwksched.SchedulerProfile {
+	if len(profileResults) > 0 {
+		return nil
+	}
+	return profiles
+}
+
+func (h *pickAllOnceHandler) ProcessResults(_ context.Context, _ *fwksched.InferenceRequest,
+	profileResults map[string]*fwksched.ProfileRunResult) (*fwksched.SchedulingResult, error) {
+	return &fwksched.SchedulingResult{ProfileResults: profileResults, PrimaryProfileName: h.primary}, nil
+}
+
+// When a bodyless request is offered several profiles and only some are
+// compatible, the compatible ones run and the rest are skipped without failing
+// the request.
+func TestScheduleBodylessSkipsOnlyIncompatibleProfiles(t *testing.T) {
+	compatiblePicker := newBodylessPlugin("compatible-picker", true)
+	incompatiblePicker := newBodylessPlugin("incompatible-picker", false)
+	profiles := map[string]fwksched.SchedulerProfile{
+		"compatible":   NewSchedulerProfile().WithPicker(compatiblePicker),
+		"incompatible": NewSchedulerProfile().WithPicker(incompatiblePicker),
+	}
+	scheduler := NewSchedulerWithConfig(NewSchedulerConfig(&pickAllOnceHandler{primary: "compatible"}, profiles))
+
+	req := &fwksched.InferenceRequest{RequestID: uuid.NewString(), TargetModel: "any-model", Bodyless: true}
+	input := []fwksched.Endpoint{
+		fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}}, &fwkdl.Metrics{}, nil),
+	}
+
+	got, err := scheduler.Schedule(context.Background(), req, input)
+
+	assert.NoError(t, err)
+	if assert.NotNil(t, got) {
+		assert.Equal(t, "compatible", got.PrimaryProfileName)
+		assert.Contains(t, got.ProfileResults, "compatible")
+		assert.NotContains(t, got.ProfileResults, "incompatible")
+	}
+	assert.Equal(t, 1, compatiblePicker.PickCallCount, "compatible profile must run")
+	assert.Equal(t, 0, incompatiblePicker.PickCallCount, "incompatible profile must be skipped")
+}
+
 // messageCaptureSink records the message of every log call at every verbosity.
 type messageCaptureSink struct {
 	messages []string

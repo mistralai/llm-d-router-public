@@ -88,6 +88,9 @@ func (p *hookPlugin) ResponseHeader(_ context.Context, _ *fwksched.InferenceRequ
 }
 func (p *hookPlugin) ResponseBody(_ context.Context, _ *fwksched.InferenceRequest, _ *fwkrc.Response, _ *fwkdl.EndpointMetadata) {
 }
+func (p *hookPlugin) ResponseTrailer(_ context.Context, _ *fwksched.InferenceRequest) error {
+	return nil
+}
 func (p *hookPlugin) Admit(_ context.Context, _ *fwksched.InferenceRequest, _ []fwksched.Endpoint) error {
 	return nil
 }
@@ -115,16 +118,17 @@ func (p *unrankedPlugin) Respond(_ context.Context, _ *fwkrc.RequestLine, _ []fw
 // these, an interface change upstream would silently drop a mock from a hook list
 // and leave the matrix below asserting on empty slices.
 var (
-	_ fwkrc.RequestHeaderProcessor  = &hookPlugin{}
-	_ fwkrc.Screener                = &hookPlugin{}
-	_ fwkrc.Admitter                = &hookPlugin{}
-	_ fwkrc.DataProducer            = &hookPlugin{}
-	_ fwkrc.PreRequest              = &hookPlugin{}
-	_ fwkrc.ResponseHeaderProcessor = &hookPlugin{}
-	_ fwkrc.ResponseBodyProcessor   = &hookPlugin{}
-	_ fwkrc.Responder               = &hookPlugin{}
-	_ fwkrc.PreRequest              = &unrankedPlugin{}
-	_ fwkrc.Responder               = &unrankedPlugin{}
+	_ fwkrc.RequestHeaderProcessor   = &hookPlugin{}
+	_ fwkrc.Screener                 = &hookPlugin{}
+	_ fwkrc.Admitter                 = &hookPlugin{}
+	_ fwkrc.DataProducer             = &hookPlugin{}
+	_ fwkrc.PreRequest               = &hookPlugin{}
+	_ fwkrc.ResponseHeaderProcessor  = &hookPlugin{}
+	_ fwkrc.ResponseBodyProcessor    = &hookPlugin{}
+	_ fwkrc.ResponseTrailerProcessor = &hookPlugin{}
+	_ fwkrc.Responder                = &hookPlugin{}
+	_ fwkrc.PreRequest               = &unrankedPlugin{}
+	_ fwkrc.Responder                = &unrankedPlugin{}
 )
 
 func names[T interface{ TypedName() fwkplugin.TypedName }](plugins []T) []string {
@@ -189,6 +193,11 @@ func TestConfig_OrderPlugins_AllHookLists(t *testing.T) {
 		{
 			name: "responseStreaming orders producer before consumer",
 			got:  names(cfg.responseStreamingPlugins),
+			want: []string{"P/mock", "C/mock"},
+		},
+		{
+			name: "responseTrailer orders producer before consumer",
+			got:  names(cfg.responseTrailerPlugins),
 			want: []string{"P/mock", "C/mock"},
 		},
 		{
@@ -317,6 +326,7 @@ func TestConfig_OrderPlugins_InputOrderIndependent(t *testing.T) {
 			assert.Equal(t, wantRanked, names(cfg.admissionPlugins), "admission")
 			assert.Equal(t, wantRanked, names(cfg.responseReceivedPlugins), "responseReceived")
 			assert.Equal(t, wantRanked, names(cfg.responseStreamingPlugins), "responseStreaming")
+			assert.Equal(t, wantRanked, names(cfg.responseTrailerPlugins), "responseTrailer")
 			assert.Equal(t, wantRanked, names(cfg.dataProducerPlugins), "dataProducer")
 			assert.Equal(t, wantPreReq, names(cfg.responders), "responders")
 		})
@@ -333,4 +343,27 @@ func TestConfig_OrderPlugins_WithResponders(t *testing.T) {
 	cfg.OrderPlugins(nil)
 
 	assert.Equal(t, []string{"A/mock", "B/mock"}, names(cfg.Responders()))
+}
+
+// TestConfig_ResponseTrailerPlugins covers registration of ResponseTrailer
+// plugins through the typed setter and through AddPlugins type detection.
+func TestConfig_ResponseTrailerPlugins(t *testing.T) {
+	t.Run("WithResponseTrailerPlugins replaces the existing list", func(t *testing.T) {
+		cfg := NewConfig().
+			WithResponseTrailerPlugins(&hookPlugin{name: "old"}).
+			WithResponseTrailerPlugins(&hookPlugin{name: "A"}, &hookPlugin{name: "B"})
+
+		assert.Equal(t, []string{"A/mock", "B/mock"}, names(cfg.responseTrailerPlugins))
+	})
+
+	t.Run("AddPlugins registers only plugins implementing ResponseTrailer", func(t *testing.T) {
+		cfg := NewConfig()
+		cfg.AddPlugins(&unrankedPlugin{name: "U"}, &hookPlugin{name: "H"})
+
+		assert.Equal(t, []string{"H/mock"}, names(cfg.responseTrailerPlugins))
+	})
+
+	t.Run("a new config has no ResponseTrailer plugins", func(t *testing.T) {
+		assert.Empty(t, NewConfig().responseTrailerPlugins)
+	})
 }

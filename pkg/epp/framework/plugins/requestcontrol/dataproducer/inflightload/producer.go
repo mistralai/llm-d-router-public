@@ -123,14 +123,15 @@ func InFlightLoadProducerFactory(name string, decoder *json.Decoder, handle fwkp
 }
 
 var (
-	_ requestcontrol.PreRequest            = &InFlightLoadProducer{}
-	_ requestcontrol.ResponseBodyProcessor = &InFlightLoadProducer{}
-	_ requestcontrol.DataProducer          = &InFlightLoadProducer{}
-	_ datalayer.EndpointExtractor          = (*InFlightLoadProducer)(nil)
-	_ datalayer.Registrant                 = &InFlightLoadProducer{}
-	_ datalayer.CrossReplicaContributor    = (*InFlightLoadProducer)(nil)
-	_ fwkplugin.ConsumerPlugin             = &InFlightLoadProducer{}
-	_ fwkplugin.StateDumper                = &InFlightLoadProducer{}
+	_ requestcontrol.PreRequest               = &InFlightLoadProducer{}
+	_ requestcontrol.ResponseBodyProcessor    = &InFlightLoadProducer{}
+	_ requestcontrol.ResponseTrailerProcessor = &InFlightLoadProducer{}
+	_ requestcontrol.DataProducer             = &InFlightLoadProducer{}
+	_ datalayer.EndpointExtractor             = (*InFlightLoadProducer)(nil)
+	_ datalayer.Registrant                    = &InFlightLoadProducer{}
+	_ datalayer.CrossReplicaContributor       = (*InFlightLoadProducer)(nil)
+	_ fwkplugin.ConsumerPlugin                = &InFlightLoadProducer{}
+	_ fwkplugin.StateDumper                   = &InFlightLoadProducer{}
 )
 
 type InFlightLoadProducer struct {
@@ -626,6 +627,13 @@ func (p *InFlightLoadProducer) ResponseBody(
 	} else {
 		p.PluginState.Touch(request.RequestID)
 	}
+}
+
+func (p *InFlightLoadProducer) ResponseTrailer(ctx context.Context, request *fwksched.InferenceRequest) error {
+	if request != nil {
+		p.PluginState.Delete(request.RequestID)
+	}
+	return nil
 }
 
 // release surgically deletes a single profile's entry from PluginState,

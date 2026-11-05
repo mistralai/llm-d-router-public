@@ -324,6 +324,116 @@ func TestInFlightLoadProducer_Lifecycle(t *testing.T) {
 	require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
 }
 
+// A bodyless request (e.g. a gRPC bidirectional stream) never reaches
+// ResponseBody, so the response trailer is the only release point for its load.
+func TestInFlightLoadProducer_ResponseTrailerReleasesLoad(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	t.Run("single endpoint", func(t *testing.T) {
+		producer := newTestProducer(t)
+		endpointID := fullEndpointName("trailer-endpoint")
+
+		req := makeTokenRequest("trailer-req", 4)
+		res := makeSchedulingResult("trailer-endpoint")
+		require.NoError(t, producer.PreRequest(ctx, req, res))
+		require.Equal(t, int64(1), producer.requestTracker.get(endpointID))
+		require.Equal(t, int64(4)+UnknownOutputTokens, producer.tokenTracker.get(endpointID))
+
+		req.SchedulingResult = res
+		require.NoError(t, producer.ResponseTrailer(ctx, req))
+
+		require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
+		require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
+	})
+
+	t.Run("every profile endpoint", func(t *testing.T) {
+		producer := newTestProducer(t)
+		idA := fullEndpointName("pod-a")
+		idB := fullEndpointName("pod-b")
+
+		req := makeTokenRequest("trailer-multi", 4)
+		res := &fwksched.SchedulingResult{
+			PrimaryProfileName: "prefill",
+			ProfileResults: map[string]*fwksched.ProfileRunResult{
+				"prefill": {TargetEndpoints: []fwksched.Endpoint{newStubSchedulingEndpoint("pod-a")}},
+				"decode":  {TargetEndpoints: []fwksched.Endpoint{newStubSchedulingEndpoint("pod-b")}},
+			},
+		}
+		require.NoError(t, producer.PreRequest(ctx, req, res))
+		require.Equal(t, int64(1), producer.requestTracker.get(idA))
+		require.Equal(t, int64(1), producer.requestTracker.get(idB))
+
+		req.SchedulingResult = res
+		require.NoError(t, producer.ResponseTrailer(ctx, req))
+
+		require.Equal(t, int64(0), producer.requestTracker.get(idA))
+		require.Equal(t, int64(0), producer.requestTracker.get(idB))
+	})
+
+	t.Run("only the trailer's request is released", func(t *testing.T) {
+		producer := newTestProducer(t)
+		endpointID := fullEndpointName("shared-endpoint")
+		res := makeSchedulingResult("shared-endpoint")
+
+		first := makeTokenRequest("trailer-first", 4)
+		second := makeTokenRequest("trailer-second", 4)
+		require.NoError(t, producer.PreRequest(ctx, first, res))
+		require.NoError(t, producer.PreRequest(ctx, second, res))
+		require.Equal(t, int64(2), producer.requestTracker.get(endpointID))
+
+		first.SchedulingResult = res
+		require.NoError(t, producer.ResponseTrailer(ctx, first))
+		require.Equal(t, int64(1), producer.requestTracker.get(endpointID))
+
+		second.SchedulingResult = res
+		require.NoError(t, producer.ResponseTrailer(ctx, second))
+		require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
+	})
+
+	t.Run("a second trailer does not underflow the counters", func(t *testing.T) {
+		producer := newTestProducer(t)
+		endpointID := fullEndpointName("repeat-endpoint")
+
+		req := makeTokenRequest("trailer-repeat", 4)
+		res := makeSchedulingResult("repeat-endpoint")
+		require.NoError(t, producer.PreRequest(ctx, req, res))
+		req.SchedulingResult = res
+
+		require.NoError(t, producer.ResponseTrailer(ctx, req))
+		require.NoError(t, producer.ResponseTrailer(ctx, req))
+
+		require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
+		require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
+	})
+
+	t.Run("trailer after end of stream does not underflow the counters", func(t *testing.T) {
+		producer := newTestProducer(t)
+		endpointID := fullEndpointName("eos-endpoint")
+
+		req := makeTokenRequest("trailer-after-eos", 4)
+		res := makeSchedulingResult("eos-endpoint")
+		require.NoError(t, producer.PreRequest(ctx, req, res))
+		req.SchedulingResult = res
+
+		producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
+		require.NoError(t, producer.ResponseTrailer(ctx, req))
+
+		require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
+		require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
+	})
+}
+
+func TestInFlightLoadProducer_ResponseTrailerNilRequest(t *testing.T) {
+	t.Parallel()
+
+	producer := newTestProducer(t)
+	require.NotPanics(t, func() {
+		require.NoError(t, producer.ResponseTrailer(context.Background(), nil))
+	})
+}
+
 func TestInFlightLoadProducer_MultiPodLifecycle(t *testing.T) {
 	t.Parallel()
 

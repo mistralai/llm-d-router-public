@@ -37,6 +37,8 @@ func (f *fakeSchedulerProfile) Run(_ context.Context, _ *fwksched.InferenceReque
 	return &fwksched.ProfileRunResult{}, nil
 }
 
+func (f *fakeSchedulerProfile) BodylessCompatible() bool { return false }
+
 // infoCaptureSink is a logr.LogSink that records every Info call. Used to verify the
 // diagnostic fields Pick logs when no profile can be resolved.
 type infoCaptureSink struct {
