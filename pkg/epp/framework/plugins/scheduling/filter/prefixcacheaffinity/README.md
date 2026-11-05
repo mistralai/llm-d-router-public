@@ -64,8 +64,15 @@ Can be instantiated multiple times with different thresholds (e.g., 0.99 for glo
   `prefillThroughput` (default), or comes from the latency predictor when `ttftSource`
   is `latencyPredictor`
 - If no endpoints have the TTFT source attribute (`LatencyPredictionInfo` or `InFlightLoad`),
-  the TTFT load gate is skipped. If no endpoints have `PrefixCacheMatchInfo`, all prefix
-  scores default to 0 and no endpoints pass the affinity threshold, so all are kept (no-op)
+  the TTFT load gate is skipped.
+- If no endpoints have `PrefixCacheMatchInfo` with a positive total block count,
+  all endpoints are kept and the `missing_prefix_signal` outcome is recorded.
+  This covers skipped cache lookups and prompts with no complete cache blocks.
+  An observed zero match with a positive total block count records `no_match`.
+
+Cache-match ratios should count only evaluated affinity decisions in their denominator
+(`sticky`, `no_match`, and `load_override`). Exclude `missing_prefix_signal`,
+`not_applicable`, and `exploration`; these outcomes do not establish a cache hit or miss.
 
 ## Composition requirements
 
