@@ -109,9 +109,6 @@ var errIndexCardinality = errors.New("index cardinality limit reached")
 
 // InMemoryIndex is an in-memory implementation of the Index interface.
 type InMemoryIndex struct {
-	// mu protects engine-key-level check-and-act operations (Evict's allEmpty
-	// check + mapping removal vs Add's pod entry insertion) to prevent TOCTOU races.
-	mu sync.Mutex
 	// data holds the mapping of requestKeys to sets of pod identifiers.
 	data *lruStore
 	// engineToRequestKeys holds the mapping of engineKeys to requestKeys.
@@ -366,11 +363,6 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	}
 
 	// Store requestKey -> PodCache mappings for all request keys.
-	// Hold m.mu to prevent Evict from checking emptiness and removing the
-	// engine→request mapping while we are inserting pod entries.
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	for _, requestKey := range requestKeys {
 		podCache, found := m.data.Get(requestKey)
 		if !found {
@@ -414,8 +406,7 @@ func (m *InMemoryIndex) Evict(ctx context.Context, keyType KeyType, keys []Block
 
 	switch keyType {
 	case EngineKey:
-		// Resolve each engine key's request keys and evict the pod entries
-		// without holding mu (engineToRequestKeys and data are thread-safe).
+		// Resolve each engine key's request keys and evict the pod entries.
 		groups := make([][]BlockHash, len(keys))
 		for i, key := range keys {
 			rks, found := m.engineToRequestKeys.Peek(key)
@@ -429,9 +420,6 @@ func (m *InMemoryIndex) Evict(ctx context.Context, keyType KeyType, keys []Block
 			}
 		}
 
-		// One lock hold covers every engine key's allEmpty check and mapping
-		// removal, keeping the Add-vs-Evict TOCTOU protection while batching.
-		m.mu.Lock()
 		for i, key := range keys {
 			if groups[i] == nil {
 				continue
@@ -447,7 +435,6 @@ func (m *InMemoryIndex) Evict(ctx context.Context, keyType KeyType, keys []Block
 				m.engineToRequestKeys.Remove(key)
 			}
 		}
-		m.mu.Unlock()
 		return nil
 	case RequestKey:
 		for _, key := range keys {
