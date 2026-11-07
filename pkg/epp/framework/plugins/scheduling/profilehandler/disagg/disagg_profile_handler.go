@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"go.opentelemetry.io/otel/trace"
@@ -571,6 +572,10 @@ func (h *Handler) PreRequest(ctx context.Context, request *scheduling.InferenceR
 		)
 		return nil
 	}
+	if request.Headers == nil {
+		request.Headers = make(map[string]string)
+	}
+	routing.DeleteRoutingHeader(request.Headers, routing.PrefillDataParallelRankHeader)
 	if schedulingResult == nil {
 		span.SetAttributes(
 			semconv.LLMDEPPPDDisaggregationUsed(false),
@@ -606,6 +611,9 @@ func (h *Handler) PreRequest(ctx context.Context, request *scheduling.InferenceR
 		targetPod := prefillProfileRunResult.TargetEndpoints[0].GetMetadata()
 		prefillHostPort := net.JoinHostPort(targetPod.Address, targetPod.Port)
 		routing.SetRoutingHeader(request.Headers, routing.PrefillEndpointHeader, prefillHostPort)
+		if rank := targetPod.DataParallelRank; rank != nil && *rank >= 0 {
+			request.Headers[routing.PrefillDataParallelRankHeader] = strconv.Itoa(*rank)
+		}
 		span.SetAttributes(
 			semconv.LLMDEPPPDDisaggregationUsed(true),
 			semconv.LLMDEPPPDPrefillPodAddress(targetPod.Address),

@@ -1938,3 +1938,44 @@ func TestHandler_ProcessResults_PrefillFirst(t *testing.T) {
 	assert.Contains(t, res.ProfileResults, defaultDecodeProfile)
 	assert.Contains(t, res.ProfileResults, defaultPrefillProfile)
 }
+
+func TestHandler_PreRequest_PrefillRank(t *testing.T) {
+	zero, one, negative := 0, 1, -1
+	for _, tc := range []struct {
+		name      string
+		rank      *int
+		prefill   bool
+		nilResult bool
+		want      string
+	}{
+		{name: "independent rank", rank: &one, prefill: true, want: "1"},
+		{name: "rank zero", rank: &zero, prefill: true, want: "0"},
+		{name: "unranked prefill", prefill: true},
+		{name: "negative rank", rank: &negative, prefill: true},
+		{name: "local decode"},
+		{name: "missing result", nilResult: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := utils.NewTestContext(t)
+			handler := NewDisaggProfileHandler(customDecodeProfile, customPrefillProfile, "", nil, nil)
+			request := &scheduling.InferenceRequest{Headers: map[string]string{
+				routing.DataParallelRankHeader:        "6",
+				routing.PrefillDataParallelRankHeader: "99",
+			}}
+			result := &scheduling.SchedulingResult{PrimaryProfileName: customDecodeProfile,
+				ProfileResults: map[string]*scheduling.ProfileRunResult{}}
+			if tc.prefill {
+				endpoint := scheduling.NewEndpoint(&fwkdl.EndpointMetadata{
+					Address: "10.0.0.2", Port: "8000", DataParallelRank: tc.rank,
+				}, nil, fwkdl.NewAttributes())
+				result.ProfileResults[customPrefillProfile] = &scheduling.ProfileRunResult{TargetEndpoints: []scheduling.Endpoint{endpoint}}
+			}
+			if tc.nilResult {
+				result = nil
+			}
+			require.NoError(t, handler.PreRequest(ctx, request, result))
+			assert.Equal(t, "6", request.Headers[routing.DataParallelRankHeader])
+			assert.Equal(t, tc.want, request.Headers[routing.PrefillDataParallelRankHeader])
+		})
+	}
+}

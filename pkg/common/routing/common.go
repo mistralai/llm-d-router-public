@@ -30,6 +30,9 @@ const (
 	// PrefillEndpointHeader is the header name used to indicate Prefill worker <ip:port>
 	PrefillEndpointHeader = "x-llm-d-prefiller-host-port"
 
+	// PrefillDataParallelRankHeader keeps the prefill selection separate from decode.
+	PrefillDataParallelRankHeader = "x-llm-d-prefiller-data-parallel-rank"
+
 	// EncoderEndpointsHeader is the header name used to indicate Encoder workers <ip:port> list
 	EncoderEndpointsHeader = "x-llm-d-encoder-hosts-ports"
 

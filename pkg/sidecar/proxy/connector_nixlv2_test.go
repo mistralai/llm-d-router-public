@@ -1434,6 +1434,46 @@ var _ = Describe("NIXL Connector (v2)", func() {
 
 		Expect(testInfo.decodeHandler.GetCompletionHeaders()[0].Get(requestHeaderDataParallelRank)).To(BeEmpty())
 	})
+	DescribeTable("routes vLLM P and D independently", func(prefillRank, expectedPrefillRank string, status int) {
+		proxyBaseAddr := startProxy()
+		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+reqcommon.PathChatCompletions,
+			bytes.NewReader([]byte(chatCompletionsRequestBody)))
+		Expect(err).NotTo(HaveOccurred())
+		req.Header.Set(routing.PrefillEndpointHeader, strings.TrimPrefix(testInfo.prefillBackend.URL, "http://"))
+		req.Header.Set(routing.DataParallelRankHeader, "6")
+		if prefillRank != "" {
+			req.Header.Set(routing.PrefillDataParallelRankHeader, prefillRank)
+		}
+		response, err := http.DefaultClient.Do(req)
+		Expect(err).NotTo(HaveOccurred())
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(response.StatusCode).To(Equal(status), string(body))
+		if status != http.StatusOK {
+			Expect(testInfo.prefillHandler.RequestCount.Load()).To(BeZero())
+			Expect(testInfo.decodeHandler.RequestCount.Load()).To(BeZero())
+			return
+		}
+		prefillHeaders := testInfo.prefillHandler.GetCompletionHeaders()
+		decodeHeaders := testInfo.decodeHandler.GetCompletionHeaders()
+		Expect(prefillHeaders).To(HaveLen(1))
+		Expect(decodeHeaders).To(HaveLen(1))
+		Expect(prefillHeaders[0].Get(routing.DataParallelRankHeader)).To(Equal(expectedPrefillRank))
+		Expect(decodeHeaders[0].Get(routing.DataParallelRankHeader)).To(Equal("6"))
+		Expect(prefillHeaders[0].Get(routing.PrefillDataParallelRankHeader)).To(BeEmpty())
+		Expect(decodeHeaders[0].Get(routing.PrefillDataParallelRankHeader)).To(BeEmpty())
+		var result map[string]any
+		Expect(json.Unmarshal(body, &result)).To(Succeed())
+		Expect(cachedTokensFromResponse(result)).To(BeNumerically("==", 7))
+	},
+		Entry("DP2 P rank 1 with DP8 D rank 6", "1", "1", http.StatusOK),
+		Entry("P rank zero", "0", "0", http.StatusOK),
+		Entry("unranked P does not inherit D", "", "", http.StatusOK),
+		Entry("negative P rank is rejected", "-1", "", http.StatusBadRequest),
+		Entry("malformed P rank is rejected", "bad", "", http.StatusBadRequest),
+	)
+
 })
 
 // moriProxyEnv bundles a running MoRI-IO proxy with its mock prefill/decode

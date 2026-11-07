@@ -58,12 +58,13 @@ var (
 		errcommon.RequestDroppedReasonHeaderKey,
 	)
 
-	// InternalRoutingHeaders carry worker addresses that the P/D sidecar connects to.
+	// InternalRoutingHeaders carry worker addresses and ranks for P/D dispatch.
 	// Only EPP plugins may set them: client values are dropped on ingress and
 	// removed from the forwarded request when no plugin sets them. Deprecated
 	// aliases are included, so neither spelling can be supplied by a client.
 	InternalRoutingHeaders = routingHeaderNames(
 		routing.PrefillEndpointHeader,
+		routing.PrefillDataParallelRankHeader,
 		routing.EncoderEndpointsHeader,
 		routing.DataParallelEndpointHeader,
 		routing.KVCacheSourceHeader,
