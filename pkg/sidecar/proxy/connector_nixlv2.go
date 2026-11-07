@@ -38,6 +38,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/sidecar/constants"
 	"github.com/llm-d/llm-d-router/pkg/sidecar/metrics"
 )
@@ -114,6 +115,18 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	)
 	if s.config.MoRIIODPSize > 1 {
 		preq.Header.Set(requestHeaderDataParallelRank, strconv.Itoa(localDPRank))
+	} else if !s.config.MoRIIOWriteMode {
+		// Prefill can execute on a different rank from decode.
+		preq.Header.Del(routing.DataParallelRankHeader)
+		if rawRank, _ := r.Context().Value(prefillDPRankKey).(string); rawRank != "" {
+			rank, err := strconv.Atoi(rawRank)
+			if err != nil || rank < 0 {
+				prefillSpan.End()
+				http.Error(w, "Invalid prefill data-parallel rank.", http.StatusBadRequest)
+				return
+			}
+			preq.Header.Set(routing.DataParallelRankHeader, strconv.Itoa(rank))
+		}
 	}
 
 	// Keeps the client's body intact for the decode request below.

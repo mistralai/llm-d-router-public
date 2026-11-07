@@ -180,6 +180,7 @@ func TestHandleRequestHeaders(t *testing.T) {
 			name: "Drops client-supplied routing headers",
 			headers: []*configPb.HeaderValue{
 				{Key: "X-Prefiller-Host-Port", Value: "10.0.0.1:9090"},
+				{Key: routing.PrefillDataParallelRankHeader, Value: "99"},
 				{Key: routing.EncoderEndpointsHeader, Value: "10.0.0.2:9090"},
 				{Key: routing.DataParallelEndpointHeader, Value: "10.0.0.3:9090"},
 				{Key: routing.KVCacheSourceHeader, Value: "10.0.0.4:9090"},
@@ -188,6 +189,7 @@ func TestHandleRequestHeaders(t *testing.T) {
 			wantHeaders: map[string]string{"x-test": "val"},
 			wantAbsent: []string{
 				routing.PrefillEndpointHeader,
+				routing.PrefillDataParallelRankHeader,
 				routing.EncoderEndpointsHeader,
 				routing.DataParallelEndpointHeader,
 				routing.KVCacheSourceHeader,
@@ -498,6 +500,7 @@ func TestGenerateRequestHeaderResponse_RemovesUnsetRoutingHeaders(t *testing.T) 
 	// supplying either name must not reach the sidecar.
 	canonical := []string{
 		routing.PrefillEndpointHeader,
+		routing.PrefillDataParallelRankHeader,
 		routing.EncoderEndpointsHeader,
 		routing.DataParallelEndpointHeader,
 		routing.KVCacheSourceHeader,
@@ -532,6 +535,7 @@ func TestGenerateRequestHeaderResponse_RemovesUnsetRoutingHeaders(t *testing.T) 
 				routing.LegacyPrefillEndpointHeader: "10.0.0.1:8000",
 			},
 			wantRemoved: []string{
+				routing.PrefillDataParallelRankHeader,
 				routing.EncoderEndpointsHeader,
 				routing.LegacyEncoderEndpointsHeader,
 				routing.DataParallelEndpointHeader,
@@ -548,6 +552,7 @@ func TestGenerateRequestHeaderResponse_RemovesUnsetRoutingHeaders(t *testing.T) 
 			wantSet: map[string]string{routing.LegacyPrefillEndpointHeader: "10.0.0.1:8000"},
 			wantRemoved: []string{
 				routing.PrefillEndpointHeader,
+				routing.PrefillDataParallelRankHeader,
 				routing.EncoderEndpointsHeader,
 				routing.LegacyEncoderEndpointsHeader,
 				routing.DataParallelEndpointHeader,

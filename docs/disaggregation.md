@@ -47,7 +47,7 @@ All topologies are driven by the unified `disagg-profile-handler` plugin, which 
 
 ### Routing headers
 
-EPP passes its stage decisions to the sidecar in three headers:
+EPP passes worker addresses to the sidecar in three headers:
 `x-llm-d-prefiller-host-port`, `x-llm-d-encoder-hosts-ports` and
 `x-llm-d-kv-cache-source-host-port`. EPP also sends each under its
 pre-convention name (`x-prefiller-host-port`, `x-encoder-hosts-ports`,
@@ -66,6 +66,14 @@ client-supplied `x-llm-d-` value from overriding the target that EPP chose. An
 upgraded EPP writes both with the same value, so the order changes nothing once
 EPP is upgraded, and the `x-llm-d-` name is read on its own once the old names
 are removed.
+
+For vLLM NIXL pull, EPP sends the selected prefill rank in
+`x-llm-d-prefiller-data-parallel-rank`. The sidecar consumes this internal
+header and uses the rank on the prefill request. The decode request keeps
+its own selected rank. An unranked prefill request carries no rank header;
+malformed or negative prefill ranks return HTTP 400 before either engine is called.
+Both EPP and sidecar builds must support this contract before rank-aware
+P/D traffic is enabled. MoRI/WRITE mode retains its connector rank selection.
 
 #### Upgrade order
 

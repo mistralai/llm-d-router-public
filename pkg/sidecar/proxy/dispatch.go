@@ -40,6 +40,7 @@ import (
 type contextKey string
 
 const requestStartTimeKey contextKey = "request_start_time"
+const prefillDPRankKey contextKey = "prefill_dp_rank"
 
 func openAIAPIAttr(apiType reqcommon.APIType) attribute.KeyValue {
 	return semconv.LLMDOpenAIAPI(apiType.String())
@@ -79,6 +80,10 @@ func (s *Server) disaggregatedPrefillHandler(apiType reqcommon.APIType) http.Han
 			openAIAPIAttr(apiType),
 		)
 
+		prefillRank := strings.TrimSpace(routing.TakeRoutingHeaderValue(r.Header, routing.PrefillDataParallelRankHeader))
+		if prefillRank != "" {
+			r = r.WithContext(context.WithValue(r.Context(), prefillDPRankKey, prefillRank))
+		}
 		prefillHostPorts := routing.TakeRoutingHeaderValues(r.Header, routing.PrefillEndpointHeader)
 
 		if len(prefillHostPorts) == 1 {
