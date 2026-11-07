@@ -70,3 +70,8 @@ func TestIsSystemOwnedHeaderIncludesAliases(t *testing.T) {
 	// (topology-stamp-handler's own output) unfiltered.
 	assert.False(t, IsSystemOwnedHeader("x-peer-topology"))
 }
+
+func TestPrefillRankIsInternalRoutingHeader(t *testing.T) {
+	t.Parallel()
+	assert.True(t, InternalRoutingHeaders.Has(routing.PrefillDataParallelRankHeader))
+}
