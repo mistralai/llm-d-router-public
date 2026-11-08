@@ -354,7 +354,7 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 	buf.Reset()
 	defer func() {
 		// Return to pool if capacity is within limits.
-		if buf.Cap() <= s.maxPoolBufferSize || s.maxPoolBufferSize == 0 {
+		if buf != nil && (buf.Cap() <= s.maxPoolBufferSize || s.maxPoolBufferSize == 0) {
 			s.bufferPool.Put(buf)
 		}
 	}()
@@ -495,6 +495,10 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 		case *extProcPb.ProcessingRequest_RequestBody:
 			loggerTrace.Info("Incoming body chunk", "EoS", v.RequestBody.EndOfStream)
 			// In the stream case, we can receive multiple request bodies.
+			if buf == nil {
+				buf = s.bufferPool.Get().(*bytes.Buffer)
+				buf.Reset()
+			}
 			buf.Write(v.RequestBody.Body)
 
 			// Message is buffered, we can read and decode.
@@ -507,6 +511,10 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				// Body stream complete. Capture raw size for flow control.
 				reqCtx.RequestSize = buf.Len()
 				buf.Reset()
+				if buf.Cap() <= s.maxPoolBufferSize || s.maxPoolBufferSize == 0 {
+					s.bufferPool.Put(buf)
+				}
+				buf = nil
 
 				parser, resolveErr := s.getOrResolveParser(ctx, reqCtx)
 				if resolveErr != nil {
