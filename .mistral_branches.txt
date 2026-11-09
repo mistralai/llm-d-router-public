@@ -19,6 +19,7 @@
 
 nzt/v1.0.2-pinned-reconstruction                      # adds pinned-base rebuilds on top of lfm/v1.0.2-rebased-upstream-build-tooling
 mk/261013-rebase-dp-kvevents                          # shared-port multi-DP routing with ordered KV-event cleanup (port of lfm/v1.0.2-rebased-upstream-dp-kvevents)
+nzt/vllm-pd-rank                                    # vLLM NIXL prefill rank handoff (upstream: https://github.com/llm-d/llm-d-router/pull/3821)
 mk/261013-rebase-objective-key                        # resolve inference objectives after request-header plugins (port of lfm/v1.0.2-rebased-upstream-objective-key)
 mk/261013-rebase-pd-chat-token-reuse                  # text chat prompt-token reuse; revision forwarding is upstream (port of nicolo.lucchesi/pd-chat-token-reuse-integration, https://github.com/mistralai/llm-d-router-public/pull/47)
 lfm/v1.0.2-rebased-upstream-rawbody-release           # release request RawBody after Envoy forwarding
