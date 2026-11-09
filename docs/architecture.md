@@ -333,10 +333,13 @@ and a vLLM decode worker that accepts `kv_transfer_params.prompt_token_ids` on
 For text chat requests, the sidecar requests `return_token_ids=true` from prefill
 and forwards its `prompt_token_ids` inside the decode request's
 `kv_transfer_params`. Decode skips prompt rendering and tokenization while
-retaining chat output parsing and streaming. Missing or invalid prefill token
-metadata produces HTTP 502.
+retaining chat output parsing and streaming. If prefill returns no
+`kv_transfer_params` or missing/invalid `prompt_token_ids`, the sidecar logs an
+error and sends the decode request without the IDs, so decode tokenizes the
+prompt as it does with the option disabled.
 
-Multimodal requests and other API paths retain their regular processing. The
+Multimodal requests, `echo` requests and other API paths retain their regular
+processing. The
 endpoint picker's tokenization for scheduling is independent of this option.
 Parallel P/D dispatch and chunked decode are incompatible with token reuse.
 

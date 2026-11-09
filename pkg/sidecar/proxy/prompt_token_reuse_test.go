@@ -50,12 +50,14 @@ func TestNIXLPromptTokenReuse(t *testing.T) {
 			{"audio", `[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}]}]`, true, true, false},
 			{"assistant audio", `[{"role":"assistant","content":null,"audio":{"id":"audio_1"}}]`, true, true, false},
 			{"unknown content", `[{"role":"user","content":[{"type":"future_media"}]}]`, true, true, false},
+			{"batch", `[[{"role":"user","content":"Hello"}]]`, true, true, false},
 			{"disabled", `[{"role":"user","content":"Hello"}]`, false, true, false},
 			{"local prefill", `[{"role":"user","content":"Hello"}]`, true, false, false},
 		} {
 			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
 				prefillRequests := make(chan map[string]any, 1)
 				decodeRequests := make(chan map[string]any, 1)
+				decodeRawRequests := make(chan string, 1)
 				prefill := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					var body map[string]any
 					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -64,7 +66,7 @@ func TestNIXLPromptTokenReuse(t *testing.T) {
 						return
 					}
 					prefillRequests <- body
-					_, _ = io.WriteString(w, `{"prompt_token_ids":[1,42,999],"choices":[{"token_ids":[123]}],"kv_transfer_params":{"do_remote_prefill":true,"remote_block_ids":[[7,8]],"remote_engine_id":"prefill"}}`)
+					_, _ = io.WriteString(w, `{"prompt_token_ids":[1,42,1000000,4294967295],"choices":[{"token_ids":[123]}],"kv_transfer_params":{"do_remote_prefill":true,"remote_block_ids":[[7,8]],"remote_engine_id":"prefill"}}`)
 				}))
 				defer prefill.Close()
 				response := `{"choices":[{"message":{"role":"assistant","content":"Hello"}}]}`
@@ -72,13 +74,18 @@ func TestNIXLPromptTokenReuse(t *testing.T) {
 					response = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Thinking\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n"
 				}
 				decode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					raw, err := io.ReadAll(r.Body)
 					var body map[string]any
-					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					if err == nil {
+						err = json.Unmarshal(raw, &body)
+					}
+					if err != nil {
 						t.Error(err)
 						http.Error(w, err.Error(), http.StatusBadRequest)
 						return
 					}
 					decodeRequests <- body
+					decodeRawRequests <- string(raw)
 					if stream {
 						w.Header().Set("Content-Type", "text/event-stream")
 					}
@@ -102,6 +109,7 @@ func TestNIXLPromptTokenReuse(t *testing.T) {
 				require.NoError(t, json.Unmarshal([]byte(requestBody), &original))
 				require.Len(t, decodeRequests, 1)
 				d := <-decodeRequests
+				dRaw := <-decodeRawRequests
 				if tc.prefill {
 					require.Len(t, prefillRequests, 1)
 					p := <-prefillRequests
@@ -113,7 +121,9 @@ func TestNIXLPromptTokenReuse(t *testing.T) {
 					require.Equal(t, "prefill", kv["remote_engine_id"])
 					require.Equal(t, []any{[]any{float64(7), float64(8)}}, kv["remote_block_ids"])
 					if tc.reuse {
-						require.Equal(t, []any{float64(1), float64(42), float64(999)}, kv["prompt_token_ids"])
+						require.Equal(t, []any{float64(1), float64(42), float64(1000000), float64(4294967295)}, kv["prompt_token_ids"])
+						// vLLM rejects non-integer IDs, so large IDs must not use exponent notation.
+						require.Contains(t, dRaw, `"prompt_token_ids":[1,42,1000000,4294967295]`)
 					} else {
 						require.NotContains(t, kv, "prompt_token_ids")
 					}
@@ -127,7 +137,7 @@ func TestNIXLPromptTokenReuse(t *testing.T) {
 	}
 }
 
-func TestNIXLPromptTokenReuseInvalidResponse(t *testing.T) {
+func TestNIXLPromptTokenReuseInvalidResponseFallsBack(t *testing.T) {
 	for _, response := range []string{
 		`{"kv_transfer_params":{"do_remote_prefill":true}}`,
 		`{"prompt_token_ids":[],"kv_transfer_params":{"do_remote_prefill":true}}`,
@@ -138,23 +148,48 @@ func TestNIXLPromptTokenReuseInvalidResponse(t *testing.T) {
 		`{"prompt_token_ids":["42"],"kv_transfer_params":{"do_remote_prefill":true}}`,
 		`{"prompt_token_ids":[1],"kv_transfer_params":{}}`,
 		`{"prompt_token_ids":[1],"kv_transfer_params":null}`,
+		`{"prompt_token_ids":[1]}`,
 	} {
 		t.Run(response, func(t *testing.T) {
 			prefill := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = io.WriteString(w, response)
 			}))
 			defer prefill.Close()
+			var prefillResponse map[string]any
+			require.NoError(t, json.Unmarshal([]byte(response), &prefillResponse))
 			decodeURL, err := url.Parse("http://127.0.0.1:1")
 			require.NoError(t, err)
 			proxy := NewProxy(Config{DecoderURL: decodeURL, KVConnector: constants.KVConnectorNIXLV2, ReusePromptTokenIDs: true})
-			proxy.decoderProxy = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-				t.Error("decode must not run with invalid prompt token metadata")
+			var decodeBody map[string]any
+			proxy.decoderProxy = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&decodeBody); err != nil {
+					t.Error(err)
+				}
+				_, _ = io.WriteString(w, `{"choices":[]}`)
 			})
 			r := httptest.NewRequest(http.MethodPost, reqcommon.PathChatCompletions, strings.NewReader(`{"messages":[{"role":"user","content":"Hello"}]}`))
 			w := httptest.NewRecorder()
 			proxy.handleNIXLV2(w, r, strings.TrimPrefix(prefill.URL, "http://"), "", reqcommon.APITypeChatCompletions)
-			require.Equal(t, http.StatusBadGateway, w.Code)
-			require.Contains(t, w.Body.String(), "prompt token reuse")
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			require.NotNil(t, decodeBody, "decode must run without reusable prompt token IDs")
+			require.Equal(t, prefillResponse["kv_transfer_params"], decodeBody["kv_transfer_params"])
+		})
+	}
+}
+
+func TestIsTextChatForTokenReuseEcho(t *testing.T) {
+	for _, tc := range []struct {
+		body  string
+		reuse bool
+	}{
+		{`{"messages":[{"role":"user","content":"Hello"}],"echo":true}`, false},
+		{`{"messages":[{"role":"user","content":"Hello"}],"echo":false}`, true},
+		{`{"messages":[{"role":"user","content":"Hello"}],"echo":null}`, true},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			body, err := decodeRequestBody([]byte(tc.body))
+			require.NoError(t, err)
+			require.Equal(t, tc.reuse, isTextChatForTokenReuse(body))
 		})
 	}
 }

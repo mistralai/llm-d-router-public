@@ -23,8 +23,15 @@ import (
 	"math"
 )
 
-// Token IDs alone cannot describe the multimodal state decode needs.
+const requestFieldEcho = "echo"
+
+// isTextChatForTokenReuse reports whether decode can reuse prefill's prompt
+// IDs. Token IDs alone cannot describe the multimodal state decode needs, and
+// vLLM renders echo requests regardless, so both keep their regular path.
 func isTextChatForTokenReuse(body map[string]any) bool {
+	if requestFlag(body, requestFieldEcho) {
+		return false
+	}
 	messages, err := requestMessages(body)
 	if err != nil || len(messages) == 0 {
 		return false
@@ -50,19 +57,36 @@ func isTextChatForTokenReuse(body map[string]any) bool {
 	return true
 }
 
-func forwardPromptTokenIDs(response map[string]any, transferParams any) error {
+// requestFlag reads a boolean top-level field that decodeRequestBody may have
+// left as raw JSON.
+func requestFlag(body map[string]any, field string) bool {
+	switch v := body[field].(type) {
+	case bool:
+		return v
+	case json.RawMessage:
+		var flag bool
+		return json.Unmarshal(v, &flag) == nil && flag
+	default:
+		return false
+	}
+}
+
+// attachPromptTokenIDs copies prefill's prompt IDs into the kv_transfer_params
+// sent to decode. On error nothing is attached, so decode renders and
+// tokenizes the prompt itself, as it does with reuse disabled.
+func attachPromptTokenIDs(response map[string]any, transferParams any) error {
 	kv, ok := transferParams.(map[string]any)
 	if !ok || len(kv) == 0 {
-		return errors.New("prompt token reuse requires non-empty prefill kv_transfer_params")
+		return errors.New("prefill returned no kv_transfer_params")
 	}
 	ids, ok := response["prompt_token_ids"].([]any)
 	if !ok || len(ids) == 0 {
-		return errors.New("prompt token reuse requires non-empty prefill prompt_token_ids")
+		return errors.New("prefill returned no prompt_token_ids")
 	}
 	for i, raw := range ids {
 		id, ok := raw.(float64)
 		if !ok || id < 0 || id > math.MaxUint32 || id != math.Trunc(id) {
-			return fmt.Errorf("prompt token reuse: invalid prefill token ID at index %d", i)
+			return fmt.Errorf("prefill returned invalid prompt token ID at index %d", i)
 		}
 	}
 	kv["prompt_token_ids"] = ids
