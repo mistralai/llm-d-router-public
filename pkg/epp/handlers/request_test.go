@@ -572,8 +572,9 @@ func TestGenerateRequestHeaderResponse_RemovesUnsetRoutingHeaders(t *testing.T) 
 				assert.Equal(t, v, gotSet[k])
 			}
 			// The data-parallel rank header is always removed; a selected rank is
-			// set again because Envoy applies removals before sets.
-			wantRemoved := slices.Concat(tc.wantRemoved, []string{routing.DataParallelRankHeader})
+			// set again because Envoy applies removals before sets. The gRPC
+			// bidirectional header is read by EPP only and always removed.
+			wantRemoved := slices.Concat(tc.wantRemoved, []string{routing.DataParallelRankHeader, metadata.GRPCBidirectionalStream})
 			assert.ElementsMatch(t, wantRemoved, mutation.GetRemoveHeaders())
 		})
 	}
@@ -651,6 +652,58 @@ func TestIsWebSocketUpgrade(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, isWebsocketUpgrade(tc.headers))
+		})
+	}
+}
+
+func TestIsGrpcBidirectionalStream(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    bool
+	}{
+		{
+			name:    "header set to true",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/grpc"},
+			want:    true,
+		},
+		{
+			name:    "case-insensitive value",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "True", "content-type": "application/grpc"},
+			want:    true,
+		},
+		{
+			name:    "header set to false",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "false", "content-type": "application/grpc"},
+			want:    false,
+		},
+		{
+			name:    "empty value",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "", "content-type": "application/grpc"},
+			want:    false,
+		},
+		{
+			name:    "value other than true",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "1", "content-type": "application/grpc"},
+			want:    false,
+		},
+		{
+			name:    "header absent",
+			headers: map[string]string{"content-type": "application/grpc"},
+			want:    false,
+		},
+		{
+			name:    "empty headers",
+			headers: map[string]string{},
+			want:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isGrpcBidirectionalStream(tc.headers))
 		})
 	}
 }
@@ -753,6 +806,110 @@ func (m *mockDirectorRequest) GetRandomEndpoint() *datalayer.EndpointMetadata {
 	return &datalayer.EndpointMetadata{
 		Address: "1.2.3.4",
 		Port:    "80",
+	}
+}
+
+func TestHandleRequestHeadersBodyless(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name               string
+		headers            map[string]string
+		endOfStream        bool
+		wantBodyless       bool
+		wantRandomEndpoint bool
+	}{
+		{
+			name:    "request with a body is not flagged",
+			headers: map[string]string{"content-type": "application/json"},
+		},
+		{
+			name:         "grpc bidirectional stream is flagged and left for scheduling",
+			headers:      map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/grpc"},
+			wantBodyless: true,
+		},
+		{
+			name:         "grpc content type with a subtype is accepted",
+			headers:      map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/grpc+proto"},
+			wantBodyless: true,
+		},
+		{
+			name: "header name and values are case-insensitive",
+			headers: map[string]string{
+				strings.ToUpper(metadata.GRPCBidirectionalStream): "TRUE",
+				"Content-Type": "Application/GRPC",
+			},
+			wantBodyless: true,
+		},
+		{
+			name:    "grpc bidirectional header set to false",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "false", "content-type": "application/grpc"},
+		},
+		{
+			name:    "grpc bidirectional header on a non-grpc request is ignored",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/json"},
+		},
+		{
+			name:    "grpc bidirectional header without a content type is ignored",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "true"},
+		},
+		{
+			name:    "grpc-web content type is not grpc",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/grpc-web"},
+		},
+		{
+			name:               "websocket upgrade is routed to a random endpoint without flagging",
+			headers:            map[string]string{"upgrade": "websocket", "connection": "upgrade"},
+			wantRandomEndpoint: true,
+		},
+		{
+			name: "websocket upgrade takes precedence over the grpc header",
+			headers: map[string]string{
+				"upgrade":                        "websocket",
+				"connection":                     "upgrade",
+				metadata.GRPCBidirectionalStream: "true",
+				"content-type":                   "application/grpc",
+			},
+			wantRandomEndpoint: true,
+		},
+		{
+			name:               "end of stream takes precedence over the grpc header",
+			headers:            map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/grpc"},
+			endOfStream:        true,
+			wantRandomEndpoint: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &StreamingServer{director: &mockDirectorRequest{}}
+			reqCtx := &RequestContext{
+				Request:  &Request{Headers: make(map[string]string)},
+				Response: &Response{Headers: make(map[string]string)},
+			}
+			values := make([]*configPb.HeaderValue, 0, len(tc.headers))
+			for key, value := range tc.headers {
+				values = append(values, &configPb.HeaderValue{Key: key, RawValue: []byte(value)})
+			}
+			req := &extProcPb.ProcessingRequest_RequestHeaders{
+				RequestHeaders: &extProcPb.HttpHeaders{
+					Headers:     &configPb.HeaderMap{Headers: values},
+					EndOfStream: tc.endOfStream,
+				},
+			}
+
+			require.NoError(t, server.HandleRequestHeaders(context.Background(), reqCtx, req))
+
+			assert.Equal(t, tc.wantBodyless, reqCtx.bodyless)
+			assert.Equal(t, tc.wantBodyless, reqCtx.grpcBidirectional)
+			if tc.wantRandomEndpoint {
+				assert.Equal(t, "1.2.3.4:80", reqCtx.TargetEndpoint)
+				assert.NotNil(t, reqCtx.reqHeaderResp)
+			} else {
+				assert.Empty(t, reqCtx.TargetEndpoint, "scheduling is left to the Director")
+				assert.Nil(t, reqCtx.reqHeaderResp)
+			}
+		})
 	}
 }
 

@@ -109,6 +109,17 @@ func (s *StreamingServer) HandleResponseBody(ctx context.Context, reqCtx *Reques
 	return s.director.HandleResponseBody(ctx, reqCtx, endOfStream)
 }
 
+// HandleResponseTrail ends a bodyless request at its response trailers: it records
+// the tunnel duration and runs the director's trailer hooks.
+func (s *StreamingServer) HandleResponseTrail(ctx context.Context, reqCtx *RequestContext) *RequestContext {
+	log.FromContext(ctx).V(logutil.DEBUG).Info("HandleResponseTrail is triggered")
+
+	fairnessID, priority := extractFairnessAndPriority(reqCtx)
+
+	metrics.RecordTunnelRequestDuration(ctx, reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority, reqCtx.RequestReceivedTimestamp, reqCtx.responseCompleteTimestamp)
+	return s.director.HandleResponseTrail(ctx, reqCtx)
+}
+
 // mergeUsage folds a parsed usage block into the usage accumulated for the request.
 // Anthropic streaming reports usage on message_start and again on message_delta, and a
 // block may carry only some of the fields, so a zero is read as "not reported" and

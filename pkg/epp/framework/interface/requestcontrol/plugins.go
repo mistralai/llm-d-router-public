@@ -35,6 +35,7 @@ const (
 	ResponseReceivedExtensionPoint  = "ResponseReceived"
 	ResponseStreamingExtensionPoint = "ResponseStreaming"
 	ResponseCompleteExtensionPoint  = "ResponseComplete"
+	ResponseTrailerExtensionPoint   = "ResponseTrailer"
 )
 
 // ConditionalDecodeHandledAttributeKey is the request-attribute key a
@@ -140,4 +141,12 @@ type Admitter interface {
 type RequestHeaderProcessor interface {
 	plugin.Plugin
 	RequestHeader(ctx context.Context, request *fwksched.InferenceRequest) error
+}
+
+// ResponseTrailerProcessor runs once at the end of a bodyless request, which has no
+// response body to carry an end of stream: when its response trailers arrive, or when
+// its stream ends without them. response.TerminationCause tells the two apart.
+type ResponseTrailerProcessor interface {
+	plugin.Plugin
+	ResponseTrailer(ctx context.Context, request *fwksched.InferenceRequest, response *Response, targetEndpoint *datalayer.EndpointMetadata) error
 }

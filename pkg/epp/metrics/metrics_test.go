@@ -293,6 +293,134 @@ func TestRecordRequestLatencies(t *testing.T) {
 	}
 }
 
+func TestRecordTunneledRequestCounter(t *testing.T) {
+	Reset()
+
+	RecordTunneledRequestCounter("m10", "t10", "tenant-a", 0)
+	RecordTunneledRequestCounter("m10", "t10", "tenant-a", 0)
+	RecordTunneledRequestCounter("m10", "t10", "tenant-a", 2)
+	RecordTunneledRequestCounter("m10", "t11", "tenant-b", 0)
+
+	require.Equal(t, 2.0, promtestutil.ToFloat64(llmdTunnelCounter.WithLabelValues("m10", "t10", "tenant-a", "0")))
+	require.Equal(t, 1.0, promtestutil.ToFloat64(llmdTunnelCounter.WithLabelValues("m10", "t10", "tenant-a", "2")),
+		"priority is part of the label set")
+	require.Equal(t, 1.0, promtestutil.ToFloat64(llmdTunnelCounter.WithLabelValues("m10", "t11", "tenant-b", "0")))
+	require.Equal(t, 3, promtestutil.CollectAndCount(llmdTunnelCounter))
+	require.Equal(t, 0, promtestutil.CollectAndCount(llmdRequestCounter),
+		"tunneled requests must not feed the regular request counter")
+}
+
+func TestRecordTunnelRequestDuration(t *testing.T) {
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	received := time.Now()
+
+	t.Run("valid durations accumulate per label set", func(t *testing.T) {
+		Reset()
+
+		require.True(t, RecordTunnelRequestDuration(ctx, "m10", "t10", "tenant-a", "0", received, received.Add(4*time.Second)))
+		require.True(t, RecordTunnelRequestDuration(ctx, "m10", "t10", "tenant-a", "0", received, received.Add(40*time.Second)))
+		require.True(t, RecordTunnelRequestDuration(ctx, "m10", "t11", "tenant-a", "0", received, received.Add(2*time.Minute)))
+
+		h, err := getHistogramVecLabelValues(t, llmdTunnelDuration, "m10", "t10", "tenant-a", "0")
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), h.GetSampleCount())
+		require.InDelta(t, 44.0, h.GetSampleSum(), 1e-9)
+
+		h, err = getHistogramVecLabelValues(t, llmdTunnelDuration, "m10", "t11", "tenant-a", "0")
+		require.NoError(t, err)
+		require.Equal(t, uint64(1), h.GetSampleCount())
+		require.InDelta(t, 120.0, h.GetSampleSum(), 1e-9)
+
+		require.Equal(t, 2, promtestutil.CollectAndCount(llmdTunnelDuration))
+		require.Equal(t, 0, promtestutil.CollectAndCount(llmdRequestLatencies),
+			"tunneled requests must not feed the regular request latency histogram")
+	})
+
+	t.Run("long-lived tunnel falls in a finite bucket", func(t *testing.T) {
+		Reset()
+
+		require.True(t, RecordTunnelRequestDuration(ctx, "m10", "t10", "tenant-a", "0", received, received.Add(20*time.Minute)))
+
+		h, err := getHistogramVecLabelValues(t, llmdTunnelDuration, "m10", "t10", "tenant-a", "0")
+		require.NoError(t, err)
+		cumulative := map[float64]uint64{}
+		for _, b := range h.GetBucket() {
+			cumulative[b.GetUpperBound()] = b.GetCumulativeCount()
+		}
+		require.Equal(t, uint64(0), cumulative[900])
+		require.Equal(t, uint64(1), cumulative[1800])
+	})
+
+	t.Run("invalid elapsed time is rejected", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			complete time.Time
+		}{
+			{name: "complete before received", complete: received.Add(-time.Second)},
+			{name: "complete equals received", complete: received},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				Reset()
+
+				require.False(t, RecordTunnelRequestDuration(ctx, "m10", "t10", "tenant-a", "0", received, tc.complete))
+				require.Equal(t, 0, promtestutil.CollectAndCount(llmdTunnelDuration), "no sample may be recorded")
+			})
+		}
+	})
+}
+
+func TestTunnelMetricsRegistered(t *testing.T) {
+	Reset()
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	received := time.Now()
+	RecordTunneledRequestCounter("m10", "t10", "tenant-a", 0)
+	require.True(t, RecordTunnelRequestDuration(ctx, "m10", "t10", "tenant-a", "0", received, received.Add(time.Second)))
+
+	families, err := metrics.Registry.Gather()
+	require.NoError(t, err)
+	byName := map[string]*dto.MetricFamily{}
+	for _, f := range families {
+		byName[f.GetName()] = f
+	}
+
+	tests := []struct {
+		name     string
+		wantType dto.MetricType
+	}{
+		{name: "llm_d_epp_tunnel_request_total", wantType: dto.MetricType_COUNTER},
+		{name: "llm_d_epp_tunnel_request_duration_seconds", wantType: dto.MetricType_HISTOGRAM},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			family, ok := byName[tc.name]
+			require.True(t, ok, "metric family must be registered by Register()")
+			require.Equal(t, tc.wantType, family.GetType())
+			require.Len(t, family.GetMetric(), 1)
+
+			var labels []string
+			for _, l := range family.GetMetric()[0].GetLabel() {
+				labels = append(labels, l.GetName())
+			}
+			require.ElementsMatch(t, []string{"model_name", "target_model_name", "fairness_id", "priority"}, labels)
+		})
+	}
+}
+
+func TestResetClearsTunnelMetrics(t *testing.T) {
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	received := time.Now()
+	RecordTunneledRequestCounter("m10", "t10", "tenant-a", 0)
+	require.True(t, RecordTunnelRequestDuration(ctx, "m10", "t10", "tenant-a", "0", received, received.Add(time.Second)))
+	require.Equal(t, 1, promtestutil.CollectAndCount(llmdTunnelCounter), "setup: counter series recorded")
+	require.Equal(t, 1, promtestutil.CollectAndCount(llmdTunnelDuration), "setup: histogram series recorded")
+
+	Reset()
+
+	require.Equal(t, 0, promtestutil.CollectAndCount(llmdTunnelCounter))
+	require.Equal(t, 0, promtestutil.CollectAndCount(llmdTunnelDuration))
+}
+
 func TestRecordNormalizedTimePerOutputToken(t *testing.T) {
 	Reset()
 	ctx := logutil.NewTestLoggerIntoContext(context.Background())
