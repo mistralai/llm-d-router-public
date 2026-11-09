@@ -250,11 +250,8 @@ retryLoop:
 		s.logger.Info("warning: missing 'kv_transfer_params' field in prefiller response")
 	}
 	if reuseTokens {
-		if err := forwardPromptTokenIDs(prefillerResponse, pKVTransferParams); err != nil {
-			if err := errorBadGateway(err, w); err != nil {
-				s.logger.Error(err, "failed to send error response to client")
-			}
-			return
+		if err := attachPromptTokenIDs(prefillerResponse, pKVTransferParams); err != nil {
+			s.logger.Error(err, "prompt token reuse skipped; decode will tokenize the prompt", "request_id", uuidStr)
 		}
 	}
 	pCachedTokens, hasPCachedTokens := extractCachedTokens(prefillerResponse)
