@@ -142,6 +142,10 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	s.addP2PPullToPrefill(prefillRequest[requestFieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
 
 	reqcommon.CapSingleToken(prefillRequest, apiType)
+	reuseTokens := s.config.ReusePromptTokenIDs && apiType == reqcommon.APITypeChatCompletions && isTextChatForTokenReuse(body)
+	if reuseTokens {
+		prefillRequest["return_token_ids"] = true
+	}
 
 	pbody, err := json.Marshal(prefillRequest)
 	if err != nil {
@@ -244,6 +248,14 @@ retryLoop:
 	pKVTransferParams, ok := prefillerResponse[requestFieldKVTransferParams]
 	if !ok {
 		s.logger.Info("warning: missing 'kv_transfer_params' field in prefiller response")
+	}
+	if reuseTokens {
+		if err := forwardPromptTokenIDs(prefillerResponse, pKVTransferParams); err != nil {
+			if err := errorBadGateway(err, w); err != nil {
+				s.logger.Error(err, "failed to send error response to client")
+			}
+			return
+		}
 	}
 	pCachedTokens, hasPCachedTokens := extractCachedTokens(prefillerResponse)
 	if !hasPCachedTokens {
