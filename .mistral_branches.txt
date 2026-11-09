@@ -22,6 +22,7 @@ mk/261013-rebase-dp-kvevents                          # shared-port multi-DP rou
 nzt/vllm-pd-rank                                    # vLLM NIXL prefill rank handoff (upstream: https://github.com/llm-d/llm-d-router/pull/3821)
 mk/261013-rebase-objective-key                        # resolve inference objectives after request-header plugins (port of lfm/v1.0.2-rebased-upstream-objective-key)
 mk/261013-rebase-pd-chat-token-reuse                  # text chat prompt-token reuse; revision forwarding is upstream (port of nicolo.lucchesi/pd-chat-token-reuse-integration, https://github.com/mistralai/llm-d-router-public/pull/47)
+nicolo.lucchesi/sidecar-prompt-token-reuse            # NIXLv2 text chat prompt-token handoff in the sidecar (https://github.com/mistralai/llm-d-router-public/pull/70)
 lfm/v1.0.2-rebased-upstream-rawbody-release           # release request RawBody after Envoy forwarding
 
 mk/261013-rebase-streaming-accounting                 # preserve multimodal accounting and release prompt load at stream start (port of lfm/multimodal-streaming-token-accounting, https://github.com/mistralai/llm-d-router-public/pull/39, https://github.com/mistralai/llm-d-router-public/pull/41)
