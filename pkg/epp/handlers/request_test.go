@@ -572,8 +572,9 @@ func TestGenerateRequestHeaderResponse_RemovesUnsetRoutingHeaders(t *testing.T) 
 				assert.Equal(t, v, gotSet[k])
 			}
 			// The data-parallel rank header is always removed; a selected rank is
-			// set again because Envoy applies removals before sets.
-			wantRemoved := slices.Concat(tc.wantRemoved, []string{routing.DataParallelRankHeader})
+			// set again because Envoy applies removals before sets. The gRPC
+			// bidirectional header is read by EPP only and always removed.
+			wantRemoved := slices.Concat(tc.wantRemoved, []string{routing.DataParallelRankHeader, metadata.GRPCBidirectionalStream})
 			assert.ElementsMatch(t, wantRemoved, mutation.GetRemoveHeaders())
 		})
 	}
@@ -665,27 +666,27 @@ func TestIsGrpcBidirectionalStream(t *testing.T) {
 	}{
 		{
 			name:    "header set to true",
-			headers: map[string]string{metadata.GRPCBidirectionalStream: "true"},
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/grpc"},
 			want:    true,
 		},
 		{
 			name:    "case-insensitive value",
-			headers: map[string]string{metadata.GRPCBidirectionalStream: "True"},
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "True", "content-type": "application/grpc"},
 			want:    true,
 		},
 		{
 			name:    "header set to false",
-			headers: map[string]string{metadata.GRPCBidirectionalStream: "false"},
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "false", "content-type": "application/grpc"},
 			want:    false,
 		},
 		{
 			name:    "empty value",
-			headers: map[string]string{metadata.GRPCBidirectionalStream: ""},
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "", "content-type": "application/grpc"},
 			want:    false,
 		},
 		{
 			name:    "value other than true",
-			headers: map[string]string{metadata.GRPCBidirectionalStream: "1"},
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "1", "content-type": "application/grpc"},
 			want:    false,
 		},
 		{
@@ -824,17 +825,37 @@ func TestHandleRequestHeadersBodyless(t *testing.T) {
 		},
 		{
 			name:         "grpc bidirectional stream is flagged and left for scheduling",
-			headers:      map[string]string{metadata.GRPCBidirectionalStream: "true"},
+			headers:      map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/grpc"},
 			wantBodyless: true,
 		},
 		{
-			name:         "header name and value are case-insensitive",
-			headers:      map[string]string{strings.ToUpper(metadata.GRPCBidirectionalStream): "TRUE"},
+			name:         "grpc content type with a subtype is accepted",
+			headers:      map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/grpc+proto"},
+			wantBodyless: true,
+		},
+		{
+			name: "header name and values are case-insensitive",
+			headers: map[string]string{
+				strings.ToUpper(metadata.GRPCBidirectionalStream): "TRUE",
+				"Content-Type": "Application/GRPC",
+			},
 			wantBodyless: true,
 		},
 		{
 			name:    "grpc bidirectional header set to false",
-			headers: map[string]string{metadata.GRPCBidirectionalStream: "false"},
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "false", "content-type": "application/grpc"},
+		},
+		{
+			name:    "grpc bidirectional header on a non-grpc request is ignored",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/json"},
+		},
+		{
+			name:    "grpc bidirectional header without a content type is ignored",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "true"},
+		},
+		{
+			name:    "grpc-web content type is not grpc",
+			headers: map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/grpc-web"},
 		},
 		{
 			name:               "websocket upgrade is routed to a random endpoint without flagging",
@@ -847,12 +868,13 @@ func TestHandleRequestHeadersBodyless(t *testing.T) {
 				"upgrade":                        "websocket",
 				"connection":                     "upgrade",
 				metadata.GRPCBidirectionalStream: "true",
+				"content-type":                   "application/grpc",
 			},
 			wantRandomEndpoint: true,
 		},
 		{
 			name:               "end of stream takes precedence over the grpc header",
-			headers:            map[string]string{metadata.GRPCBidirectionalStream: "true"},
+			headers:            map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/grpc"},
 			endOfStream:        true,
 			wantRandomEndpoint: true,
 		},

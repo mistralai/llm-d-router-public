@@ -56,11 +56,14 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/datastore"
+	"github.com/llm-d/llm-d-router/pkg/epp/flowcontrol/eviction"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/eviction/filtering"
+	evictionordering "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/eviction/ordering"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/inflightload"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/requestheader/agentidentity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/anthropic"
@@ -2445,15 +2448,23 @@ func (p *targetModelRewriteHeaderPlugin) RequestHeader(_ context.Context, reques
 type trailerRecorderPlugin struct {
 	name   string
 	err    error
-	record func(name string, request *fwksched.InferenceRequest)
+	record func(call trailerCall)
+}
+
+type trailerCall struct {
+	plugin         string
+	request        *fwksched.InferenceRequest
+	response       *fwkrc.Response
+	targetEndpoint *fwkdl.EndpointMetadata
 }
 
 func (p *trailerRecorderPlugin) TypedName() fwkplugin.TypedName {
 	return fwkplugin.TypedName{Name: p.name, Type: "mock-response-trailer"}
 }
 
-func (p *trailerRecorderPlugin) ResponseTrailer(_ context.Context, request *fwksched.InferenceRequest) error {
-	p.record(p.name, request)
+func (p *trailerRecorderPlugin) ResponseTrailer(_ context.Context, request *fwksched.InferenceRequest,
+	response *fwkrc.Response, targetEndpoint *fwkdl.EndpointMetadata) error {
+	p.record(trailerCall{plugin: p.name, request: request, response: response, targetEndpoint: targetEndpoint})
 	return p.err
 }
 
@@ -2574,17 +2585,10 @@ func TestDirector_HandleBodylessRequestSchedulingFailure(t *testing.T) {
 }
 
 func TestDirector_HandleResponseTrail(t *testing.T) {
-	type trailerCall struct {
-		plugin  string
-		request *fwksched.InferenceRequest
-	}
-
 	t.Run("runs every trailer plugin in order with the scheduling request", func(t *testing.T) {
 		ctx := logutil.NewTestLoggerIntoContext(context.Background())
 		var calls []trailerCall
-		record := func(name string, request *fwksched.InferenceRequest) {
-			calls = append(calls, trailerCall{plugin: name, request: request})
-		}
+		record := func(call trailerCall) { calls = append(calls, call) }
 		dir := NewDirectorWithConfig(nil, &mockScheduler{}, nil, nil, NewConfig().WithResponseTrailerPlugins(
 			&trailerRecorderPlugin{name: "first", record: record},
 			&trailerRecorderPlugin{name: "second", record: record},
@@ -2602,10 +2606,46 @@ func TestDirector_HandleResponseTrail(t *testing.T) {
 		assert.Same(t, reqCtx.SchedulingRequest, calls[1].request)
 	})
 
+	t.Run("plugins receive an end-of-stream response with the termination cause", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			cause     fwkrc.TerminationCause
+			wantCause fwkrc.TerminationCause
+		}{
+			{name: "trailers without an error end naturally", wantCause: fwkrc.TerminationCauseNatural},
+			{name: "a recorded cause is kept", cause: fwkrc.TerminationCauseClientDisconnect, wantCause: fwkrc.TerminationCauseClientDisconnect},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				ctx := logutil.NewTestLoggerIntoContext(context.Background())
+				var calls []trailerCall
+				dir := NewDirectorWithConfig(nil, &mockScheduler{}, nil, nil, NewConfig().WithResponseTrailerPlugins(
+					&trailerRecorderPlugin{name: "only", record: func(call trailerCall) { calls = append(calls, call) }},
+				))
+				reqCtx := newBodylessTestRequestContext("req-1", bodylessModel)
+				reqCtx.SchedulingRequest = &fwksched.InferenceRequest{RequestID: "req-1"}
+				reqCtx.TargetPod = &fwkdl.EndpointMetadata{Address: "10.0.0.1"}
+				reqCtx.Response.Headers = map[string]string{"content-type": "application/grpc"}
+				reqCtx.TerminationCause = tt.cause
+
+				dir.HandleResponseTrail(ctx, reqCtx)
+
+				require.Len(t, calls, 1)
+				response := calls[0].response
+				require.NotNil(t, response)
+				assert.Equal(t, "req-1", response.RequestID)
+				assert.True(t, response.EndOfStream)
+				assert.Equal(t, tt.wantCause, response.TerminationCause)
+				assert.Equal(t, reqCtx.Response.Headers, response.Headers)
+				assert.Same(t, reqCtx.TargetPod, calls[0].targetEndpoint)
+			})
+		}
+	})
+
 	t.Run("a failing plugin does not stop the remaining plugins", func(t *testing.T) {
 		ctx := logutil.NewTestLoggerIntoContext(context.Background())
 		var invoked []string
-		record := func(name string, _ *fwksched.InferenceRequest) { invoked = append(invoked, name) }
+		record := func(call trailerCall) { invoked = append(invoked, call.plugin) }
 		dir := NewDirectorWithConfig(nil, &mockScheduler{}, nil, nil, NewConfig().WithResponseTrailerPlugins(
 			&trailerRecorderPlugin{name: "first", err: errors.New("first plugin boom"), record: record},
 			&trailerRecorderPlugin{name: "second", record: record},
@@ -2619,9 +2659,7 @@ func TestDirector_HandleResponseTrail(t *testing.T) {
 	t.Run("a request aborted before scheduling reaches the plugins as nil", func(t *testing.T) {
 		ctx := logutil.NewTestLoggerIntoContext(context.Background())
 		var calls []trailerCall
-		record := func(name string, request *fwksched.InferenceRequest) {
-			calls = append(calls, trailerCall{plugin: name, request: request})
-		}
+		record := func(call trailerCall) { calls = append(calls, call) }
 		dir := NewDirectorWithConfig(nil, &mockScheduler{}, nil, nil, NewConfig().WithResponseTrailerPlugins(
 			&trailerRecorderPlugin{name: "only", record: record},
 		))
@@ -2663,6 +2701,29 @@ func TestDirector_BodylessRequestReleasesInFlightLoadAtTrailer(t *testing.T) {
 
 	dir.HandleResponseTrail(ctx, reqCtx)
 	require.Equal(t, int64(0), producer.GetRequests(endpointID), "a repeated trailer must not release twice")
+}
+
+// TestDirector_BodylessRequestUntracksEvictionAtTrailer verifies that a bodyless request leaves
+// the eviction tracker when its response trailer arrives, so an eviction issued after the stream
+// finished cannot select it.
+func TestDirector_BodylessRequestUntracksEvictionAtTrailer(t *testing.T) {
+	result, _ := newPod1SchedulingResult()
+	dir, ctx := newSinglePodDirector(t, result)
+	evictor := eviction.NewRequestEvictor(
+		&evictionordering.PriorityThenTimeOrdering{},
+		&filtering.SheddableFilter{},
+		&eviction.NoOpEvictor{},
+	)
+	dir.SetRequestEvictor(evictor)
+
+	reqCtx, err := dir.HandleBodylessRequest(ctx, newBodylessTestRequestContext("req-1", bodylessModel))
+	require.NoError(t, err)
+	inFlight, _ := evictor.Stats()
+	require.Equal(t, 1, inFlight)
+
+	dir.HandleResponseTrail(ctx, reqCtx)
+	inFlight, _ = evictor.Stats()
+	assert.Zero(t, inFlight, "the trailer must untrack the request")
 }
 
 // TestRunPreRequestPlugins_NoPlugins verifies that runPreRequestPlugins returns

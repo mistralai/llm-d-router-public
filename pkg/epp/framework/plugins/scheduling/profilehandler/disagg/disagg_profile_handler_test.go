@@ -81,8 +81,6 @@ func (p *mockProfile) Run(_ context.Context, _ *scheduling.InferenceRequest, _ [
 	return &scheduling.ProfileRunResult{}, nil
 }
 
-func (p *mockProfile) BodylessCompatible() bool { return false }
-
 func profileNames(m map[string]scheduling.SchedulerProfile) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

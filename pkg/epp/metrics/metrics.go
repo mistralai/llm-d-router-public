@@ -211,7 +211,7 @@ func RecordTunnelRequestDuration(ctx context.Context, modelName, targetModelName
 	modelName, targetModelName = boundModels(modelName, targetModelName)
 	fairnessID = boundFairnessID(fairnessID)
 	if !complete.After(received) {
-		log.FromContext(ctx).V(logutil.DEFAULT).Error(nil, "Request latency values are invalid",
+		log.FromContext(ctx).V(logutil.DEFAULT).Error(nil, "Tunnel duration values are invalid",
 			"modelName", modelName, "targetModelName", targetModelName, "completeTime", complete, "receivedTime", received)
 		return false
 	}

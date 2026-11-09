@@ -629,7 +629,12 @@ func (p *InFlightLoadProducer) ResponseBody(
 	}
 }
 
-func (p *InFlightLoadProducer) ResponseTrailer(ctx context.Context, request *fwksched.InferenceRequest) error {
+func (p *InFlightLoadProducer) ResponseTrailer(
+	_ context.Context,
+	request *fwksched.InferenceRequest,
+	_ *requestcontrol.Response,
+	_ *datalayer.EndpointMetadata,
+) error {
 	if request != nil {
 		p.PluginState.Delete(request.RequestID)
 	}

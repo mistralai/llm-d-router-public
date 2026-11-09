@@ -37,8 +37,7 @@ type ReadinessChecker interface {
 }
 
 // BodylessCapable is an optional interface for plugins that declare whether
-// they can operate on a bodyless request (e.g. a WebSocket upgrade or a gRPC
-// bidirectional stream).
+// they can operate on a bodyless request, such as a gRPC bidirectional stream.
 type BodylessCapable interface {
 	BodylessCompatible() bool
 }

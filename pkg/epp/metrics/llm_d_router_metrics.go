@@ -58,9 +58,9 @@ var (
 	llmdTunnelDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Subsystem: LLMDRouterEndpointPickerSubsystem,
-			Name:      "tunnel_request_duration",
+			Name:      "tunnel_request_duration_seconds",
 			Help:      metricsutil.HelpMsgWithStability("Duration of a tunneled request in seconds. Reflects connection lifetime, not inference latency.", compbasemetrics.ALPHA),
-			Buckets:   []float64{3, 5, 10, 30, 60, 120, 300, 600, 900, 1800}, // The bucket might need adjustment.
+			Buckets:   []float64{3, 5, 10, 30, 60, 120, 300, 600, 900, 1800},
 		},
 		modelLabelsWithFairnessPriority,
 	)

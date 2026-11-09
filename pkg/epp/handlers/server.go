@@ -25,7 +25,6 @@ import (
 	"sync"
 	"time"
 
-	extProcFilterPb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
@@ -154,10 +153,9 @@ type RequestContext struct {
 	// (enqueue-and-wait). Meaningful only when FlowControlAdmitted is true.
 	FlowControlQueueDuration time.Duration
 
-	// bodyless is a boolean set to true only if the request is handled without looking at the body.
-	// Because there is none, or it's not parsable.
+	// bodyless requests are routed from their headers; their body is never read.
 	bodyless bool
-	// grpcBidirectional represents whether the request is a grpc bidirectional stream.
+	// grpcBidirectional marks a gRPC bidirectional stream.
 	grpcBidirectional bool
 
 	// Lifecycle bookkeeping.
@@ -520,6 +518,7 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 
 			err = s.HandleRequestHeaders(ctx, reqCtx, v)
 			if err == nil && reqCtx.bodyless {
+				reqCtx.Request.Metadata = envoy.ExtractMetadataValues(req)
 				reqCtx, err = s.director.HandleBodylessRequest(ctx, reqCtx)
 				// The Director may resolve agent identity after this request span opened.
 				tracing.AttributeRequest(ctx, span)
@@ -536,12 +535,8 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				}
 
 				reqCtx.reqHeaderResp = s.generateRequestHeaderResponse(ctx, reqCtx)
-				reqCtx.reqHeaderResp.ModeOverride = &extProcFilterPb.ProcessingMode{
-					RequestBodyMode:     extProcFilterPb.ProcessingMode_NONE,
-					ResponseBodyMode:    extProcFilterPb.ProcessingMode_NONE,
-					ResponseTrailerMode: extProcFilterPb.ProcessingMode_SEND,
-				}
 				fairnessID, _ := extractFairnessAndPriority(reqCtx)
+				metrics.RecordRequestCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, reqCtx.Priority)
 				metrics.RecordTunneledRequestCounter(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, reqCtx.Priority)
 
 				recordRequestProcessing()

@@ -194,7 +194,7 @@ func (d *Director) getInferenceObjective(ctx context.Context, reqCtx *handlers.R
 	return infObjective
 }
 
-// HandleBodylessRequest orchestrates requests ignoring the body, such as WebSocket upgrades or grpc bidirectional streams.
+// HandleBodylessRequest orchestrates a request whose body is not read, such as a gRPC bidirectional stream.
 func (d *Director) HandleBodylessRequest(ctx context.Context, reqCtx *handlers.RequestContext) (_ *handlers.RequestContext, err error) {
 	return d.handleRequest(ctx, reqCtx, nil)
 }
@@ -208,7 +208,7 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 }
 
 // handleRequest is the shared orchestration core for both bodied and bodyless requests.
-// A nil inferenceRequestBody signals a bodyless request (e.g. WebSocket upgrade).
+// A nil inferenceRequestBody signals a bodyless request.
 func (d *Director) handleRequest(ctx context.Context, reqCtx *handlers.RequestContext, inferenceRequestBody *fwkrh.InferenceRequestBody) (_ *handlers.RequestContext, err error) {
 	tracer := tracing.Tracer("llm-d-router/pkg/epp/requestcontrol")
 	ctx, span := tracer.Start(ctx, "request_orchestration", trace.WithSpanKind(trace.SpanKindServer))
@@ -698,7 +698,21 @@ func (d *Director) HandleResponseBody(ctx context.Context, reqCtx *handlers.Requ
 }
 
 func (d *Director) HandleResponseTrail(ctx context.Context, reqCtx *handlers.RequestContext) *handlers.RequestContext {
-	d.runResponseTrailerPlugins(ctx, reqCtx.SchedulingRequest)
+	cause := reqCtx.TerminationCause
+	if cause == "" {
+		cause = fwkrc.TerminationCauseNatural
+	}
+	// A bodyless request has no response body, so this is its end of stream.
+	response := &fwkrc.Response{
+		RequestID:        reqCtx.Request.ID,
+		Headers:          reqCtx.Response.Headers,
+		EndOfStream:      true,
+		TerminationCause: cause,
+	}
+	if d.requestEvictor != nil {
+		d.requestEvictor.ResponseBody(ctx, reqCtx.SchedulingRequest, response, reqCtx.TargetPod)
+	}
+	d.runResponseTrailerPlugins(ctx, reqCtx.SchedulingRequest, response, reqCtx.TargetPod)
 	return reqCtx
 }
 
@@ -894,16 +908,21 @@ func (d *Director) runResponseBodyPlugins(ctx context.Context, request *fwksched
 	}
 }
 
-func (d *Director) runResponseTrailerPlugins(ctx context.Context, request *fwksched.InferenceRequest) {
-	loggerTrace := log.FromContext(ctx).V(logutil.TRACE)
+func (d *Director) runResponseTrailerPlugins(ctx context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, targetEndpoint *fwkdl.EndpointMetadata) {
+	logger := log.FromContext(ctx)
+	loggerTrace := logger.V(logutil.TRACE)
 	for _, plugin := range d.requestControlPlugins.responseTrailerPlugins {
 		name := plugin.TypedName()
 		if loggerTrace.Enabled() {
 			loggerTrace.Info("Running ResponseTrailer plugin", "plugin", name)
 		}
 		before := time.Now()
-		plugin.ResponseTrailer(ctx, request)
+		err := plugin.ResponseTrailer(ctx, request, response, targetEndpoint)
 		metrics.RecordPluginProcessingLatency(fwkrc.ResponseTrailerExtensionPoint, name.Type, name.Name, time.Since(before))
+		if err != nil {
+			logger.Error(err, "ResponseTrailer plugin failed", "plugin", name)
+			continue
+		}
 		if loggerTrace.Enabled() {
 			loggerTrace.Info("Completed running ResponseTrailer plugin successfully", "plugin", name)
 		}

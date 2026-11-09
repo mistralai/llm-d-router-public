@@ -85,7 +85,7 @@ func (p *hookPlugin) ResponseHeader(_ context.Context, _ *fwksched.InferenceRequ
 }
 func (p *hookPlugin) ResponseBody(_ context.Context, _ *fwksched.InferenceRequest, _ *fwkrc.Response, _ *fwkdl.EndpointMetadata) {
 }
-func (p *hookPlugin) ResponseTrailer(_ context.Context, _ *fwksched.InferenceRequest) error {
+func (p *hookPlugin) ResponseTrailer(_ context.Context, _ *fwksched.InferenceRequest, _ *fwkrc.Response, _ *fwkdl.EndpointMetadata) error {
 	return nil
 }
 func (p *hookPlugin) Admit(_ context.Context, _ *fwksched.InferenceRequest, _ []fwksched.Endpoint) error {

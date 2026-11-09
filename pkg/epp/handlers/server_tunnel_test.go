@@ -22,12 +22,12 @@ import (
 	"time"
 
 	configPb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	extProcFilterPb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	envoyTypePb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/structpb"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
@@ -50,7 +50,7 @@ const (
 	tunnelAge = 2 * time.Second
 
 	tunnelRequestsMetric   = "llm_d_epp_tunnel_request_total"
-	tunnelDurationMetric   = "llm_d_epp_tunnel_request_duration"
+	tunnelDurationMetric   = "llm_d_epp_tunnel_request_duration_seconds"
 	regularRequestsMetric  = "llm_d_epp_request_total"
 	completionsRequestPath = "/v1/completions"
 )
@@ -66,12 +66,15 @@ type tunnelDirector struct {
 	requestCalls      int
 	responseBodyCalls int
 	trailCalls        int
+	// bodylessMetadata is the request metadata the bodyless hook observed.
+	bodylessMetadata map[string]any
 	// trailCause is the termination cause the last trail hook observed.
 	trailCause fwkrc.TerminationCause
 }
 
 func (d *tunnelDirector) HandleBodylessRequest(_ context.Context, reqCtx *RequestContext) (*RequestContext, error) {
 	d.bodylessCalls++
+	d.bodylessMetadata = reqCtx.Request.Metadata
 	if d.bodylessErr != nil {
 		return reqCtx, d.bodylessErr
 	}
@@ -108,7 +111,7 @@ func (d *tunnelDirector) schedule(reqCtx *RequestContext) {
 }
 
 func newGRPCBidirectionalHeaders() *extProcPb.ProcessingRequest {
-	return newRequestHeaders(map[string]string{metadata.GRPCBidirectionalStream: "true"})
+	return newRequestHeaders(map[string]string{metadata.GRPCBidirectionalStream: "true", "content-type": "application/grpc"})
 }
 
 func newResponseHeaders() *extProcPb.ProcessingRequest {
@@ -224,11 +227,6 @@ func TestProcessGRPCBidirectionalTunnel(t *testing.T) {
 
 			require.NotNil(t, reqHeaders.GetRequestHeaders())
 			assert.Equal(t, tunnelEndpoint, requestHeaderMutations(reqHeaders)[metadata.DestinationEndpointKey])
-			mode := reqHeaders.GetModeOverride()
-			require.NotNil(t, mode, "the tunnel must switch off body processing and ask for trailers")
-			assert.Equal(t, extProcFilterPb.ProcessingMode_NONE, mode.GetRequestBodyMode())
-			assert.Equal(t, extProcFilterPb.ProcessingMode_NONE, mode.GetResponseBodyMode())
-			assert.Equal(t, extProcFilterPb.ProcessingMode_SEND, mode.GetResponseTrailerMode())
 			assert.NotNil(t, respHeaders.GetResponseHeaders())
 			assert.NotNil(t, respTrailers.GetResponseTrailers())
 
@@ -239,7 +237,7 @@ func TestProcessGRPCBidirectionalTunnel(t *testing.T) {
 			assert.Equal(t, tt.wantCause, director.trailCause)
 
 			assert.Equal(t, 1.0, counterValue(t, tunnelRequestsMetric, tunnelLabels()))
-			assert.Zero(t, counterValue(t, regularRequestsMetric, nil), "a tunnel is not counted as a regular request")
+			assert.Equal(t, 1.0, counterValue(t, regularRequestsMetric, tunnelLabels()), "a tunnel is also counted as a request")
 			duration := findHistogramMetric(t, tunnelDurationMetric, tunnelLabels())
 			assert.Equal(t, uint64(1), duration.GetSampleCount())
 			assert.GreaterOrEqual(t, duration.GetSampleSum(), tunnelAge.Seconds())
@@ -263,7 +261,7 @@ func TestProcessBodylessAbortWithoutTrailers(t *testing.T) {
 
 func TestProcessRegularRequestAbortRunsResponseBodyHook(t *testing.T) {
 	director := &tunnelDirector{}
-	srv := runTunnel(t, director,
+	runTunnel(t, director,
 		newRequestHeaders(map[string]string{":path": completionsRequestPath}),
 		&extProcPb.ProcessingRequest{Request: &extProcPb.ProcessingRequest_RequestBody{RequestBody: &extProcPb.HttpBody{
 			Body:        []byte(`{"model":"m","prompt":"hi"}`),
@@ -275,9 +273,28 @@ func TestProcessRegularRequestAbortRunsResponseBodyHook(t *testing.T) {
 	assert.Zero(t, director.bodylessCalls)
 	assert.Equal(t, 1, director.responseBodyCalls)
 	assert.Zero(t, director.trailCalls)
-	require.NotEmpty(t, srv.sentResponses)
-	assert.Nil(t, srv.sentResponses[0].GetModeOverride(), "regular requests keep the proxy's processing mode")
 	assert.Zero(t, counterValue(t, tunnelRequestsMetric, nil))
+}
+
+// A bodyless stream sends no request body message, so the subset hint must be
+// read from the request headers message.
+func TestProcessBodylessReadsRequestMetadata(t *testing.T) {
+	subset, err := structpb.NewStruct(map[string]any{
+		metadata.SubsetFilterKey: []any{tunnelEndpoint},
+	})
+	require.NoError(t, err)
+	headers := newGRPCBidirectionalHeaders()
+	headers.MetadataContext = &configPb.Metadata{
+		FilterMetadata: map[string]*structpb.Struct{metadata.SubsetFilterNamespace: subset},
+	}
+
+	director := &tunnelDirector{}
+	runTunnel(t, director, headers)
+
+	require.Equal(t, 1, director.bodylessCalls)
+	assert.Equal(t, map[string]any{
+		metadata.SubsetFilterNamespace: map[string]any{metadata.SubsetFilterKey: []any{tunnelEndpoint}},
+	}, director.bodylessMetadata)
 }
 
 func TestProcessBodylessSchedulingErrorSendsImmediateResponse(t *testing.T) {

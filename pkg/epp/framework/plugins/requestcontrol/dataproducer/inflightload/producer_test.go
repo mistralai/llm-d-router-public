@@ -342,7 +342,7 @@ func TestInFlightLoadProducer_ResponseTrailerReleasesLoad(t *testing.T) {
 		require.Equal(t, int64(4)+UnknownOutputTokens, producer.tokenTracker.get(endpointID))
 
 		req.SchedulingResult = res
-		require.NoError(t, producer.ResponseTrailer(ctx, req))
+		require.NoError(t, producer.ResponseTrailer(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil))
 
 		require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
 		require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
@@ -366,7 +366,7 @@ func TestInFlightLoadProducer_ResponseTrailerReleasesLoad(t *testing.T) {
 		require.Equal(t, int64(1), producer.requestTracker.get(idB))
 
 		req.SchedulingResult = res
-		require.NoError(t, producer.ResponseTrailer(ctx, req))
+		require.NoError(t, producer.ResponseTrailer(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil))
 
 		require.Equal(t, int64(0), producer.requestTracker.get(idA))
 		require.Equal(t, int64(0), producer.requestTracker.get(idB))
@@ -384,11 +384,11 @@ func TestInFlightLoadProducer_ResponseTrailerReleasesLoad(t *testing.T) {
 		require.Equal(t, int64(2), producer.requestTracker.get(endpointID))
 
 		first.SchedulingResult = res
-		require.NoError(t, producer.ResponseTrailer(ctx, first))
+		require.NoError(t, producer.ResponseTrailer(ctx, first, &requestcontrol.Response{EndOfStream: true}, nil))
 		require.Equal(t, int64(1), producer.requestTracker.get(endpointID))
 
 		second.SchedulingResult = res
-		require.NoError(t, producer.ResponseTrailer(ctx, second))
+		require.NoError(t, producer.ResponseTrailer(ctx, second, &requestcontrol.Response{EndOfStream: true}, nil))
 		require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
 	})
 
@@ -401,8 +401,8 @@ func TestInFlightLoadProducer_ResponseTrailerReleasesLoad(t *testing.T) {
 		require.NoError(t, producer.PreRequest(ctx, req, res))
 		req.SchedulingResult = res
 
-		require.NoError(t, producer.ResponseTrailer(ctx, req))
-		require.NoError(t, producer.ResponseTrailer(ctx, req))
+		require.NoError(t, producer.ResponseTrailer(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil))
+		require.NoError(t, producer.ResponseTrailer(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil))
 
 		require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
 		require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
@@ -418,7 +418,7 @@ func TestInFlightLoadProducer_ResponseTrailerReleasesLoad(t *testing.T) {
 		req.SchedulingResult = res
 
 		producer.ResponseBody(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil)
-		require.NoError(t, producer.ResponseTrailer(ctx, req))
+		require.NoError(t, producer.ResponseTrailer(ctx, req, &requestcontrol.Response{EndOfStream: true}, nil))
 
 		require.Equal(t, int64(0), producer.requestTracker.get(endpointID))
 		require.Equal(t, int64(0), producer.tokenTracker.get(endpointID))
@@ -430,7 +430,7 @@ func TestInFlightLoadProducer_ResponseTrailerNilRequest(t *testing.T) {
 
 	producer := newTestProducer(t)
 	require.NotPanics(t, func() {
-		require.NoError(t, producer.ResponseTrailer(context.Background(), nil))
+		require.NoError(t, producer.ResponseTrailer(context.Background(), nil, &requestcontrol.Response{EndOfStream: true}, nil))
 	})
 }
 

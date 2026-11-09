@@ -33,7 +33,9 @@ import (
 
 	"github.com/llm-d/llm-d-router/pkg/common/envoy"
 	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
+	fwkrequest "github.com/llm-d/llm-d-router/pkg/epp/framework/common/request"
 	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 	"github.com/llm-d/llm-d-router/pkg/epp/util/request"
 )
@@ -61,13 +63,13 @@ func (s *StreamingServer) HandleRequestHeaders(ctx context.Context, reqCtx *Requ
 	reqCtx.ObjectiveKey, _ = metadata.GetLowerCaseHeaderValue(reqCtx.Request.Headers, metadata.ObjectiveKey)
 	reqCtx.TargetModelName, _ = metadata.GetLowerCaseHeaderValue(reqCtx.Request.Headers, metadata.ModelNameRewriteKey)
 
-	// A websocket upgrade is a bodyless request. Schedule it with RandomEndpoint picking.
+	// A websocket upgrade is a bodyless request. Schedule it with RandomEndpoint.
 	if isWebsocketUpgrade(reqCtx.Request.Headers) {
 		return s.fallbackToRandomEndpoint(ctx, reqCtx, 0)
 	}
 
-	// Grpc bidirectional streams are handled as bodyless requests (too complicated to actually parse the request body,
-	// and does not make sense as it will end only at the end of the whole stream)
+	// A gRPC bidirectional stream is routed from its headers: its body is a
+	// sequence of messages that ends only when the stream ends.
 	if isGrpcBidirectionalStream(reqCtx.Request.Headers) {
 		reqCtx.bodyless = true
 		reqCtx.grpcBidirectional = true
@@ -99,11 +101,16 @@ func isWebsocketUpgrade(headers map[string]string) bool {
 	return false
 }
 
-// isGrpcBidirectionalStream reports wether the request is meant to be a grpc bidirectional stream.
-// There is no way to know this from the request, so we just trust the client headers.
+// isGrpcBidirectionalStream reports whether the request is a gRPC bidirectional stream.
+// gRPC does not signal streaming in the request, so a header declares it, and the
+// content type confirms the request is gRPC.
 func isGrpcBidirectionalStream(headers map[string]string) bool {
 	val, ok := headers[metadata.GRPCBidirectionalStream]
-	return ok && strings.ToLower(val) == "true"
+	if !ok || strings.ToLower(val) != "true" {
+		return false
+	}
+	contentType := strings.ToLower(headers[reqcommon.HeaderContentType])
+	return contentType == fwkrequest.MediaTypeGRPC || strings.HasPrefix(contentType, fwkrequest.MediaTypeGRPC+"+")
 }
 
 func (s *StreamingServer) fallbackToRandomEndpoint(ctx context.Context, reqCtx *RequestContext, requestSize int) error {
