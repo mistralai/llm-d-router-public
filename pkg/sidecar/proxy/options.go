@@ -63,6 +63,7 @@ const (
 	mooncakeBootstrapPortFlag = "mooncake-bootstrap-port"
 	p2pConnectorPortFlag      = "p2p-connector-port"
 	enableP2PPull             = "enable-p2p-pull"
+	reusePromptTokenIDs       = "reuse-prompt-token-ids"
 	enableSSRFProtection      = "enable-ssrf-protection"
 	enablePrefillerSampling   = "enable-prefiller-sampling"
 	enableTLS                 = "enable-tls"
@@ -112,6 +113,7 @@ const (
 
 // yamlConfiguration represents structure of YAML configuration for sidecar proxy
 type yamlConfiguration struct {
+	ReusePromptTokenIDs     *bool    `json:"reuse-prompt-token-ids,omitempty"`
 	Port                    int      `json:"port,omitempty"`
 	ModelServerPort         int      `json:"model-server-port,omitempty"`
 	MooncakeBootstrapPort   int      `json:"mooncake-bootstrap-port,omitempty"`
@@ -271,6 +273,8 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.DataParallelSize, dataParallelSize, opts.DataParallelSize, "the model server's data-parallel size")
 	fs.StringVar(&opts.KVConnector, kvConnector, opts.KVConnector,
 		"the KV protocol between prefiller and decoder. Supported: "+supportedKVConnectorNamesStr)
+	fs.BoolVar(&opts.ReusePromptTokenIDs, reusePromptTokenIDs, opts.ReusePromptTokenIDs,
+		"reuse prefill prompt token IDs for text chat requests; requires NIXLv2 and vLLM decode support for kv_transfer_params.prompt_token_ids")
 	fs.StringVar(&opts.ECConnector, ecConnector, opts.ECConnector,
 		"the EC protocol between encoder and prefiller (for EPD mode). Supported: "+supportedECConnectorNamesStr+". Leave empty to skip encoder stage.")
 	fs.IntVar(&opts.MooncakeBootstrapPort, mooncakeBootstrapPortFlag, opts.MooncakeBootstrapPort,
@@ -658,6 +662,17 @@ func (opts *Options) Validate() error {
 	if _, ok := supportedKVConnectors[opts.KVConnector]; !ok {
 		return fmt.Errorf("--kv-connector must be one of: %s", supportedKVConnectorNamesStr)
 	}
+	if opts.ReusePromptTokenIDs {
+		if opts.KVConnector != constants.KVConnectorNIXLV2 {
+			return errors.New("--reuse-prompt-token-ids requires --kv-connector=nixlv2")
+		}
+		if opts.MoRIIOParallelDispatch {
+			return errors.New("--reuse-prompt-token-ids is incompatible with parallel dispatch")
+		}
+		if opts.DecodeChunkSize > 0 {
+			return errors.New("--reuse-prompt-token-ids is incompatible with chunked decode")
+		}
+	}
 
 	// Validate EC connector if provided
 	if opts.ECConnector != "" {
@@ -829,6 +844,9 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	}
 	if cfg.EnableP2PPull != nil && !opts.isFlagSet(enableP2PPull) {
 		opts.EnableP2PPull = *cfg.EnableP2PPull
+	}
+	if cfg.ReusePromptTokenIDs != nil && !opts.isFlagSet(reusePromptTokenIDs) {
+		opts.ReusePromptTokenIDs = *cfg.ReusePromptTokenIDs
 	}
 
 	if !opts.isSecureServingFlagSet() {
