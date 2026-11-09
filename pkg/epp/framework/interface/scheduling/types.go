@@ -55,7 +55,7 @@ type InferenceRequest struct {
 	FairnessID string
 	// RequestSizeBytes is the size of the raw request body in bytes when available.
 	RequestSizeBytes int
-	// Bodyless indicates a headers-only request (e.g. WebSocket upgrade) with no body to parse.
+	// Bodyless indicates a request routed without reading its body, such as a gRPC bidirectional stream.
 	Bodyless bool
 	// SchedulingResult captures the scheduling decisions made during the cycle.
 	SchedulingResult *SchedulingResult
@@ -203,7 +203,4 @@ func (r *ProfileRunResult) FirstEndpoint() Endpoint {
 
 type SchedulerProfile interface {
 	Run(ctx context.Context, request *InferenceRequest, candidateEndpoints []Endpoint) (*ProfileRunResult, error)
-	// BodylessCompatible reports whether every plugin in the profile can
-	// handle a request with no body (e.g. a WebSocket upgrade).
-	BodylessCompatible() bool
 }

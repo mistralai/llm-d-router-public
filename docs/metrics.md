@@ -123,6 +123,8 @@ lifecycle handled by the router.
 | `llm_d_epp_request_ttft_seconds` | Histogram | `model_name`, `target_model_name`, `fairness_id`, `priority`, `streaming` | Time to first token. Carries a trace exemplar; see [Exemplars](#exemplars). |
 | `llm_d_epp_request_streaming_tpot_seconds` | Histogram | `model_name`, `target_model_name`, `fairness_id`, `priority` | Time per output token for streaming. Carries a trace exemplar; see [Exemplars](#exemplars). |
 | `llm_d_epp_request_streaming_itl_seconds` | Histogram | `model_name`, `target_model_name`, `fairness_id`, `priority` | Inter-token latency for streaming. Carries a trace exemplar; see [Exemplars](#exemplars). |
+| `llm_d_epp_tunnel_request_total` | Counter | `model_name`, `target_model_name`, `fairness_id`, `priority` | Tunneled requests (gRPC bidirectional streams), which are routed without reading the request body. Also counted in `llm_d_epp_request_total`. |
+| `llm_d_epp_tunnel_request_duration_seconds` | Histogram | `model_name`, `target_model_name`, `fairness_id`, `priority` | Connection lifetime of a tunneled request that ended with response trailers. Carries a trace exemplar; see [Exemplars](#exemplars). |
 
 Requests answered locally by a responder, such as `GET /v1/models`, are not counted in
 `llm_d_epp_request_total` or `llm_d_epp_request_size_bytes`. A responder error is counted in

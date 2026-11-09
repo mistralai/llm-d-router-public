@@ -173,8 +173,10 @@ type Responder interface {
 	Respond(ctx context.Context, request *RequestLine, endpoints []datalayer.Endpoint) (*LocalResponse, error)
 }
 
-// ResponseTrailerProcessor runs after a response trailer has been received.
+// ResponseTrailerProcessor runs once at the end of a bodyless request, which has no
+// response body to carry an end of stream: when its response trailers arrive, or when
+// its stream ends without them. response.TerminationCause tells the two apart.
 type ResponseTrailerProcessor interface {
 	plugin.Plugin
-	ResponseTrailer(ctx context.Context, request *fwksched.InferenceRequest) error
+	ResponseTrailer(ctx context.Context, request *fwksched.InferenceRequest, response *Response, targetEndpoint *datalayer.EndpointMetadata) error
 }

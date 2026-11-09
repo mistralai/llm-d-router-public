@@ -307,9 +307,6 @@ func TestSchedulerProfileBodylessCompatible(t *testing.T) {
 				profile.WithPicker(test.picker)
 			}
 
-			// The result is computed when the scheduler is built.
-			NewSchedulerWithConfig(NewSchedulerConfig(single.NewSingleProfileHandler(), map[string]fwksched.SchedulerProfile{"default": profile}))
-
 			assert.Equal(t, test.want, profile.BodylessCompatible())
 		})
 	}
@@ -380,31 +377,84 @@ func TestScheduleBodyless(t *testing.T) {
 	}
 }
 
-// pickAllOnceHandler picks every profile in the first round and none afterwards.
-type pickAllOnceHandler struct {
-	primary string
+// plainProfile is a SchedulerProfile that does not implement BodylessCapable.
+type plainProfile struct {
+	runCalls int
 }
 
-func (h *pickAllOnceHandler) TypedName() fwkplugin.TypedName {
-	return fwkplugin.TypedName{Type: "pick-all-once", Name: "pick-all-once"}
+func (p *plainProfile) Run(_ context.Context, _ *fwksched.InferenceRequest, _ []fwksched.Endpoint) (*fwksched.ProfileRunResult, error) {
+	p.runCalls++
+	return &fwksched.ProfileRunResult{}, nil
 }
 
-func (h *pickAllOnceHandler) Pick(_ context.Context, _ *fwksched.InferenceRequest, profiles map[string]fwksched.SchedulerProfile,
+// A profile implementation that does not declare bodyless support is skipped
+// for a bodyless request and still runs for a request with a body.
+func TestScheduleBodylessSkipsProfileWithoutCapability(t *testing.T) {
+	tests := []struct {
+		name         string
+		bodyless     bool
+		wantErr      string
+		wantRunCalls int
+	}{
+		{
+			name:     "bodyless request",
+			bodyless: true,
+			wantErr:  "no bodyless-compatible scheduler profile",
+		},
+		{
+			name:         "request with a body",
+			wantRunCalls: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			profile := &plainProfile{}
+			scheduler := NewSchedulerWithConfig(NewSchedulerConfig(
+				single.NewSingleProfileHandler(), map[string]fwksched.SchedulerProfile{"default": profile}))
+			req := &fwksched.InferenceRequest{RequestID: uuid.NewString(), TargetModel: "any-model", Bodyless: test.bodyless}
+
+			_, err := scheduler.Schedule(context.Background(), req, nil)
+
+			assert.Equal(t, test.wantRunCalls, profile.runCalls)
+			if test.wantErr != "" {
+				assert.ErrorContains(t, err, test.wantErr)
+			}
+		})
+	}
+}
+
+// pickUntilAllRanHandler picks every profile until each has a result, like the
+// single and data-parallel handlers. It gives up after maxPickCalls so a
+// scheduler that never records a result fails the test instead of hanging.
+type pickUntilAllRanHandler struct {
+	primary   string
+	pickCalls int
+}
+
+const maxPickCalls = 3
+
+func (h *pickUntilAllRanHandler) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Type: "pick-until-all-ran", Name: "pick-until-all-ran"}
+}
+
+func (h *pickUntilAllRanHandler) Pick(_ context.Context, _ *fwksched.InferenceRequest, profiles map[string]fwksched.SchedulerProfile,
 	profileResults map[string]*fwksched.ProfileRunResult) map[string]fwksched.SchedulerProfile {
-	if len(profileResults) > 0 {
+	h.pickCalls++
+	if len(profiles) == len(profileResults) || h.pickCalls > maxPickCalls {
 		return nil
 	}
 	return profiles
 }
 
-func (h *pickAllOnceHandler) ProcessResults(_ context.Context, _ *fwksched.InferenceRequest,
+func (h *pickUntilAllRanHandler) ProcessResults(_ context.Context, _ *fwksched.InferenceRequest,
 	profileResults map[string]*fwksched.ProfileRunResult) (*fwksched.SchedulingResult, error) {
 	return &fwksched.SchedulingResult{ProfileResults: profileResults, PrimaryProfileName: h.primary}, nil
 }
 
 // When a bodyless request is offered several profiles and only some are
-// compatible, the compatible ones run and the rest are skipped without failing
-// the request.
+// compatible, the compatible ones run once and the rest are skipped without
+// failing the request.
 func TestScheduleBodylessSkipsOnlyIncompatibleProfiles(t *testing.T) {
 	compatiblePicker := newBodylessPlugin("compatible-picker", true)
 	incompatiblePicker := newBodylessPlugin("incompatible-picker", false)
@@ -412,7 +462,8 @@ func TestScheduleBodylessSkipsOnlyIncompatibleProfiles(t *testing.T) {
 		"compatible":   NewSchedulerProfile().WithPicker(compatiblePicker),
 		"incompatible": NewSchedulerProfile().WithPicker(incompatiblePicker),
 	}
-	scheduler := NewSchedulerWithConfig(NewSchedulerConfig(&pickAllOnceHandler{primary: "compatible"}, profiles))
+	handler := &pickUntilAllRanHandler{primary: "compatible"}
+	scheduler := NewSchedulerWithConfig(NewSchedulerConfig(handler, profiles))
 
 	req := &fwksched.InferenceRequest{RequestID: uuid.NewString(), TargetModel: "any-model", Bodyless: true}
 	input := []fwksched.Endpoint{
@@ -424,11 +475,92 @@ func TestScheduleBodylessSkipsOnlyIncompatibleProfiles(t *testing.T) {
 	assert.NoError(t, err)
 	if assert.NotNil(t, got) {
 		assert.Equal(t, "compatible", got.PrimaryProfileName)
-		assert.Contains(t, got.ProfileResults, "compatible")
-		assert.NotContains(t, got.ProfileResults, "incompatible")
+		assert.NotNil(t, got.ProfileResults["compatible"])
+		assert.Contains(t, got.ProfileResults, "incompatible")
+		assert.Nil(t, got.ProfileResults["incompatible"], "a skipped profile is recorded as a nil result")
 	}
-	assert.Equal(t, 1, compatiblePicker.PickCallCount, "compatible profile must run")
+	assert.Equal(t, 2, handler.pickCalls, "the second Pick must see every profile as evaluated")
+	assert.Equal(t, 1, compatiblePicker.PickCallCount, "compatible profile must run once")
 	assert.Equal(t, 0, incompatiblePicker.PickCallCount, "incompatible profile must be skipped")
+}
+
+// stagedHandler picks one profile per round in a fixed order, like the disagg
+// handler's decode-first stages.
+type stagedHandler struct {
+	stages []string
+}
+
+func (h *stagedHandler) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Type: "staged", Name: "staged"}
+}
+
+func (h *stagedHandler) Pick(_ context.Context, _ *fwksched.InferenceRequest, profiles map[string]fwksched.SchedulerProfile,
+	profileResults map[string]*fwksched.ProfileRunResult) map[string]fwksched.SchedulerProfile {
+	for _, name := range h.stages {
+		if _, evaluated := profileResults[name]; !evaluated {
+			return map[string]fwksched.SchedulerProfile{name: profiles[name]}
+		}
+	}
+	return nil
+}
+
+func (h *stagedHandler) ProcessResults(_ context.Context, _ *fwksched.InferenceRequest,
+	profileResults map[string]*fwksched.ProfileRunResult) (*fwksched.SchedulingResult, error) {
+	return &fwksched.SchedulingResult{ProfileResults: profileResults, PrimaryProfileName: h.stages[0]}, nil
+}
+
+// A round in which every picked profile is skipped fails the request only when
+// no profile ran in any round. Otherwise the profile handler decides.
+func TestScheduleBodylessSkippedRoundAfterRun(t *testing.T) {
+	tests := []struct {
+		name            string
+		firstCompatible bool
+		wantErr         string
+	}{
+		{
+			name:            "an earlier round ran a compatible profile",
+			firstCompatible: true,
+		},
+		{
+			name:            "no round ran a profile",
+			firstCompatible: false,
+			wantErr:         "no bodyless-compatible scheduler profile",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			firstPicker := newBodylessPlugin("first-picker", test.firstCompatible)
+			secondPicker := newBodylessPlugin("second-picker", false)
+			profiles := map[string]fwksched.SchedulerProfile{
+				"first":  NewSchedulerProfile().WithPicker(firstPicker),
+				"second": NewSchedulerProfile().WithPicker(secondPicker),
+			}
+			scheduler := NewSchedulerWithConfig(NewSchedulerConfig(&stagedHandler{stages: []string{"first", "second"}}, profiles))
+
+			req := &fwksched.InferenceRequest{RequestID: uuid.NewString(), TargetModel: "any-model", Bodyless: true}
+			input := []fwksched.Endpoint{
+				fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}}, &fwkdl.Metrics{}, nil),
+			}
+
+			got, err := scheduler.Schedule(context.Background(), req, input)
+
+			assert.Zero(t, secondPicker.PickCallCount, "the incompatible profile must be skipped")
+			if test.wantErr != "" {
+				assert.ErrorContains(t, err, test.wantErr)
+				assert.Nil(t, got)
+				return
+			}
+			assert.NoError(t, err)
+			if assert.NotNil(t, got) {
+				assert.Equal(t, "first", got.PrimaryProfileName)
+				assert.NotNil(t, got.ProfileResults["first"])
+				assert.Contains(t, got.ProfileResults, "second")
+				assert.Nil(t, got.ProfileResults["second"])
+			}
+			assert.Equal(t, 1, firstPicker.PickCallCount)
+		})
+	}
 }
 
 // messageCaptureSink records the message of every log call at every verbosity.

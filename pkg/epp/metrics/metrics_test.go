@@ -389,7 +389,7 @@ func TestTunnelMetricsRegistered(t *testing.T) {
 		wantType dto.MetricType
 	}{
 		{name: "llm_d_epp_tunnel_request_total", wantType: dto.MetricType_COUNTER},
-		{name: "llm_d_epp_tunnel_request_duration", wantType: dto.MetricType_HISTOGRAM},
+		{name: "llm_d_epp_tunnel_request_duration_seconds", wantType: dto.MetricType_HISTOGRAM},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

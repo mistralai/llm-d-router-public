@@ -71,8 +71,8 @@ const (
 	// FlowQueueDurationHeaderKey is the response header carrying the time a request spent in flow control admission,
 	// as integer milliseconds. It is absent when flow control did not process the request.
 	FlowQueueDurationHeaderKey = "x-llm-d-flow-queue-duration-ms"
-	// GRPCBidirectionalStream is the header key used to specify if the connection will/should be a bidirectional grpc
-	// stream.
+	// GRPCBidirectionalStream is the request header that marks a gRPC bidirectional stream, which EPP routes
+	// without reading the request body.
 	GRPCBidirectionalStream = "x-grpc-bidirectional-stream"
 )
 
