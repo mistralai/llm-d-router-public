@@ -112,3 +112,72 @@ func (s *lruStore) Len() int {
 	defer s.mu.RUnlock()
 	return s.lru.Len()
 }
+
+// addEntries publishes populated caches. A shared store lock prevents capacity
+// eviction during per-block mutation. TryLock avoids waiting for a PodCache
+// while holding a store lock; the contended path waits outside that lock.
+func (s *lruStore) addEntries(key BlockHash, records []EntryRef, capacity int) {
+	for {
+		s.mu.RLock()
+		pc, found := s.lru.Peek(key)
+		if !found {
+			s.mu.RUnlock()
+			candidate := &PodCache{capacity: capacity}
+			candidate.addAllLocked(records)
+			s.mu.Lock()
+			_, found = s.lru.Peek(key)
+			if !found {
+				s.lru.Add(key, candidate)
+				s.mu.Unlock()
+				return
+			}
+			s.mu.Unlock()
+			continue
+		}
+		if !pc.mu.TryLock() {
+			s.mu.RUnlock()
+			pc.mu.Lock()
+			pc.mu.Unlock()
+			continue
+		}
+		pc.addAllLocked(records)
+		pc.mu.Unlock()
+		s.mu.RUnlock()
+		// The value mutation is complete before exclusive recency maintenance.
+		// A concurrent capacity eviction may already have removed this key.
+		s.mu.Lock()
+		s.lru.Get(key)
+		s.mu.Unlock()
+		return
+	}
+}
+
+func (s *lruStore) removeEntries(key BlockHash, entries []PodEntry) {
+	for {
+		s.mu.RLock()
+		pc, found := s.lru.Peek(key)
+		if !found {
+			s.mu.RUnlock()
+			return
+		}
+		if !pc.mu.TryLock() {
+			s.mu.RUnlock()
+			pc.mu.Lock()
+			pc.mu.Unlock()
+			continue
+		}
+		empty := pc.removeAllLocked(entries)
+		s.mu.RUnlock()
+		if empty {
+			s.mu.Lock()
+			// Add cannot modify pc until its lock is released. Capacity eviction
+			// may have replaced it while the store lock was reacquired.
+			if current, ok := s.lru.Peek(key); ok && current == pc {
+				s.lru.Remove(key)
+			}
+			s.mu.Unlock()
+		}
+		pc.mu.Unlock()
+		return
+	}
+}
