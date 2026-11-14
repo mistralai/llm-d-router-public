@@ -32,21 +32,14 @@ import (
 
 // populateIndex fills an in-memory index with numKeys request keys, each held
 // by numPods pods on the gpu tier. Returns the index and the ordered keys.
-func populateIndex(b *testing.B, numKeys, numPods int) (*kvblock.InMemoryIndex, []kvblock.BlockHash) {
+func populateIndex(b *testing.B, numKeys, numPods int) (walkableIndex, []kvblock.BlockHash) {
 	b.Helper()
 	return populateIndexWithStore(b, numKeys, numPods, "")
 }
 
-func populateIndexWithStore(b *testing.B, numKeys, numPods int, store string) (*kvblock.InMemoryIndex, []kvblock.BlockHash) {
+func populateIndexWithStore(b *testing.B, numKeys, numPods int, store string) (walkableIndex, []kvblock.BlockHash) {
 	b.Helper()
-	idx, err := kvblock.NewInMemoryIndex(&kvblock.InMemoryIndexConfig{
-		Size:          1 << 20,
-		PodCacheSize:  128,
-		LocationStore: store,
-	})
-	if err != nil {
-		b.Fatal(err)
-	}
+	idx := createMemoryIndexForTesting(b, store, 1<<20, 128)
 	keys := make([]kvblock.BlockHash, numKeys)
 	for i := range keys {
 		keys[i] = kvblock.BlockHash(uint64(i) + 1)
@@ -64,22 +57,22 @@ func populateIndexWithStore(b *testing.B, numKeys, numPods int, store string) (*
 	return idx, keys
 }
 
-// BenchmarkInMemoryIndexLocationStore compares concurrent full-prefix reads
-// with optional 64-block event writers. Writers cycle over disjoint keys and
-// evict after each Add, keeping every read at the same hit depth for both stores.
-func BenchmarkInMemoryIndexLocationStore(b *testing.B) {
+// BenchmarkMemoryIndexConcurrentAccess compares concurrent full-prefix reads
+// with optional 64-block event writers. Each event resolves a parent, adds a
+// batch, and evicts it, keeping every read at the same hit depth for both indexes.
+func BenchmarkMemoryIndexConcurrentAccess(b *testing.B) {
 	for _, store := range []string{"lru", "otter"} {
 		for _, readers := range []string{"walk", "lookup"} {
 			for _, writers := range []int{0, 4} {
 				b.Run(fmt.Sprintf("%s/%s/writers=%d", store, readers, writers), func(b *testing.B) {
-					benchmarkLocationStore(b, store, readers, writers)
+					benchmarkMemoryIndex(b, store, readers, writers)
 				})
 			}
 		}
 	}
 }
 
-func benchmarkLocationStore(b *testing.B, store, readers string, writers int) {
+func benchmarkMemoryIndex(b *testing.B, store, readers string, writers int) {
 	b.Helper()
 	const numKeys, numPods = 3750, 16
 	idx, keys := populateIndexWithStore(b, numKeys, numPods, store)
@@ -89,10 +82,14 @@ func benchmarkLocationStore(b *testing.B, store, readers string, writers int) {
 	var wg sync.WaitGroup
 	var updates atomic.Uint64
 	for w := range writers {
+		entries := []kvblock.PodEntry{{PodIdentifier: fmt.Sprintf("writer-%d", w), DeviceTier: "gpu"}}
+		parent := kvblock.BlockHash(1<<40 + w)
+		if err := idx.Add(ctx, []kvblock.BlockHash{parent}, []kvblock.BlockHash{parent}, entries); err != nil {
+			b.Fatal(err)
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			entries := []kvblock.PodEntry{{PodIdentifier: fmt.Sprintf("writer-%d", w), DeviceTier: "gpu"}}
 			eventKeys := make([]kvblock.BlockHash, 64)
 			<-start
 			for i := 0; ; i++ {
@@ -100,6 +97,10 @@ func benchmarkLocationStore(b *testing.B, store, readers string, writers int) {
 				case <-stop:
 					return
 				default:
+				}
+				if _, err := idx.GetRequestKey(ctx, parent); err != nil {
+					errs <- err
+					return
 				}
 				base := numKeys + 1 + w*4096 + (i%64)*64
 				for j := range eventKeys {

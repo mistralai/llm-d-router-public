@@ -19,7 +19,7 @@ subscriber writes.
 - **Ordered walk.** `KeyWalker` is an optional capability for callers that
   fold entries in key order: it visits the requested keys in sequence,
   reporting misses, and lends each key's entries as `EntryRef` values that
-  carry the index's pod and tier ordinals. The in-memory backend has it and
+  carry the index's pod and tier ordinals. The in-memory backends have it and
   the decorators keep it; the [`kvcache`](../README.md) prefix matcher walks
   when it can and falls back to `Lookup`.
 
@@ -30,6 +30,7 @@ subscriber writes.
 | Backend | Constructor | Use |
 |---------|-------------|-----|
 | In-memory | `NewInMemoryIndex` | Single-replica local index bounded by key count. |
+| Otter | `NewOtterIndex` | Local index with concurrent location and translation caches. |
 | Cost-aware memory | `NewCostAwareMemoryIndex` | Local index with cost-aware eviction. |
 | Redis | `NewRedisIndex` | Shared index across EPP replicas (Redis-protocol server). |
 
@@ -37,28 +38,29 @@ Two decorators wrap any backend: `NewTracedIndex` adds OpenTelemetry spans
 (no-op when tracing is off) and `NewInstrumentedIndex` records the
 [metrics](../metrics/README.md).
 
-### In-memory location store
+### Otter backend
 
-`inMemoryConfig.locationStore` selects the request-key-to-pod store:
+Set `otterConfig` to select the Otter backend:
 
 ```yaml
-inMemoryConfig:
+otterConfig:
   size: 1000000
   podCacheSize: 128
-  locationStore: otter
 ```
 
-The default, `lru`, updates exact LRU recency under a shared store mutex.
-`otter` uses a concurrent cache with buffered access history and an approximate
-recency/frequency eviction policy. Inserts and explicit removals are visible
-synchronously. Capacity maintenance can temporarily exceed `size`, which limits
-key count rather than bytes. Read-ahead lookups and eviction scans do not record
-accesses; `Lookup` and `WalkKeys` record their visited prefixes.
+`InMemoryIndex` uses LRU caches and remains the default. `OtterIndex` uses
+concurrent caches for both request-key locations and engine-key translations,
+with buffered access history and an approximate recency/frequency eviction
+policy. Inserts and explicit removals are visible synchronously.
+Capacity maintenance can temporarily exceed `size`, which limits
+key count in each cache rather than bytes. Read-ahead lookups and eviction scans
+do not record accesses; `Lookup` and `WalkKeys` record their visited prefixes.
 
-Both stores retain per-key pod-entry locks and the index's Add/Evict ordering
-lock. The engine-key-to-request-key translation cache remains an LRU. Selecting
-Otter changes location-store contention and eviction behavior; it does not remove
-those other synchronization costs.
+`OtterIndex` embeds the in-memory implementation, sharing its lookup, translation,
+and eviction logic. Both indexes retain per-key pod-entry locks and the index's
+Add/Evict ordering lock. Parent translations must remain available for later
+KV events to extend a prefix, so eviction policy affects event processing as well
+as routing cache hits.
 
 ## Grouped (HMA) Entries
 

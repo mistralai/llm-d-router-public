@@ -45,30 +45,62 @@ func TestInMemoryIndexBehavior(t *testing.T) {
 	testCommonIndexBehavior(t, createInMemoryIndexForTesting)
 }
 
+type walkableIndex interface {
+	Index
+	KeyWalker
+}
+
+func createMemoryIndexForTesting(t testing.TB, store string, size, podCacheSize int) walkableIndex {
+	t.Helper()
+	var index Index
+	var err error
+	switch store {
+	case "", "lru":
+		index, err = NewInMemoryIndex(&InMemoryIndexConfig{Size: size, PodCacheSize: podCacheSize})
+	case "otter":
+		index, err = NewOtterIndex(&OtterIndexConfig{Size: size, PodCacheSize: podCacheSize})
+	default:
+		t.Fatalf("unknown test store: %s", store)
+	}
+	require.NoError(t, err)
+	walker, ok := index.(walkableIndex)
+	require.True(t, ok)
+	return walker
+}
+
 func TestOtterIndexBehavior(t *testing.T) {
 	testCommonIndexBehavior(t, func(t *testing.T) Index {
 		t.Helper()
-		index, err := NewInMemoryIndex(&InMemoryIndexConfig{
-			Size:          1 << 20,
-			PodCacheSize:  500,
-			LocationStore: "otter",
+		index, err := NewOtterIndex(&OtterIndexConfig{
+			Size:         1 << 20,
+			PodCacheSize: 500,
 		})
 		require.NoError(t, err)
 		return index
 	})
 }
 
-func TestInMemoryIndexRejectsUnknownLocationStore(t *testing.T) {
-	_, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 100, LocationStore: "unknown"})
-	require.ErrorContains(t, err, "unknown location store")
+func TestNewIndexSelectsOtterOverDefaultInMemoryConfig(t *testing.T) {
+	cfg := DefaultIndexConfig()
+	cfg.OtterConfig = &OtterIndexConfig{Size: 100}
+	index, err := NewIndex(t.Context(), cfg)
+	require.NoError(t, err)
+	require.IsType(t, &OtterIndex{}, index)
+	_, ok := index.(KeyWalker)
+	require.True(t, ok)
 }
 
-func TestInMemoryIndexRejectsNonPositiveSize(t *testing.T) {
-	for _, store := range []string{"", "lru", "otter"} {
+func TestMemoryIndexesRejectNonPositiveSize(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
 		for _, size := range []int{0, -1} {
 			t.Run(fmt.Sprintf("store=%s/size=%d", store, size), func(t *testing.T) {
-				_, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: size, LocationStore: store})
-				require.ErrorContains(t, err, "size must be positive")
+				var err error
+				if store == "otter" {
+					_, err = NewOtterIndex(&OtterIndexConfig{Size: size})
+				} else {
+					_, err = NewInMemoryIndex(&InMemoryIndexConfig{Size: size})
+				}
+				require.Error(t, err)
 			})
 		}
 	}

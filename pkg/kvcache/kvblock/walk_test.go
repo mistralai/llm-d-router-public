@@ -89,8 +89,7 @@ func TestWalkKeysVisitsEveryPositionAcrossBatches(t *testing.T) {
 func testWalkKeysVisitsEveryPositionAcrossBatches(t *testing.T, store string) {
 	t.Helper()
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 2000, LocationStore: store})
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, 2000, 0)
 	pod := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	keys := make([]BlockHash, 1000)
 	var held []BlockHash

@@ -16,8 +16,6 @@ limitations under the License.
 
 package kvblock
 
-import "fmt"
-
 // locationStore synchronizes request-key membership. Callers separately lock
 // mutable PodCache values. Capacity eviction can detach a returned value.
 type locationStore interface {
@@ -28,18 +26,4 @@ type locationStore interface {
 	LoadOrStore(BlockHash, *PodCache) (actual *PodCache, loaded bool)
 	Remove(BlockHash) bool
 	Keys() []BlockHash
-}
-
-func newLocationStore(kind string, size int) (locationStore, error) {
-	if size <= 0 {
-		return nil, fmt.Errorf("location store size must be positive: %d", size)
-	}
-	switch kind {
-	case "", "lru":
-		return newLRUStore(size)
-	case "otter":
-		return newOtterStore(size)
-	default:
-		return nil, fmt.Errorf("unknown location store: %q", kind)
-	}
 }

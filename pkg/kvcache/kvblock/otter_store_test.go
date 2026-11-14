@@ -33,7 +33,7 @@ func TestOtterStoreMembershipBeforeMaintenance(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	store := &otterStore{cache: cache}
+	store := &otterStore[*PodCache]{cache: cache}
 	first := &PodCache{capacity: 1}
 	second := &PodCache{capacity: 2}
 
@@ -70,14 +70,37 @@ func TestOtterStoreMembershipBeforeMaintenance(t *testing.T) {
 	require.Equal(t, []BlockHash{1}, store.Keys())
 }
 
-func TestOtterStoreEnforcesCapacityAfterMaintenance(t *testing.T) {
+func TestOtterEngineKeysReplaceAndRemoveMappings(t *testing.T) {
+	store, err := newOtterStore[[]BlockHash](100)
+	require.NoError(t, err)
+	store.Put(1, []BlockHash{10, 11})
+	previous, found := store.Peek(1)
+	require.True(t, found)
+	store.Put(1, []BlockHash{20, 21})
+	current, found := store.Get(1)
+	require.True(t, found)
+	require.Equal(t, []BlockHash{20, 21}, current)
+	require.Equal(t, []BlockHash{10, 11}, previous)
+	require.True(t, store.Remove(1))
+	store.cache.CleanUp()
+	_, found = store.Peek(1)
+	require.False(t, found)
+}
+
+func TestOtterIndexEnforcesCapacityAfterMaintenance(t *testing.T) {
 	const size = 32
-	store, err := newOtterStore(size)
+	index, err := NewOtterIndex(&OtterIndexConfig{Size: size})
 	require.NoError(t, err)
 	for key := range BlockHash(1000) {
-		store.LoadOrStore(key, &PodCache{capacity: 1})
+		require.NoError(t, index.Add(t.Context(), []BlockHash{10000 + key}, []BlockHash{key + 1},
+			[]PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}))
 	}
-	store.cache.CleanUp()
-	require.LessOrEqual(t, store.cache.EstimatedSize(), size)
-	require.NotEmpty(t, store.Keys())
+	locations := index.data.(*otterStore[*PodCache])
+	translations := index.engineToRequestKeys.(*otterStore[[]BlockHash])
+	locations.cache.CleanUp()
+	translations.cache.CleanUp()
+	require.LessOrEqual(t, locations.cache.EstimatedSize(), size)
+	require.LessOrEqual(t, translations.cache.EstimatedSize(), size)
+	require.NotEmpty(t, locations.Keys())
+	require.NotEmpty(t, translations.Keys())
 }

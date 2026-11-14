@@ -29,6 +29,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func newMemoryIndexForTesting(t *testing.T, store string, size, podCacheSize int) *InMemoryIndex {
+	t.Helper()
+	if store == "otter" {
+		index, err := NewOtterIndex(&OtterIndexConfig{Size: size, PodCacheSize: podCacheSize})
+		require.NoError(t, err)
+		return index.InMemoryIndex
+	}
+	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: size, PodCacheSize: podCacheSize})
+	require.NoError(t, err)
+	return index
+}
+
 // TestInMemoryIndexEvictKeepsEntryAddedConcurrently drives, for each public
 // eviction entrypoint, the interleaving where Add has fetched a key's PodCache
 // and the eviction empties that cache before Add writes to it. The test holds
@@ -77,8 +89,7 @@ func testInMemoryIndexEvictKeepsEntryAddedConcurrently(t *testing.T, store strin
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
-			idx, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 100, LocationStore: store})
-			require.NoError(t, err)
+			idx := newMemoryIndexForTesting(t, store, 100, 0)
 			require.NoError(t, idx.Add(ctx, []BlockHash{engineKey}, []BlockHash{requestKey}, []PodEntry{podA}))
 
 			recordsB, err := idx.internRecords([]PodEntry{podB})
@@ -164,6 +175,13 @@ func TestInMemoryIndexEngineEvictKeepsMappingAddedConcurrently(t *testing.T) {
 // key however the writers interleave. The test checks every entry against
 // that, and that every key held through an engine key still resolves.
 func TestInMemoryIndexConcurrentWritersMatchSequentialModel(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testMemoryIndexConcurrentWritersMatchSequentialModel(t, store) })
+	}
+}
+
+func testMemoryIndexConcurrentWritersMatchSequentialModel(t *testing.T, store string) {
+	t.Helper()
 	const (
 		pods   = 4
 		keys   = 3
@@ -195,8 +213,7 @@ func TestInMemoryIndexConcurrentWritersMatchSequentialModel(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			for r := range rounds {
-				idx, err := NewInMemoryIndex(nil)
-				require.NoError(t, err)
+				idx := newMemoryIndexForTesting(t, store, 100, 0)
 
 				var writers []*writer
 				for p := range pods {

@@ -17,6 +17,7 @@ limitations under the License.
 package kvblock
 
 import (
+	"fmt"
 	"slices"
 
 	"github.com/maypok86/otter/v2"
@@ -24,28 +25,31 @@ import (
 
 // otterStore buffers access history for eviction-policy maintenance.
 // Membership changes are synchronous; policy maintenance may lag behind them.
-type otterStore struct {
-	cache *otter.Cache[BlockHash, *PodCache]
+type otterStore[V any] struct {
+	cache *otter.Cache[BlockHash, V]
 }
 
-func newOtterStore(size int) (*otterStore, error) {
-	cache, err := otter.New(&otter.Options[BlockHash, *PodCache]{MaximumSize: size})
+func newOtterStore[V any](size int) (*otterStore[V], error) {
+	if size <= 0 {
+		return nil, fmt.Errorf("otter store size must be positive: %d", size)
+	}
+	cache, err := otter.New(&otter.Options[BlockHash, V]{MaximumSize: size})
 	if err != nil {
 		return nil, err
 	}
-	return &otterStore{cache: cache}, nil
+	return &otterStore[V]{cache: cache}, nil
 }
 
-func (s *otterStore) Get(key BlockHash) (*PodCache, bool) {
+func (s *otterStore[V]) Get(key BlockHash) (V, bool) {
 	return s.cache.GetIfPresent(key)
 }
 
-func (s *otterStore) Peek(key BlockHash) (*PodCache, bool) {
+func (s *otterStore[V]) Peek(key BlockHash) (V, bool) {
 	entry, found := s.cache.GetEntryQuietly(key)
 	return entry.Value, found
 }
 
-func (s *otterStore) PeekInto(keys []BlockHash, out []*PodCache) []*PodCache {
+func (s *otterStore[V]) PeekInto(keys []BlockHash, out []V) []V {
 	out = out[:0]
 	for _, key := range keys {
 		pc, _ := s.Peek(key)
@@ -54,22 +58,26 @@ func (s *otterStore) PeekInto(keys []BlockHash, out []*PodCache) []*PodCache {
 	return out
 }
 
-func (s *otterStore) Promote(keys []BlockHash) {
+func (s *otterStore[V]) Promote(keys []BlockHash) {
 	for _, key := range keys {
 		s.cache.GetIfPresent(key)
 	}
 }
 
-func (s *otterStore) LoadOrStore(key BlockHash, value *PodCache) (actual *PodCache, loaded bool) {
+func (s *otterStore[V]) LoadOrStore(key BlockHash, value V) (actual V, loaded bool) {
 	actual, inserted := s.cache.SetIfAbsent(key, value)
 	return actual, !inserted
 }
 
-func (s *otterStore) Remove(key BlockHash) bool {
+func (s *otterStore[V]) Put(key BlockHash, value V) {
+	s.cache.Set(key, value)
+}
+
+func (s *otterStore[V]) Remove(key BlockHash) bool {
 	_, removed := s.cache.Invalidate(key)
 	return removed
 }
 
-func (s *otterStore) Keys() []BlockHash {
+func (s *otterStore[V]) Keys() []BlockHash {
 	return slices.Collect(s.cache.Keys())
 }

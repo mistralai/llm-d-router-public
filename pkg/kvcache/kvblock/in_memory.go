@@ -55,9 +55,6 @@ type InMemoryIndexConfig struct {
 	// PodCacheSize is the maximum number of pod entries per key.
 	// A non-positive value selects defaultPodsPerKey.
 	PodCacheSize int `json:"podCacheSize"`
-	// LocationStore selects "lru" (the default) or "otter" for request-key
-	// locations. Otter may temporarily exceed Size during eviction maintenance.
-	LocationStore string `json:"locationStore,omitempty"`
 }
 
 // DefaultInMemoryIndexConfig returns a default configuration for the InMemoryIndex.
@@ -73,12 +70,7 @@ func NewInMemoryIndex(cfg *InMemoryIndexConfig) (*InMemoryIndex, error) {
 	if cfg == nil {
 		cfg = DefaultInMemoryIndexConfig()
 	}
-	podCacheSize := cfg.PodCacheSize
-	if podCacheSize <= 0 {
-		podCacheSize = defaultPodsPerKey
-	}
-
-	cache, err := newLocationStore(cfg.LocationStore, cfg.Size)
+	cache, err := newLRUStore(cfg.Size)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize in-memory index: %w", err)
 	}
@@ -88,13 +80,20 @@ func NewInMemoryIndex(cfg *InMemoryIndexConfig) (*InMemoryIndex, error) {
 		return nil, fmt.Errorf("failed to initialize in-memory engine key map: %w", err)
 	}
 
+	return newInMemoryIndex(cache, &lruEngineKeys{Cache: engineToRequestKeys}, cfg.PodCacheSize), nil
+}
+
+func newInMemoryIndex(cache locationStore, engineKeys engineKeyStore, podCacheSize int) *InMemoryIndex {
+	if podCacheSize <= 0 {
+		podCacheSize = defaultPodsPerKey
+	}
 	return &InMemoryIndex{
 		data:                cache,
-		engineToRequestKeys: engineToRequestKeys,
+		engineToRequestKeys: engineKeys,
 		podCacheSize:        podCacheSize,
 		pods:                newInterner(maxInternedPods),
 		tiers:               newInterner(maxInternedTiers),
-	}, nil
+	}
 }
 
 // cancellationCheckMask paces context-cancellation checks in loops over
@@ -121,7 +120,7 @@ type InMemoryIndex struct {
 	// data holds the mapping of requestKeys to sets of pod identifiers.
 	data locationStore
 	// engineToRequestKeys holds the mapping of engineKeys to requestKeys.
-	engineToRequestKeys *lru.Cache[BlockHash, []BlockHash]
+	engineToRequestKeys engineKeyStore
 	// podCacheSize is the maximum number of pod entries per key.
 	podCacheSize int
 	// pods and tiers assign the ordinals EntryRef carries. Neither is
@@ -371,7 +370,7 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	if engineKeys != nil {
 		mappings := engineToRequestMapping(engineKeys, requestKeys)
 		for ek, rks := range mappings {
-			m.engineToRequestKeys.Add(ek, rks)
+			m.engineToRequestKeys.Put(ek, rks)
 		}
 	}
 
@@ -511,7 +510,7 @@ func (m *InMemoryIndex) removeIfEmptyLocked(requestKey BlockHash) bool {
 // Context cancellation does not interrupt Clear.
 //
 // The engineKey->requestKey mapping (engineToRequestKeys) is intentionally left
-// untouched: it is LRU-bounded, self-heals when the pod re-Adds the same prefixes,
+// untouched: it is capacity-bounded, self-heals when the pod re-Adds the same prefixes,
 // and any stale mapping resolves to an emptied request key that correctly breaks
 // the prefix chain in Lookup.
 func (m *InMemoryIndex) Clear(ctx context.Context, podIdentifier string) error {
