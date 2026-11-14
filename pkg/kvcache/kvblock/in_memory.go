@@ -544,7 +544,6 @@ func (m *InMemoryIndex) Clear(ctx context.Context, podIdentifier string) error {
 	}
 
 	// One m.mu hold per chunk bounds how long Clear blocks Add.
-	const clearChunkSize = 1024
 	for chunk := range slices.Chunk(emptied, clearChunkSize) {
 		m.mu.Lock()
 		for _, requestKey := range chunk {

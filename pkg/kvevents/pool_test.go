@@ -2430,6 +2430,7 @@ func TestProcessEventBatch_SameEngineHashesAcrossModels(t *testing.T) {
 	server := miniredis.RunT(t)
 	for name, newIndex := range map[string]func() (kvblock.Index, error){
 		"in-memory": func() (kvblock.Index, error) { return kvblock.NewInMemoryIndex(kvblock.DefaultInMemoryIndexConfig()) },
+		"otter":     func() (kvblock.Index, error) { return kvblock.NewOtterIndex(kvblock.DefaultOtterIndexConfig()) },
 		"cost-aware": func() (kvblock.Index, error) {
 			return kvblock.NewCostAwareMemoryIndex(kvblock.DefaultCostAwareMemoryIndexConfig())
 		},

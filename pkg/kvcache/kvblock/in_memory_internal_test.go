@@ -29,11 +29,57 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// memoryIndexForTesting exposes the state used to drive deterministic races
+// while each backend supplies its own Index and KeyWalker implementation.
+type memoryIndexForTesting struct {
+	Index
+	KeyWalker
+	mu   *sync.Mutex
+	data interface {
+		Get(BlockHash) (*PodCache, bool)
+		Peek(BlockHash) (*PodCache, bool)
+	}
+	engineToRequestKeys interface {
+		Peek(BlockHash) ([]BlockHash, bool)
+	}
+	pods, tiers   *interner
+	internRecords func([]PodEntry) ([]EntryRef, error)
+}
+
+func newMemoryIndexForTesting(t *testing.T, store string, size, podCacheSize int) *memoryIndexForTesting {
+	t.Helper()
+	if store == "otter" {
+		index, err := NewOtterIndex(&OtterIndexConfig{Size: size, PodCacheSize: podCacheSize})
+		require.NoError(t, err)
+		return &memoryIndexForTesting{
+			Index: index, KeyWalker: index, mu: &index.mu, data: index.data,
+			engineToRequestKeys: index.engineToRequestKeys,
+			pods:                index.pods, tiers: index.tiers, internRecords: index.internRecords,
+		}
+	}
+	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: size, PodCacheSize: podCacheSize})
+	require.NoError(t, err)
+	return &memoryIndexForTesting{
+		Index: index, KeyWalker: index, mu: &index.mu, data: index.data,
+		engineToRequestKeys: index.engineToRequestKeys,
+		pods:                index.pods, tiers: index.tiers, internRecords: index.internRecords,
+	}
+}
+
 // TestInMemoryIndexEvictKeepsEntryAddedConcurrently drives, for each public
 // eviction entrypoint, the interleaving where Add has fetched a key's PodCache
 // and the eviction empties that cache before Add writes to it. The test holds
 // m.mu as Add does, so the eviction must not remove the key until the write lands.
 func TestInMemoryIndexEvictKeepsEntryAddedConcurrently(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) {
+			testInMemoryIndexEvictKeepsEntryAddedConcurrently(t, store)
+		})
+	}
+}
+
+func testInMemoryIndexEvictKeepsEntryAddedConcurrently(t *testing.T, store string) {
+	t.Helper()
 	const (
 		engineKey  BlockHash = 101
 		requestKey BlockHash = 1
@@ -43,23 +89,23 @@ func TestInMemoryIndexEvictKeepsEntryAddedConcurrently(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		evict func(context.Context, *InMemoryIndex) error
+		evict func(context.Context, Index) error
 	}{
 		{
 			name: "Evict by request key",
-			evict: func(ctx context.Context, idx *InMemoryIndex) error {
+			evict: func(ctx context.Context, idx Index) error {
 				return idx.Evict(ctx, RequestKey, []BlockHash{requestKey}, []PodEntry{podA})
 			},
 		},
 		{
 			name: "Evict by engine key",
-			evict: func(ctx context.Context, idx *InMemoryIndex) error {
+			evict: func(ctx context.Context, idx Index) error {
 				return idx.Evict(ctx, EngineKey, []BlockHash{engineKey}, []PodEntry{podA})
 			},
 		},
 		{
 			name: "Clear",
-			evict: func(ctx context.Context, idx *InMemoryIndex) error {
+			evict: func(ctx context.Context, idx Index) error {
 				return idx.Clear(ctx, podA.PodIdentifier)
 			},
 		},
@@ -68,8 +114,7 @@ func TestInMemoryIndexEvictKeepsEntryAddedConcurrently(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
-			idx, err := NewInMemoryIndex(nil)
-			require.NoError(t, err)
+			idx := newMemoryIndexForTesting(t, store, 100, 0)
 			require.NoError(t, idx.Add(ctx, []BlockHash{engineKey}, []BlockHash{requestKey}, []PodEntry{podA}))
 
 			recordsB, err := idx.internRecords([]PodEntry{podB})
@@ -155,6 +200,13 @@ func TestInMemoryIndexEngineEvictKeepsMappingAddedConcurrently(t *testing.T) {
 // key however the writers interleave. The test checks every entry against
 // that, and that every key held through an engine key still resolves.
 func TestInMemoryIndexConcurrentWritersMatchSequentialModel(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testMemoryIndexConcurrentWritersMatchSequentialModel(t, store) })
+	}
+}
+
+func testMemoryIndexConcurrentWritersMatchSequentialModel(t *testing.T, store string) {
+	t.Helper()
 	const (
 		pods   = 4
 		keys   = 3
@@ -186,8 +238,7 @@ func TestInMemoryIndexConcurrentWritersMatchSequentialModel(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
 			for r := range rounds {
-				idx, err := NewInMemoryIndex(nil)
-				require.NoError(t, err)
+				idx := newMemoryIndexForTesting(t, store, 100, 0)
 
 				var writers []*writer
 				for p := range pods {

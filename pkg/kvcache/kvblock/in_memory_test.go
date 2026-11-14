@@ -45,6 +45,67 @@ func TestInMemoryIndexBehavior(t *testing.T) {
 	testCommonIndexBehavior(t, createInMemoryIndexForTesting)
 }
 
+type walkableIndex interface {
+	Index
+	KeyWalker
+}
+
+func createMemoryIndexForTesting(t testing.TB, store string, size, podCacheSize int) walkableIndex {
+	t.Helper()
+	var index Index
+	var err error
+	switch store {
+	case "", "lru":
+		index, err = NewInMemoryIndex(&InMemoryIndexConfig{Size: size, PodCacheSize: podCacheSize})
+	case "otter":
+		index, err = NewOtterIndex(&OtterIndexConfig{Size: size, PodCacheSize: podCacheSize})
+	default:
+		t.Fatalf("unknown test store: %s", store)
+	}
+	require.NoError(t, err)
+	walker, ok := index.(walkableIndex)
+	require.True(t, ok)
+	return walker
+}
+
+func TestOtterIndexBehavior(t *testing.T) {
+	testCommonIndexBehavior(t, func(t *testing.T) Index {
+		t.Helper()
+		index, err := NewOtterIndex(&OtterIndexConfig{
+			Size:         1 << 20,
+			PodCacheSize: 500,
+		})
+		require.NoError(t, err)
+		return index
+	})
+}
+
+func TestNewIndexSelectsOtterOverDefaultInMemoryConfig(t *testing.T) {
+	cfg := DefaultIndexConfig()
+	cfg.OtterConfig = &OtterIndexConfig{Size: 100}
+	index, err := NewIndex(t.Context(), cfg)
+	require.NoError(t, err)
+	require.IsType(t, &OtterIndex{}, index)
+	_, ok := index.(KeyWalker)
+	require.True(t, ok)
+}
+
+func TestMemoryIndexesRejectNonPositiveSize(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		for _, size := range []int{0, -1} {
+			t.Run(fmt.Sprintf("store=%s/size=%d", store, size), func(t *testing.T) {
+				var err error
+				if store == "otter" {
+					_, err = NewOtterIndex(&OtterIndexConfig{Size: size})
+				} else {
+					_, err = NewInMemoryIndex(&InMemoryIndexConfig{Size: size})
+				}
+				require.Error(t, err)
+			})
+		}
+	}
+}
+
 func TestInMemoryIndexSize(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
 
@@ -125,9 +186,15 @@ func TestInMemoryIndexPodCacheSize(t *testing.T) {
 }
 
 func TestInMemoryIndexDefaultPodCacheSize(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testInMemoryIndexDefaultPodCacheSize(t, store) })
+	}
+}
+
+func testInMemoryIndexDefaultPodCacheSize(t *testing.T, store string) {
+	t.Helper()
 	ctx := t.Context()
-	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1})
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, 1, 0)
 	capacity := DefaultInMemoryIndexConfig().PodCacheSize
 	entries := make([]PodEntry, capacity+1)
 	for i := range entries {
@@ -142,10 +209,16 @@ func TestInMemoryIndexDefaultPodCacheSize(t *testing.T) {
 }
 
 func TestInMemoryIndexClearIgnoresCancellation(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testInMemoryIndexClearIgnoresCancellation(t, store) })
+	}
+}
+
+func testInMemoryIndexClearIgnoresCancellation(t *testing.T, store string) {
+	t.Helper()
 	ctx := t.Context()
 	const numKeys = 600
-	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: numKeys, PodCacheSize: 3})
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, numKeys, 3)
 	keys := make([]BlockHash, numKeys)
 	for i := range keys {
 		keys[i] = BlockHash(i + 1)
@@ -207,8 +280,15 @@ func (c *cancelAfterFirstErrCheck) Err() error {
 // A lookup cancelled between a checkpoint and a missing key reports the
 // cancellation instead of the partial prefix read before the miss.
 func TestInMemoryIndexLookupCancelledBeforeMiss(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testInMemoryIndexLookupCancelledBeforeMiss(t, store) })
+	}
+}
+
+func testInMemoryIndexLookupCancelledBeforeMiss(t *testing.T, store string) {
+	t.Helper()
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index := createInMemoryIndexForTesting(t)
+	index := createMemoryIndexForTesting(t, store, 100, 0)
 	require.NoError(t, index.Add(ctx, nil, []BlockHash{1}, []PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}))
 
 	found, err := index.Lookup(&cancelAfterFirstErrCheck{Context: ctx}, []BlockHash{1, 2}, nil)

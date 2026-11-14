@@ -31,9 +31,15 @@ import (
 // and leaves the index untouched: no key, no engine mapping, no ordinal for
 // the batch's new pod. Known tiers keep working.
 func TestAddRejectsTierCardinalityPastTheCap(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testAddRejectsTierCardinalityPastTheCap(t, store) })
+	}
+}
+
+func testAddRejectsTierCardinalityPastTheCap(t *testing.T, store string) {
+	t.Helper()
 	ctx := log.IntoContext(context.Background(), logr.Discard())
-	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1 << 16, PodCacheSize: 8})
-	require.NoError(t, err)
+	index := newMemoryIndexForTesting(t, store, 1<<16, 8)
 
 	for i := 0; i < maxInternedTiers; i++ {
 		entry := []PodEntry{{PodIdentifier: "pod-a", DeviceTier: fmt.Sprintf("tier-%d", i)}}
@@ -46,11 +52,12 @@ func TestAddRejectsTierCardinalityPastTheCap(t *testing.T) {
 		{PodIdentifier: "pod-new", DeviceTier: "one-too-many"},
 	}
 	const engineKey, requestKey = BlockHash(1 << 40), BlockHash(1<<40 + 1)
-	err = index.Add(ctx, []BlockHash{engineKey}, []BlockHash{requestKey}, overflow)
+	err := index.Add(ctx, []BlockHash{engineKey}, []BlockHash{requestKey}, overflow)
 	require.ErrorIs(t, err, errIndexCardinality)
 	_, found := index.data.Peek(requestKey)
 	assert.False(t, found, "a rejected Add must not create the key")
-	assert.False(t, index.engineToRequestKeys.Contains(engineKey), "a rejected Add must not map the engine key")
+	_, found = index.engineToRequestKeys.Peek(engineKey)
+	assert.False(t, found, "a rejected Add must not map the engine key")
 	assert.Equal(t, podsBefore, len(index.pods.ids), "a rejected Add must not consume a pod ordinal")
 	assert.Equal(t, tiersBefore, len(index.tiers.ids), "a rejected Add must not consume a tier ordinal")
 
