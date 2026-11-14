@@ -59,3 +59,14 @@ still references it.
 
 - [KV-Cache Indexer](../README.md) -- reads this index to score pods
 - [KV-Events](../../kvevents/README.md) -- writes to this index from engine events
+
+## Otter backend
+
+Set `kvBlockIndexConfig.otterConfig` with `size` and `podCacheSize` to select
+the standalone Otter index. It uses concurrent caches for both block locations
+and engine-key translations. Capacity maintenance can temporarily exceed `size`.
+The default in-memory backend remains LRU-based. Both implementations retain
+per-key pod-entry locks; Otter also orders Add against deletion of empty keys.
+
+Otter preserves multi-DP location identity and supports `ClearRank`, so a worker
+reset keeps entries belonging to sibling ranks.

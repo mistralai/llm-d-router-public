@@ -32,6 +32,8 @@ import (
 type IndexConfig struct {
 	// InMemoryConfig holds the configuration for the in-memory index.
 	InMemoryConfig *InMemoryIndexConfig `json:"inMemoryConfig"`
+	// OtterConfig selects concurrent location and translation caches.
+	OtterConfig *OtterIndexConfig `json:"otterConfig,omitempty"`
 	// RedisConfig holds the configuration for the Redis index.
 	RedisConfig *RedisIndexConfig `json:"redisConfig"`
 	// CostAwareMemoryConfig holds the configuration for the cost-aware memory index.
@@ -74,6 +76,11 @@ func NewIndex(ctx context.Context, cfg *IndexConfig) (Index, error) {
 		idx, err = NewRedisIndex(cfg.RedisConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Redis index: %w", err)
+		}
+	case cfg.OtterConfig != nil:
+		idx, err = NewOtterIndex(cfg.OtterConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Otter index: %w", err)
 		}
 	case cfg.InMemoryConfig != nil:
 		idx, err = NewInMemoryIndex(cfg.InMemoryConfig)

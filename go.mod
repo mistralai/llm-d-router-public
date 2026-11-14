@@ -24,6 +24,7 @@ require (
 	github.com/jellydator/ttlcache/v3 v3.4.1
 	github.com/llm-d/llm-d-async/api v0.9.1
 	github.com/llm-d/llm-d-async/producer v0.9.1
+	github.com/maypok86/otter/v2 v2.4.0
 	github.com/onsi/ginkgo/v2 v2.31.0
 	github.com/onsi/gomega v1.42.1
 	github.com/openai/openai-go v1.12.0
