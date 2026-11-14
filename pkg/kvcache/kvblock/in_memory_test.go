@@ -186,9 +186,15 @@ func TestInMemoryIndexPodCacheSize(t *testing.T) {
 }
 
 func TestInMemoryIndexDefaultPodCacheSize(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testInMemoryIndexDefaultPodCacheSize(t, store) })
+	}
+}
+
+func testInMemoryIndexDefaultPodCacheSize(t *testing.T, store string) {
+	t.Helper()
 	ctx := t.Context()
-	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1})
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, 1, 0)
 	capacity := DefaultInMemoryIndexConfig().PodCacheSize
 	entries := make([]PodEntry, capacity+1)
 	for i := range entries {
@@ -203,10 +209,16 @@ func TestInMemoryIndexDefaultPodCacheSize(t *testing.T) {
 }
 
 func TestInMemoryIndexClearIgnoresCancellation(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testInMemoryIndexClearIgnoresCancellation(t, store) })
+	}
+}
+
+func testInMemoryIndexClearIgnoresCancellation(t *testing.T, store string) {
+	t.Helper()
 	ctx := t.Context()
 	const numKeys = 600
-	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: numKeys, PodCacheSize: 3})
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, numKeys, 3)
 	keys := make([]BlockHash, numKeys)
 	for i := range keys {
 		keys[i] = BlockHash(i + 1)
@@ -268,8 +280,15 @@ func (c *cancelAfterFirstErrCheck) Err() error {
 // A lookup cancelled between a checkpoint and a missing key reports the
 // cancellation instead of the partial prefix read before the miss.
 func TestInMemoryIndexLookupCancelledBeforeMiss(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testInMemoryIndexLookupCancelledBeforeMiss(t, store) })
+	}
+}
+
+func testInMemoryIndexLookupCancelledBeforeMiss(t *testing.T, store string) {
+	t.Helper()
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index := createInMemoryIndexForTesting(t)
+	index := createMemoryIndexForTesting(t, store, 100, 0)
 	require.NoError(t, index.Add(ctx, nil, []BlockHash{1}, []PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}))
 
 	found, err := index.Lookup(&cancelAfterFirstErrCheck{Context: ctx}, []BlockHash{1, 2}, nil)

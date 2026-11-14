@@ -95,8 +95,8 @@ func TestOtterIndexEnforcesCapacityAfterMaintenance(t *testing.T) {
 		require.NoError(t, index.Add(t.Context(), []BlockHash{10000 + key}, []BlockHash{key + 1},
 			[]PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}))
 	}
-	locations := index.data.(*otterStore[*PodCache])
-	translations := index.engineToRequestKeys.(*otterStore[[]BlockHash])
+	locations := index.data
+	translations := index.engineToRequestKeys
 	locations.cache.CleanUp()
 	translations.cache.CleanUp()
 	require.LessOrEqual(t, locations.cache.EstimatedSize(), size)

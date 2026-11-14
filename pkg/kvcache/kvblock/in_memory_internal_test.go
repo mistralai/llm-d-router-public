@@ -29,16 +29,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newMemoryIndexForTesting(t *testing.T, store string, size, podCacheSize int) *InMemoryIndex {
+// memoryIndexForTesting exposes the state used to drive deterministic races
+// while each backend supplies its own Index and KeyWalker implementation.
+type memoryIndexForTesting struct {
+	Index
+	KeyWalker
+	mu   *sync.Mutex
+	data interface {
+		Get(BlockHash) (*PodCache, bool)
+		Peek(BlockHash) (*PodCache, bool)
+	}
+	engineToRequestKeys interface {
+		Peek(BlockHash) ([]BlockHash, bool)
+	}
+	pods, tiers   *interner
+	internRecords func([]PodEntry) ([]EntryRef, error)
+}
+
+func newMemoryIndexForTesting(t *testing.T, store string, size, podCacheSize int) *memoryIndexForTesting {
 	t.Helper()
 	if store == "otter" {
 		index, err := NewOtterIndex(&OtterIndexConfig{Size: size, PodCacheSize: podCacheSize})
 		require.NoError(t, err)
-		return index.InMemoryIndex
+		return &memoryIndexForTesting{
+			Index: index, KeyWalker: index, mu: &index.mu, data: index.data,
+			engineToRequestKeys: index.engineToRequestKeys,
+			pods:                index.pods, tiers: index.tiers, internRecords: index.internRecords,
+		}
 	}
 	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: size, PodCacheSize: podCacheSize})
 	require.NoError(t, err)
-	return index
+	return &memoryIndexForTesting{
+		Index: index, KeyWalker: index, mu: &index.mu, data: index.data,
+		engineToRequestKeys: index.engineToRequestKeys,
+		pods:                index.pods, tiers: index.tiers, internRecords: index.internRecords,
+	}
 }
 
 // TestInMemoryIndexEvictKeepsEntryAddedConcurrently drives, for each public
@@ -64,23 +89,23 @@ func testInMemoryIndexEvictKeepsEntryAddedConcurrently(t *testing.T, store strin
 
 	tests := []struct {
 		name  string
-		evict func(context.Context, *InMemoryIndex) error
+		evict func(context.Context, Index) error
 	}{
 		{
 			name: "Evict by request key",
-			evict: func(ctx context.Context, idx *InMemoryIndex) error {
+			evict: func(ctx context.Context, idx Index) error {
 				return idx.Evict(ctx, RequestKey, []BlockHash{requestKey}, []PodEntry{podA})
 			},
 		},
 		{
 			name: "Evict by engine key",
-			evict: func(ctx context.Context, idx *InMemoryIndex) error {
+			evict: func(ctx context.Context, idx Index) error {
 				return idx.Evict(ctx, EngineKey, []BlockHash{engineKey}, []PodEntry{podA})
 			},
 		},
 		{
 			name: "Clear",
-			evict: func(ctx context.Context, idx *InMemoryIndex) error {
+			evict: func(ctx context.Context, idx Index) error {
 				return idx.Clear(ctx, podA.PodIdentifier)
 			},
 		},

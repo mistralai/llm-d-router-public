@@ -78,14 +78,21 @@ func (s *lruStore) Promote(keys []BlockHash) {
 	}
 }
 
-func (s *lruStore) LoadOrStore(key BlockHash, value *PodCache) (actual *PodCache, loaded bool) {
+func (s *lruStore) Add(key BlockHash, value *PodCache) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if actual, loaded = s.lru.Get(key); loaded {
-		return actual, true
-	}
 	s.lru.Add(key, value)
-	return value, false
+}
+
+// ContainsOrAdd reports whether key is present and, when it is not, adds
+// value.
+func (s *lruStore) ContainsOrAdd(key BlockHash, value *PodCache) (contains, evicted bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lru.Contains(key) {
+		return true, false
+	}
+	return false, s.lru.Add(key, value)
 }
 
 func (s *lruStore) Remove(key BlockHash) bool {

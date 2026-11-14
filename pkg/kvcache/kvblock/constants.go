@@ -18,3 +18,6 @@ package kvblock
 
 // TracerScope is the OpenTelemetry instrumentation scope name for the kvblock package.
 const TracerScope = "llm-d-router/pkg/kvcache/kvblock"
+
+// clearChunkSize bounds the number of empty keys removed under one Add/Evict lock hold.
+const clearChunkSize = 1024

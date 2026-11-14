@@ -35,7 +35,7 @@ import (
 
 const (
 	// defaultInMemoryIndexSize caps the index by entry count, not memory: the
-	// stores evict on count and have no notion of byte cost. To size
+	// underlying LRU evicts on count and has no notion of byte cost. To size
 	// Size against available memory, estimate per-entry cost as roughly
 	// PodCacheSize pod entries times the PodIdentifier and DeviceTier string
 	// lengths, plus map/LRU bookkeeping overhead, and divide the memory budget
@@ -48,8 +48,8 @@ const (
 
 // InMemoryIndexConfig holds the configuration for the InMemoryIndex.
 type InMemoryIndexConfig struct {
-	// Size is the capacity target for each key store. It bounds entry count,
-	// not memory; see defaultInMemoryIndexSize for sizing
+	// Size is the maximum number of keys that can be stored in the index. It
+	// bounds entry count, not memory; see defaultInMemoryIndexSize for sizing
 	// it against available memory.
 	Size int `json:"size"`
 	// PodCacheSize is the maximum number of pod entries per key.
@@ -70,6 +70,11 @@ func NewInMemoryIndex(cfg *InMemoryIndexConfig) (*InMemoryIndex, error) {
 	if cfg == nil {
 		cfg = DefaultInMemoryIndexConfig()
 	}
+	podCacheSize := cfg.PodCacheSize
+	if podCacheSize <= 0 {
+		podCacheSize = defaultPodsPerKey
+	}
+
 	cache, err := newLRUStore(cfg.Size)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize in-memory index: %w", err)
@@ -80,20 +85,13 @@ func NewInMemoryIndex(cfg *InMemoryIndexConfig) (*InMemoryIndex, error) {
 		return nil, fmt.Errorf("failed to initialize in-memory engine key map: %w", err)
 	}
 
-	return newInMemoryIndex(cache, &lruEngineKeys{Cache: engineToRequestKeys}, cfg.PodCacheSize), nil
-}
-
-func newInMemoryIndex(cache locationStore, engineKeys engineKeyStore, podCacheSize int) *InMemoryIndex {
-	if podCacheSize <= 0 {
-		podCacheSize = defaultPodsPerKey
-	}
 	return &InMemoryIndex{
 		data:                cache,
-		engineToRequestKeys: engineKeys,
+		engineToRequestKeys: engineToRequestKeys,
 		podCacheSize:        podCacheSize,
 		pods:                newInterner(maxInternedPods),
 		tiers:               newInterner(maxInternedTiers),
-	}
+	}, nil
 }
 
 // cancellationCheckMask paces context-cancellation checks in loops over
@@ -118,9 +116,9 @@ type InMemoryIndex struct {
 	// take it.
 	mu sync.Mutex
 	// data holds the mapping of requestKeys to sets of pod identifiers.
-	data locationStore
+	data *lruStore
 	// engineToRequestKeys holds the mapping of engineKeys to requestKeys.
-	engineToRequestKeys engineKeyStore
+	engineToRequestKeys *lru.Cache[BlockHash, []BlockHash]
 	// podCacheSize is the maximum number of pod entries per key.
 	podCacheSize int
 	// pods and tiers assign the ordinals EntryRef carries. Neither is
@@ -370,7 +368,7 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 	if engineKeys != nil {
 		mappings := engineToRequestMapping(engineKeys, requestKeys)
 		for ek, rks := range mappings {
-			m.engineToRequestKeys.Put(ek, rks)
+			m.engineToRequestKeys.Add(ek, rks)
 		}
 	}
 
@@ -381,15 +379,23 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 		if !found {
 			newPodCache := &PodCache{capacity: m.podCacheSize}
 
-			// Publish a populated cache so a concurrent lookup cannot see an
-			// empty generation between insertion and the first entry write.
-			newPodCache.addAll(records)
-			podCache, found = m.data.LoadOrStore(requestKey, newPodCache)
+			// Try to add, but use existing if another thread added it first
+			// This is a bounded retry (1) - not perfectly safe but for practical use-cases and scenarios
+			// this should be sufficient
+			contains, _ := m.data.ContainsOrAdd(requestKey, newPodCache)
+			if contains {
+				podCache, found = m.data.Get(requestKey)
+				if !found { // Extremely irregular workload pattern - key evicted
+					m.data.Add(requestKey, newPodCache)
+					podCache = newPodCache
+				}
+			} else {
+				// We successfully added our cache
+				podCache = newPodCache
+			}
 		}
 
-		if found {
-			podCache.addAll(records)
-		}
+		podCache.addAll(records)
 
 		if traceLogger.Enabled() {
 			traceLogger.Info("added pods to key", "requestKey", requestKey, "pods", entries)
@@ -510,7 +516,7 @@ func (m *InMemoryIndex) removeIfEmptyLocked(requestKey BlockHash) bool {
 // Context cancellation does not interrupt Clear.
 //
 // The engineKey->requestKey mapping (engineToRequestKeys) is intentionally left
-// untouched: it is capacity-bounded, self-heals when the pod re-Adds the same prefixes,
+// untouched: it is LRU-bounded, self-heals when the pod re-Adds the same prefixes,
 // and any stale mapping resolves to an emptied request key that correctly breaks
 // the prefix chain in Lookup.
 func (m *InMemoryIndex) Clear(ctx context.Context, podIdentifier string) error {
@@ -538,7 +544,6 @@ func (m *InMemoryIndex) Clear(ctx context.Context, podIdentifier string) error {
 	}
 
 	// One m.mu hold per chunk bounds how long Clear blocks Add.
-	const clearChunkSize = 1024
 	for chunk := range slices.Chunk(emptied, clearChunkSize) {
 		m.mu.Lock()
 		for _, requestKey := range chunk {

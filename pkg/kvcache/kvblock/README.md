@@ -25,14 +25,14 @@ subscriber writes.
 
 ## Backends
 
-`NewIndex` selects a backend from `IndexConfig` (first configured wins):
+`NewIndex` selects the first configured backend in this order:
 
 | Backend | Constructor | Use |
 |---------|-------------|-----|
-| In-memory | `NewInMemoryIndex` | Single-replica local index bounded by key count. |
-| Otter | `NewOtterIndex` | Local index with concurrent location and translation caches. |
 | Cost-aware memory | `NewCostAwareMemoryIndex` | Local index with cost-aware eviction. |
 | Redis | `NewRedisIndex` | Shared index across EPP replicas (Redis-protocol server). |
+| Otter | `NewOtterIndex` | Local index with concurrent location and translation caches. |
+| In-memory | `NewInMemoryIndex` | Default local index bounded by key count. |
 
 Two decorators wrap any backend: `NewTracedIndex` adds OpenTelemetry spans
 (no-op when tracing is off) and `NewInstrumentedIndex` records the
@@ -56,11 +56,11 @@ Capacity maintenance can temporarily exceed `size`, which limits
 key count in each cache rather than bytes. Read-ahead lookups and eviction scans
 do not record accesses; `Lookup` and `WalkKeys` record their visited prefixes.
 
-`OtterIndex` embeds the in-memory implementation, sharing its lookup, translation,
-and eviction logic. Both indexes retain per-key pod-entry locks and the index's
-Add/Evict ordering lock. Parent translations must remain available for later
-KV events to extend a prefix, so eviction policy affects event processing as well
-as routing cache hits.
+`OtterIndex` owns its lookup, traversal, translation, and eviction methods.
+It shares the pod-entry representation and ordinal interner with `InMemoryIndex`.
+Both indexes retain per-key pod-entry locks and an Add/Evict ordering lock.
+Parent translations must remain available for later KV events to extend a prefix,
+so eviction policy affects event processing as well as routing cache hits.
 
 ## Grouped (HMA) Entries
 

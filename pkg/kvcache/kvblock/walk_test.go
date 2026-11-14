@@ -56,9 +56,15 @@ func podEntries(refs []EntryRef) []PodEntry {
 }
 
 func TestWalkKeysVisitsEveryPositionInOrder(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testWalkKeysVisitsEveryPositionInOrder(t, store) })
+	}
+}
+
+func testWalkKeysVisitsEveryPositionInOrder(t *testing.T, store string) {
+	t.Helper()
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index, err := NewInMemoryIndex(nil)
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, 1<<20, 0)
 	podA := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	podB := PodEntry{PodIdentifier: "pod-b", DeviceTier: "cpu"}
 	require.NoError(t, index.Add(ctx, nil, []BlockHash{10}, []PodEntry{podA}))
@@ -112,9 +118,15 @@ func testWalkKeysVisitsEveryPositionAcrossBatches(t *testing.T, store string) {
 
 // A key listed twice is visited at both positions.
 func TestWalkKeysVisitsDuplicatePositions(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testWalkKeysVisitsDuplicatePositions(t, store) })
+	}
+}
+
+func testWalkKeysVisitsDuplicatePositions(t *testing.T, store string) {
+	t.Helper()
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index, err := NewInMemoryIndex(nil)
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, 1<<20, 0)
 	podA := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	require.NoError(t, index.Add(ctx, nil, []BlockHash{10}, []PodEntry{podA}))
 
@@ -129,14 +141,20 @@ func TestWalkKeysVisitsDuplicatePositions(t *testing.T) {
 }
 
 func TestWalkKeysStopsWhenVisitReturnsFalse(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testWalkKeysStopsWhenVisitReturnsFalse(t, store) })
+	}
+}
+
+func testWalkKeysStopsWhenVisitReturnsFalse(t *testing.T, store string) {
+	t.Helper()
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index, err := NewInMemoryIndex(nil)
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, 1<<20, 0)
 	keys := []BlockHash{1, 2, 3, 4, 5}
 	require.NoError(t, index.Add(ctx, nil, keys, []PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}))
 
 	visited := 0
-	err = index.WalkKeys(ctx, keys, func(pos int, _ bool, _ []EntryRef) bool {
+	err := index.WalkKeys(ctx, keys, func(pos int, _ bool, _ []EntryRef) bool {
 		visited++
 		return pos < 2
 	})
@@ -145,9 +163,15 @@ func TestWalkKeysStopsWhenVisitReturnsFalse(t *testing.T) {
 }
 
 func TestWalkKeysCancellation(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testWalkKeysCancellation(t, store) })
+	}
+}
+
+func testWalkKeysCancellation(t *testing.T, store string) {
+	t.Helper()
 	baseCtx := logging.NewTestLoggerIntoContext(t.Context())
-	index, err := NewInMemoryIndex(nil)
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, 1<<20, 0)
 	keys := make([]BlockHash, 1000)
 	for i := range keys {
 		keys[i] = BlockHash(i + 1)
@@ -303,9 +327,15 @@ func TestLookupRefreshesIndexLRU(t *testing.T) {
 
 // Ordinals identify pods and tiers consistently across keys and entry order.
 func TestWalkKeysOrdinalsAreStable(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testWalkKeysOrdinalsAreStable(t, store) })
+	}
+}
+
+func testWalkKeysOrdinalsAreStable(t *testing.T, store string) {
+	t.Helper()
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index, err := NewInMemoryIndex(nil)
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, 1<<20, 0)
 	gpuA := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	cpuB := PodEntry{PodIdentifier: "pod-b", DeviceTier: "cpu"}
 	specA := PodEntry{PodIdentifier: "pod-a", Speculative: true}
@@ -345,9 +375,15 @@ func TestWalkKeysOrdinalsAreStable(t *testing.T) {
 type nonWalkerIndex struct{ Index }
 
 func TestWalkCapabilityThroughDecorators(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testWalkCapabilityThroughDecorators(t, store) })
+	}
+}
+
+func testWalkCapabilityThroughDecorators(t *testing.T, store string) {
+	t.Helper()
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index, err := NewInMemoryIndex(nil)
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, 1<<20, 0)
 	keys := []BlockHash{1, 2, 3}
 	require.NoError(t, index.Add(ctx, nil, []BlockHash{1, 3}, []PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}))
 	direct := walkAll(t, index, keys)
@@ -377,9 +413,15 @@ func TestWalkCapabilityThroughDecorators(t *testing.T) {
 // Concurrent walks and writes on one index must each see complete per-key
 // entries.
 func TestWalkKeysConcurrentReadersAndWriters(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testWalkKeysConcurrentReadersAndWriters(t, store) })
+	}
+}
+
+func testWalkKeysConcurrentReadersAndWriters(t *testing.T, store string) {
+	t.Helper()
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1 << 12, PodCacheSize: 16})
-	require.NoError(t, err)
+	index := createMemoryIndexForTesting(t, store, 1<<12, 16)
 
 	const numKeys, numPods = 200, 4
 	keys := make([]BlockHash, numKeys)
