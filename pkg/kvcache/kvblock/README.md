@@ -29,13 +29,36 @@ subscriber writes.
 
 | Backend | Constructor | Use |
 |---------|-------------|-----|
-| In-memory | `NewInMemoryIndex` | Single-replica, LRU-bounded local index. |
+| In-memory | `NewInMemoryIndex` | Single-replica local index bounded by key count. |
 | Cost-aware memory | `NewCostAwareMemoryIndex` | Local index with cost-aware eviction. |
 | Redis | `NewRedisIndex` | Shared index across EPP replicas (Redis-protocol server). |
 
 Two decorators wrap any backend: `NewTracedIndex` adds OpenTelemetry spans
 (no-op when tracing is off) and `NewInstrumentedIndex` records the
 [metrics](../metrics/README.md).
+
+### In-memory location store
+
+`inMemoryConfig.locationStore` selects the request-key-to-pod store:
+
+```yaml
+inMemoryConfig:
+  size: 1000000
+  podCacheSize: 128
+  locationStore: otter
+```
+
+The default, `lru`, updates exact LRU recency under a shared store mutex.
+`otter` uses a concurrent cache with buffered access history and an approximate
+recency/frequency eviction policy. Inserts and explicit removals are visible
+synchronously. Capacity maintenance can temporarily exceed `size`, which limits
+key count rather than bytes. Read-ahead lookups and eviction scans do not record
+accesses; `Lookup` and `WalkKeys` record their visited prefixes.
+
+Both stores retain per-key pod-entry locks and the index's Add/Evict ordering
+lock. The engine-key-to-request-key translation cache remains an LRU. Selecting
+Otter changes location-store contention and eviction behavior; it does not remove
+those other synchronization costs.
 
 ## Grouped (HMA) Entries
 

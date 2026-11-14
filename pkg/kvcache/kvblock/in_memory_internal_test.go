@@ -34,6 +34,15 @@ import (
 // and the eviction empties that cache before Add writes to it. The test holds
 // m.mu as Add does, so the eviction must not remove the key until the write lands.
 func TestInMemoryIndexEvictKeepsEntryAddedConcurrently(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) {
+			testInMemoryIndexEvictKeepsEntryAddedConcurrently(t, store)
+		})
+	}
+}
+
+func testInMemoryIndexEvictKeepsEntryAddedConcurrently(t *testing.T, store string) {
+	t.Helper()
 	const (
 		engineKey  BlockHash = 101
 		requestKey BlockHash = 1
@@ -68,7 +77,7 @@ func TestInMemoryIndexEvictKeepsEntryAddedConcurrently(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
-			idx, err := NewInMemoryIndex(nil)
+			idx, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 100, LocationStore: store})
 			require.NoError(t, err)
 			require.NoError(t, idx.Add(ctx, []BlockHash{engineKey}, []BlockHash{requestKey}, []PodEntry{podA}))
 

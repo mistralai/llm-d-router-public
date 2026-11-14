@@ -24,8 +24,15 @@ import (
 )
 
 func TestWalkKeysUnlocksAfterPanic(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testWalkKeysUnlocksAfterPanic(t, store) })
+	}
+}
+
+func testWalkKeysUnlocksAfterPanic(t *testing.T, store string) {
+	t.Helper()
 	ctx := t.Context()
-	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1, PodCacheSize: 2})
+	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 1, PodCacheSize: 2, LocationStore: store})
 	require.NoError(t, err)
 	keys := []BlockHash{1}
 	first := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}

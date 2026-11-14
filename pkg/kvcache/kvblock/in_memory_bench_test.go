@@ -19,8 +19,12 @@ package kvblock_test
 import (
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
@@ -30,9 +34,15 @@ import (
 // by numPods pods on the gpu tier. Returns the index and the ordered keys.
 func populateIndex(b *testing.B, numKeys, numPods int) (*kvblock.InMemoryIndex, []kvblock.BlockHash) {
 	b.Helper()
+	return populateIndexWithStore(b, numKeys, numPods, "")
+}
+
+func populateIndexWithStore(b *testing.B, numKeys, numPods int, store string) (*kvblock.InMemoryIndex, []kvblock.BlockHash) {
+	b.Helper()
 	idx, err := kvblock.NewInMemoryIndex(&kvblock.InMemoryIndexConfig{
-		Size:         1 << 20,
-		PodCacheSize: 128,
+		Size:          1 << 20,
+		PodCacheSize:  128,
+		LocationStore: store,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -48,10 +58,101 @@ func populateIndex(b *testing.B, numKeys, numPods int) (*kvblock.InMemoryIndex, 
 			DeviceTier:    "gpu",
 		}
 	}
-	if err := idx.Add(context.Background(), nil, keys, entries); err != nil {
+	if err := idx.Add(logr.NewContext(context.Background(), logr.Discard()), nil, keys, entries); err != nil {
 		b.Fatal(err)
 	}
 	return idx, keys
+}
+
+// BenchmarkInMemoryIndexLocationStore compares concurrent full-prefix reads
+// with optional 64-block event writers. Writers cycle over disjoint keys and
+// evict after each Add, keeping every read at the same hit depth for both stores.
+func BenchmarkInMemoryIndexLocationStore(b *testing.B) {
+	for _, store := range []string{"lru", "otter"} {
+		for _, readers := range []string{"walk", "lookup"} {
+			for _, writers := range []int{0, 4} {
+				b.Run(fmt.Sprintf("%s/%s/writers=%d", store, readers, writers), func(b *testing.B) {
+					benchmarkLocationStore(b, store, readers, writers)
+				})
+			}
+		}
+	}
+}
+
+func benchmarkLocationStore(b *testing.B, store, readers string, writers int) {
+	b.Helper()
+	const numKeys, numPods = 3750, 16
+	idx, keys := populateIndexWithStore(b, numKeys, numPods, store)
+	ctx := logr.NewContext(context.Background(), logr.Discard())
+	start, stop := make(chan struct{}), make(chan struct{})
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	var updates atomic.Uint64
+	for w := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			entries := []kvblock.PodEntry{{PodIdentifier: fmt.Sprintf("writer-%d", w), DeviceTier: "gpu"}}
+			eventKeys := make([]kvblock.BlockHash, 64)
+			<-start
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				base := numKeys + 1 + w*4096 + (i%64)*64
+				for j := range eventKeys {
+					eventKeys[j] = kvblock.BlockHash(base + j)
+				}
+				if err := idx.Add(ctx, eventKeys, eventKeys, entries); err != nil {
+					errs <- err
+					return
+				}
+				if err := idx.Evict(ctx, kvblock.EngineKey, eventKeys, entries); err != nil {
+					errs <- err
+					return
+				}
+				updates.Add(1)
+			}
+		}()
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	began := time.Now()
+	close(start)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if readers == "lookup" {
+				got, err := idx.Lookup(ctx, keys, nil)
+				if err != nil || len(got) != numKeys {
+					b.Errorf("lookup returned %d keys: %v", len(got), err)
+					return
+				}
+				continue
+			}
+			seen := 0
+			err := idx.WalkKeys(ctx, keys, func(_ int, _ bool, entries []kvblock.EntryRef) bool {
+				seen += len(entries)
+				return true
+			})
+			if err != nil || seen != numKeys*numPods {
+				b.Errorf("walk visited %d entries: %v", seen, err)
+				return
+			}
+		}
+	})
+	elapsed := time.Since(began)
+	b.StopTimer()
+	close(stop)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		b.Fatal(err)
+	}
+	if writers > 0 {
+		b.ReportMetric(float64(updates.Load())/elapsed.Seconds(), "add-evict/s")
+	}
 }
 
 // BenchmarkInMemoryIndexLookup measures a full-hit lookup of the block keys a

@@ -35,7 +35,7 @@ import (
 
 const (
 	// defaultInMemoryIndexSize caps the index by entry count, not memory: the
-	// underlying LRU evicts on count and has no notion of byte cost. To size
+	// stores evict on count and have no notion of byte cost. To size
 	// Size against available memory, estimate per-entry cost as roughly
 	// PodCacheSize pod entries times the PodIdentifier and DeviceTier string
 	// lengths, plus map/LRU bookkeeping overhead, and divide the memory budget
@@ -48,13 +48,16 @@ const (
 
 // InMemoryIndexConfig holds the configuration for the InMemoryIndex.
 type InMemoryIndexConfig struct {
-	// Size is the maximum number of keys that can be stored in the index. It
-	// bounds entry count, not memory; see defaultInMemoryIndexSize for sizing
+	// Size is the capacity target for each key store. It bounds entry count,
+	// not memory; see defaultInMemoryIndexSize for sizing
 	// it against available memory.
 	Size int `json:"size"`
 	// PodCacheSize is the maximum number of pod entries per key.
 	// A non-positive value selects defaultPodsPerKey.
 	PodCacheSize int `json:"podCacheSize"`
+	// LocationStore selects "lru" (the default) or "otter" for request-key
+	// locations. Otter may temporarily exceed Size during eviction maintenance.
+	LocationStore string `json:"locationStore,omitempty"`
 }
 
 // DefaultInMemoryIndexConfig returns a default configuration for the InMemoryIndex.
@@ -75,7 +78,7 @@ func NewInMemoryIndex(cfg *InMemoryIndexConfig) (*InMemoryIndex, error) {
 		podCacheSize = defaultPodsPerKey
 	}
 
-	cache, err := newLRUStore(cfg.Size)
+	cache, err := newLocationStore(cfg.LocationStore, cfg.Size)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize in-memory index: %w", err)
 	}
@@ -116,7 +119,7 @@ type InMemoryIndex struct {
 	// take it.
 	mu sync.Mutex
 	// data holds the mapping of requestKeys to sets of pod identifiers.
-	data *lruStore
+	data locationStore
 	// engineToRequestKeys holds the mapping of engineKeys to requestKeys.
 	engineToRequestKeys *lru.Cache[BlockHash, []BlockHash]
 	// podCacheSize is the maximum number of pod entries per key.
@@ -379,23 +382,15 @@ func (m *InMemoryIndex) Add(ctx context.Context, engineKeys, requestKeys []Block
 		if !found {
 			newPodCache := &PodCache{capacity: m.podCacheSize}
 
-			// Try to add, but use existing if another thread added it first
-			// This is a bounded retry (1) - not perfectly safe but for practical use-cases and scenarios
-			// this should be sufficient
-			contains, _ := m.data.ContainsOrAdd(requestKey, newPodCache)
-			if contains {
-				podCache, found = m.data.Get(requestKey)
-				if !found { // Extremely irregular workload pattern - key evicted
-					m.data.Add(requestKey, newPodCache)
-					podCache = newPodCache
-				}
-			} else {
-				// We successfully added our cache
-				podCache = newPodCache
-			}
+			// Publish a populated cache so a concurrent lookup cannot see an
+			// empty generation between insertion and the first entry write.
+			newPodCache.addAll(records)
+			podCache, found = m.data.LoadOrStore(requestKey, newPodCache)
 		}
 
-		podCache.addAll(records)
+		if found {
+			podCache.addAll(records)
+		}
 
 		if traceLogger.Enabled() {
 			traceLogger.Info("added pods to key", "requestKey", requestKey, "pods", entries)

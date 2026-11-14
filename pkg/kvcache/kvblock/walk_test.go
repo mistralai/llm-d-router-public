@@ -81,8 +81,15 @@ func TestWalkKeysVisitsEveryPositionInOrder(t *testing.T) {
 // A walk longer than one peek batch visits every position once, in order,
 // with each position's own hit or miss.
 func TestWalkKeysVisitsEveryPositionAcrossBatches(t *testing.T) {
+	for _, store := range []string{"lru", "otter"} {
+		t.Run(store, func(t *testing.T) { testWalkKeysVisitsEveryPositionAcrossBatches(t, store) })
+	}
+}
+
+func testWalkKeysVisitsEveryPositionAcrossBatches(t *testing.T, store string) {
+	t.Helper()
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
-	index, err := NewInMemoryIndex(nil)
+	index, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 2000, LocationStore: store})
 	require.NoError(t, err)
 	pod := PodEntry{PodIdentifier: "pod-a", DeviceTier: "gpu"}
 	keys := make([]BlockHash, 1000)

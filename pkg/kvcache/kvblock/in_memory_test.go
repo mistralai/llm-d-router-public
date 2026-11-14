@@ -45,6 +45,35 @@ func TestInMemoryIndexBehavior(t *testing.T) {
 	testCommonIndexBehavior(t, createInMemoryIndexForTesting)
 }
 
+func TestOtterIndexBehavior(t *testing.T) {
+	testCommonIndexBehavior(t, func(t *testing.T) Index {
+		t.Helper()
+		index, err := NewInMemoryIndex(&InMemoryIndexConfig{
+			Size:          1 << 20,
+			PodCacheSize:  500,
+			LocationStore: "otter",
+		})
+		require.NoError(t, err)
+		return index
+	})
+}
+
+func TestInMemoryIndexRejectsUnknownLocationStore(t *testing.T) {
+	_, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: 100, LocationStore: "unknown"})
+	require.ErrorContains(t, err, "unknown location store")
+}
+
+func TestInMemoryIndexRejectsNonPositiveSize(t *testing.T) {
+	for _, store := range []string{"", "lru", "otter"} {
+		for _, size := range []int{0, -1} {
+			t.Run(fmt.Sprintf("store=%s/size=%d", store, size), func(t *testing.T) {
+				_, err := NewInMemoryIndex(&InMemoryIndexConfig{Size: size, LocationStore: store})
+				require.ErrorContains(t, err, "size must be positive")
+			})
+		}
+	}
+}
+
 func TestInMemoryIndexSize(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(t.Context())
 
