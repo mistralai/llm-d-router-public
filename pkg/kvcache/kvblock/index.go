@@ -146,6 +146,7 @@ type Index interface {
 	// or partially evicted; each implementation documents its own failure semantics.
 	Evict(ctx context.Context, keyType KeyType, keys []BlockHash, entries []PodEntry) error
 	// GetRequestKey returns the requestKey associated with the given engineKey.
+	// A translation may outlive its locations; it does not establish a cache hit.
 	GetRequestKey(ctx context.Context, engineKey BlockHash) (BlockHash, error)
 	// Clear removes all index entries for the given pod, across every device tier.
 	// It backs the AllBlocksCleared KV-event (a vLLM prefix-cache reset, e.g. after

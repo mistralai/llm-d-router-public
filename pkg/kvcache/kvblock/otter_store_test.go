@@ -23,6 +23,39 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestOtterIndexRetainsTranslationWithoutRetainingLocations(t *testing.T) {
+	index, err := NewOtterIndex(&OtterIndexConfig{Size: 100})
+	require.NoError(t, err)
+	ctx := t.Context()
+	engineKeys := []BlockHash{101}
+	requestKeys := []BlockHash{1, 2}
+	gpu := []PodEntry{{PodIdentifier: "pod-a", DeviceTier: "gpu"}}
+	cpu := []PodEntry{{PodIdentifier: "pod-a", DeviceTier: "cpu"}}
+	require.NoError(t, index.Add(ctx, engineKeys, requestKeys, gpu))
+	require.NoError(t, index.Evict(ctx, EngineKey, engineKeys, gpu))
+
+	key, err := index.GetRequestKey(ctx, engineKeys[0])
+	require.NoError(t, err)
+	require.Equal(t, requestKeys[1], key)
+	hits, err := index.Lookup(ctx, requestKeys, nil)
+	require.NoError(t, err)
+	require.Empty(t, hits)
+
+	// A location-only update must remain removable by its engine hash.
+	require.NoError(t, index.Add(ctx, nil, requestKeys, cpu))
+	require.NoError(t, index.Evict(ctx, EngineKey, engineKeys, cpu))
+	hits, err = index.Lookup(ctx, requestKeys, nil)
+	require.NoError(t, err)
+	require.Empty(t, hits)
+
+	require.NoError(t, index.Add(ctx, engineKeys, requestKeys, gpu))
+	hits, err = index.Lookup(ctx, requestKeys, nil)
+	require.NoError(t, err)
+	for _, key := range requestKeys {
+		require.Equal(t, gpu, hits[key])
+	}
+}
+
 // Delayed policy work must not delay membership changes or resurrect removed values.
 func TestOtterStoreMembershipBeforeMaintenance(t *testing.T) {
 	var pending []func()
