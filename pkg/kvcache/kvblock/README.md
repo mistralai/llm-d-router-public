@@ -65,8 +65,12 @@ still references it.
 Set `kvBlockIndexConfig.otterConfig` with `size` and `podCacheSize` to select
 the standalone Otter index. It uses concurrent caches for both block locations
 and engine-key translations. Capacity maintenance can temporarily exceed `size`.
-The default in-memory backend remains LRU-based. Both implementations retain
-per-key pod-entry locks; Otter also orders Add against deletion of empty keys.
+The default in-memory backend remains LRU-based. Otter uses atomic per-key
+updates for additions, removals and pod clearing. Its pod-entry locks protect
+mutable locations from concurrent readers. Engine-key translations remain in
+their independently bounded cache after all locations are removed. A retained
+translation permits parent resolution and later location-only updates; it
+contributes no cache hit without a location.
 
 Otter preserves multi-DP location identity and supports `ClearRank`, so a worker
 reset keeps entries belonging to sibling ranks.
