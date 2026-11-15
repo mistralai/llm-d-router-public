@@ -943,7 +943,7 @@ func testEvictRequestKeys(t *testing.T, ctx context.Context, index Index) {
 }
 
 // testEvictEngineKeysOneToOne verifies a multi-key engine-key eviction under 1:1
-// mapping: every request key is emptied and every engine mapping is removed.
+// mapping: every request key is emptied.
 func testEvictEngineKeysOneToOne(t *testing.T, ctx context.Context, index Index) {
 	t.Helper()
 	engineKeys := []BlockHash{101, 102, 103}
@@ -958,14 +958,13 @@ func testEvictEngineKeysOneToOne(t *testing.T, ctx context.Context, index Index)
 		require.NoError(t, err)
 		assert.Empty(t, result[requestKeys[i]], "request key %d should be empty", requestKeys[i])
 
-		_, err = index.GetRequestKey(ctx, engineKeys[i])
-		assert.Error(t, err, "engine mapping for %d should be removed", engineKeys[i])
+		assertEvictedEngineMapping(t, ctx, index, engineKeys[i], requestKeys[i])
 	}
 }
 
 // testEvictEngineKeysManyToOne verifies a multi-key engine-key eviction under
-// many:1 mapping: evicted engine keys lose their mappings and the shared request
-// key is emptied, while mappings of non-evicted engine keys are untouched.
+// many:1 mapping: the shared request key is emptied, while mappings of
+// non-evicted engine keys are untouched.
 func testEvictEngineKeysManyToOne(t *testing.T, ctx context.Context, index Index) {
 	t.Helper()
 	// 4 engine keys, 1 request key -> each engine key maps to R0.
@@ -981,8 +980,7 @@ func testEvictEngineKeysManyToOne(t *testing.T, ctx context.Context, index Index
 	assert.Empty(t, result[requestKeys[0]], "R0 should be empty after batch eviction")
 
 	for _, ek := range engineKeys[:2] {
-		_, err := index.GetRequestKey(ctx, ek)
-		assert.Error(t, err, "evicted engine key %d should not resolve", ek)
+		assertEvictedEngineMapping(t, ctx, index, ek, requestKeys[0])
 	}
 	_, err = index.GetRequestKey(ctx, engineKeys[2])
 	assert.NoError(t, err, "non-evicted engine key mapping must be untouched")
@@ -1070,9 +1068,18 @@ func testEvictPreservesEngineMappingForOtherTiers(t *testing.T, ctx context.Cont
 	require.NoError(t, err)
 	assert.Empty(t, result[requestKey], "no entries should remain")
 
-	// Engine→request mapping should be gone.
-	_, err = index.GetRequestKey(ctx, engineKey)
-	assert.Error(t, err, "engine→request mapping should be removed after full eviction")
+	assertEvictedEngineMapping(t, ctx, index, engineKey, requestKey)
+}
+
+func assertEvictedEngineMapping(t *testing.T, ctx context.Context, index Index, engineKey, requestKey BlockHash) {
+	t.Helper()
+	key, err := index.GetRequestKey(ctx, engineKey)
+	if _, retainsTranslations := index.(*OtterIndex); retainsTranslations {
+		require.NoError(t, err)
+		assert.Equal(t, requestKey, key)
+		return
+	}
+	assert.Error(t, err, "engine mapping for %d should be removed", engineKey)
 }
 
 func testGroupedEntriesCoexist(t *testing.T, ctx context.Context, index Index) {

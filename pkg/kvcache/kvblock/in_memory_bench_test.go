@@ -72,6 +72,58 @@ func BenchmarkMemoryIndexConcurrentAccess(b *testing.B) {
 	}
 }
 
+// BenchmarkMemoryIndexConcurrentMutations mixes short event batches with long
+// speculative prefixes. Writers own distinct locations on overlapping keys.
+func BenchmarkMemoryIndexConcurrentMutations(b *testing.B) {
+	for _, store := range []string{"lru", "otter"} {
+		for _, speculative := range []bool{false, true} {
+			b.Run(fmt.Sprintf("%s/speculative=%t", store, speculative), func(b *testing.B) {
+				idx := createMemoryIndexForTesting(b, store, 1<<20, 128)
+				ctx := logr.NewContext(context.Background(), logr.Discard())
+				var workers, blocks atomic.Uint64
+				b.ReportAllocs()
+				b.ResetTimer()
+				b.RunParallel(func(pb *testing.PB) {
+					worker := workers.Add(1)
+					isSpeculative := speculative && worker%4 == 0
+					batchSize := 64
+					keyType := kvblock.EngineKey
+					if isSpeculative {
+						batchSize = 1024
+						keyType = kvblock.RequestKey
+					}
+					entries := []kvblock.PodEntry{{
+						PodIdentifier: fmt.Sprintf("writer-%d", worker),
+						DeviceTier:    "gpu", Speculative: isSpeculative,
+					}}
+					keys := make([]kvblock.BlockHash, batchSize)
+					var completed uint64
+					for pb.Next() {
+						for i := range keys {
+							keys[i] = kvblock.BlockHash(1 + (completed*64+uint64(i))%4096)
+						}
+						engineKeys := keys
+						if isSpeculative {
+							engineKeys = nil
+						}
+						if err := idx.Add(ctx, engineKeys, keys, entries); err != nil {
+							b.Error(err)
+							return
+						}
+						if err := idx.Evict(ctx, keyType, keys, entries); err != nil {
+							b.Error(err)
+							return
+						}
+						completed++
+					}
+					blocks.Add(completed * uint64(batchSize))
+				})
+				b.ReportMetric(float64(blocks.Load())/b.Elapsed().Seconds(), "blocks/s")
+			})
+		}
+	}
+}
+
 func benchmarkMemoryIndex(b *testing.B, store, readers string, writers int) {
 	b.Helper()
 	const numKeys, numPods = 3750, 16

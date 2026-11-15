@@ -19,10 +19,9 @@ package kvblock
 import (
 	"context"
 	"fmt"
-	"slices"
-	"sync"
 
 	"github.com/go-logr/logr"
+	"github.com/maypok86/otter/v2"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -48,11 +47,8 @@ func DefaultOtterIndexConfig() *OtterIndexConfig {
 
 // OtterIndex uses Otter for both location and engine-key translation storage.
 type OtterIndex struct {
-	// mu orders Add's mapping and pod writes against removal of empty keys.
-	// Lookups and walks do not acquire it.
-	mu   sync.Mutex
 	data *otterStore[*PodCache]
-	// Values are complete translation slices, immutable after publication.
+	// Translations are immutable and capacity-bounded independently of locations.
 	engineToRequestKeys *otterStore[[]BlockHash]
 	podCacheSize        int
 	// Ordinals remain assigned for the lifetime of this index.
@@ -207,14 +203,6 @@ func (o *OtterIndex) Add(ctx context.Context, engineKeys, requestKeys []BlockHas
 		return err
 	}
 
-	// Hold o.mu across the engine->request mappings and the pod entry inserts,
-	// also when engineKeys is nil. Evict and Clear re-check emptiness under o.mu
-	// before removing a request key or an engine key mapping, so they cannot
-	// remove one that this call has written but whose entries it has not
-	// inserted yet.
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
 	// Build engine->request mappings when engine keys are provided.
 	// The ratio of array lengths determines the mapping type:
 	//   equal  (4 eng, 4 req) -> 1:1   E0->R0, E1->R1, ...
@@ -230,19 +218,18 @@ func (o *OtterIndex) Add(ctx context.Context, engineKeys, requestKeys []BlockHas
 	// Store requestKey -> PodCache mappings for all request keys.
 
 	for _, requestKey := range requestKeys {
-		podCache, found := o.data.Get(requestKey)
-		if !found {
-			newPodCache := &PodCache{capacity: o.podCacheSize}
-
-			// Publish a populated cache so a concurrent lookup cannot see an
-			// empty generation between insertion and the first entry write.
-			newPodCache.addAll(records)
-			podCache, found = o.data.LoadOrStore(requestKey, newPodCache)
-		}
-
-		if found {
+		o.data.cache.Compute(requestKey, func(podCache *PodCache, found bool) (*PodCache, otter.ComputeOp) {
+			if !found {
+				podCache = &PodCache{capacity: o.podCacheSize}
+			}
 			podCache.addAll(records)
-		}
+			if !found {
+				return podCache, otter.WriteOp
+			}
+			return podCache, otter.CancelOp
+		})
+		// Compute's CancelOp keeps the mutable value without policy work.
+		o.data.Get(requestKey)
 
 		if traceLogger.Enabled() {
 			traceLogger.Info("added pods to key", "requestKey", requestKey, "pods", entries)
@@ -265,41 +252,17 @@ func (o *OtterIndex) Evict(ctx context.Context, keyType KeyType, keys []BlockHas
 
 	switch keyType {
 	case EngineKey:
-		// Resolve each engine key's request keys and evict the pod entries.
-		// Do not hold mu here: evictPodsFromRequestKey takes it to remove an
-		// emptied request key.
-		groups := make([][]BlockHash, len(keys))
-		for i, key := range keys {
+		for _, key := range keys {
 			rks, found := o.engineToRequestKeys.Peek(key)
 			if !found {
 				traceLogger.Info("engineKey not found in mapping, nothing to evict", "engineKey", key)
 				continue
 			}
-			groups[i] = rks
 			for _, rk := range rks {
 				o.evictPodsFromRequestKey(rk, key, entries, traceLogger)
 			}
 		}
 
-		// One lock hold covers every engine key's allEmpty check and mapping
-		// removal, keeping the Add-vs-Evict TOCTOU protection while batching.
-		o.mu.Lock()
-		for i, key := range keys {
-			if groups[i] == nil {
-				continue
-			}
-			allEmpty := true
-			for _, rk := range groups[i] {
-				if pc, found := o.data.Peek(rk); found && pc != nil && pc.size() > 0 {
-					allEmpty = false
-					break
-				}
-			}
-			if allEmpty {
-				o.engineToRequestKeys.Remove(key)
-			}
-		}
-		o.mu.Unlock()
 		return nil
 	case RequestKey:
 		for _, key := range keys {
@@ -314,51 +277,21 @@ func (o *OtterIndex) Evict(ctx context.Context, keyType KeyType, keys []BlockHas
 // evictPodsFromRequestKey removes the given pod entries from a single request key's cache.
 // If the cache becomes empty, the request key is removed from the index.
 func (o *OtterIndex) evictPodsFromRequestKey(requestKey, engineKey BlockHash, entries []PodEntry, traceLogger logr.Logger) {
-	podCache, found := o.data.Peek(requestKey)
-	if !found || podCache == nil {
-		traceLogger.Info("requestKey not found in index, nothing to evict", "requestKey", requestKey, "engineKey", engineKey)
-		return
+	o.data.cache.ComputeIfPresent(requestKey, func(podCache *PodCache) (*PodCache, otter.ComputeOp) {
+		if podCache.removeAll(entries) {
+			return nil, otter.InvalidateOp
+		}
+		return podCache, otter.CancelOp
+	})
+	if traceLogger.Enabled() {
+		traceLogger.Info("evicted pods from key", "requestKey", requestKey, "engineKey", engineKey, "pods", entries)
 	}
-
-	isEmpty := podCache.removeAll(entries)
-
-	traceLogger.Info("evicted pods from key", "requestKey", requestKey, "engineKey", engineKey, "pods", entries)
-
-	if !isEmpty {
-		return
-	}
-
-	o.mu.Lock()
-	removed := o.removeIfEmptyLocked(requestKey)
-	o.mu.Unlock()
-	if removed && traceLogger.Enabled() {
-		traceLogger.Info("removed requestKey from index as no pods remain", "requestKey", requestKey)
-	}
-}
-
-// removeIfEmptyLocked removes requestKey from the index if its cache holds no
-// entries, and reports whether it did. The caller holds o.mu, so an Add that
-// already fetched this cache has finished its write before the check.
-func (o *OtterIndex) removeIfEmptyLocked(requestKey BlockHash) bool {
-	podCache, found := o.data.Peek(requestKey)
-	if !found || podCache == nil {
-		return false
-	}
-
-	podCache.mu.Lock()
-	defer podCache.mu.Unlock()
-	if len(podCache.entries) != 0 {
-		return false
-	}
-	o.data.Remove(requestKey)
-	return true
 }
 
 // Clear removes every entry for the pod from the index, across all device tiers.
 // O(N) over the index for a pod it has held, and O(1) for a pod it never held,
-// such as one whose first snapshot is about to load. It removes the request keys
-// it empties under one o.mu hold per chunk of keys, re-checking each key's
-// emptiness under the lock. Lookup does not take o.mu, so Clear does not stall Lookup.
+// such as one whose first snapshot is about to load. Each key's removal is atomic
+// with concurrent additions to that key.
 //
 // Context cancellation does not interrupt Clear.
 //
@@ -377,26 +310,13 @@ func (o *OtterIndex) Clear(ctx context.Context, podIdentifier string) error {
 		return nil
 	}
 
-	var emptied []BlockHash
 	for _, requestKey := range o.data.Keys() {
-		// Peek so a clear does not record accesses on keys it scans.
-		podCache, found := o.data.Peek(requestKey)
-		if !found || podCache == nil {
-			continue
-		}
-
-		if matched := podCache.matching(podIdentifier); len(matched) > 0 && podCache.removeAll(matched) {
-			emptied = append(emptied, requestKey)
-		}
-	}
-
-	// One o.mu hold per chunk bounds how long Clear blocks Add.
-	for chunk := range slices.Chunk(emptied, clearChunkSize) {
-		o.mu.Lock()
-		for _, requestKey := range chunk {
-			o.removeIfEmptyLocked(requestKey)
-		}
-		o.mu.Unlock()
+		o.data.cache.ComputeIfPresent(requestKey, func(podCache *PodCache) (*PodCache, otter.ComputeOp) {
+			if matched := podCache.matching(podIdentifier); len(matched) > 0 && podCache.removeAll(matched) {
+				return nil, otter.InvalidateOp
+			}
+			return podCache, otter.CancelOp
+		})
 	}
 
 	traceLogger.Info("cleared pod from index", "pod", podIdentifier)

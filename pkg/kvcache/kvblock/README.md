@@ -58,7 +58,11 @@ do not record accesses; `Lookup` and `WalkKeys` record their visited prefixes.
 
 `OtterIndex` owns its lookup, traversal, translation, and eviction methods.
 It shares the pod-entry representation and ordinal interner with `InMemoryIndex`.
-Both indexes retain per-key pod-entry locks and an Add/Evict ordering lock.
+Otter uses atomic per-key updates for additions, removals and pod clearing.
+Its pod-entry locks protect mutable locations from concurrent readers.
+Engine-key translations remain in their independently bounded cache after all
+locations are removed. A retained translation permits parent resolution and
+later location-only updates; it contributes no cache hit without a location.
 Parent translations must remain available for later KV events to extend a prefix,
 so eviction policy affects event processing as well as routing cache hits.
 

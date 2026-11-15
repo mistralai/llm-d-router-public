@@ -52,7 +52,7 @@ func newMemoryIndexForTesting(t *testing.T, store string, size, podCacheSize int
 		index, err := NewOtterIndex(&OtterIndexConfig{Size: size, PodCacheSize: podCacheSize})
 		require.NoError(t, err)
 		return &memoryIndexForTesting{
-			Index: index, KeyWalker: index, mu: &index.mu, data: index.data,
+			Index: index, KeyWalker: index, data: index.data,
 			engineToRequestKeys: index.engineToRequestKeys,
 			pods:                index.pods, tiers: index.tiers, internRecords: index.internRecords,
 		}
@@ -71,11 +71,7 @@ func newMemoryIndexForTesting(t *testing.T, store string, size, podCacheSize int
 // and the eviction empties that cache before Add writes to it. The test holds
 // m.mu as Add does, so the eviction must not remove the key until the write lands.
 func TestInMemoryIndexEvictKeepsEntryAddedConcurrently(t *testing.T) {
-	for _, store := range []string{"lru", "otter"} {
-		t.Run(store, func(t *testing.T) {
-			testInMemoryIndexEvictKeepsEntryAddedConcurrently(t, store)
-		})
-	}
+	testInMemoryIndexEvictKeepsEntryAddedConcurrently(t, "lru")
 }
 
 func testInMemoryIndexEvictKeepsEntryAddedConcurrently(t *testing.T, store string) {
