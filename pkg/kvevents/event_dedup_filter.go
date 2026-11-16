@@ -102,17 +102,46 @@ func (s blockScope) key(blockHash uint64) dedupKey {
 // harmless over-estimate (see above) rather than a correctness error. This
 // mirrors the bounded-by-the-wire behavior of Dynamo's EventDedupFilter.
 //
-// It is safe for concurrent use: the single mutex guards the whole cross-pod
-// map. The Pool additionally shards work by pod identifier (see Pool.AddTask),
-// so a given pod's events are serialized onto one worker and mutex contention
-// is low in practice.
+// Each pod has its own lock so independent event workers can update reference
+// counts concurrently.
 type eventDedupFilter struct {
-	mu   sync.Mutex
-	refs map[string]map[dedupKey]int // podIdentifier -> per-block reference count
+	refs sync.Map // podIdentifier -> *dedupPod
+}
+
+type dedupPod struct {
+	mu      sync.Mutex
+	refs    map[dedupKey]int
+	retired bool
 }
 
 func newEventDedupFilter() *eventDedupFilter {
-	return &eventDedupFilter{refs: make(map[string]map[dedupKey]int)}
+	return &eventDedupFilter{}
+}
+
+func (f *eventDedupFilter) lockPod(podIdentifier string, create bool) *dedupPod {
+	for {
+		value, ok := f.refs.Load(podIdentifier)
+		if !ok {
+			if !create {
+				return nil
+			}
+			value, _ = f.refs.LoadOrStore(podIdentifier, &dedupPod{refs: make(map[dedupKey]int)})
+		}
+		pod := value.(*dedupPod)
+		pod.mu.Lock()
+		if !pod.retired {
+			return pod
+		}
+		// A remover may retire this pod after Load but before Lock.
+		pod.mu.Unlock()
+	}
+}
+
+// retirePod requires pod.mu and prevents waiters from updating detached counts.
+func (f *eventDedupFilter) retirePod(podIdentifier string, pod *dedupPod) {
+	pod.retired = true
+	pod.refs = nil
+	f.refs.Delete(podIdentifier)
 }
 
 // trackStore records one reference for each stored block hash within scope.
@@ -122,16 +151,11 @@ func (f *eventDedupFilter) trackStore(scope blockScope, blockHashes []uint64) {
 		return
 	}
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	pod := f.lockPod(scope.podIdentifier, true)
+	defer pod.mu.Unlock()
 
-	bucket := f.refs[scope.podIdentifier]
-	if bucket == nil {
-		bucket = make(map[dedupKey]int)
-		f.refs[scope.podIdentifier] = bucket
-	}
 	for _, h := range blockHashes {
-		bucket[scope.key(h)]++
+		pod.refs[scope.key(h)]++
 	}
 }
 
@@ -145,16 +169,15 @@ func (f *eventDedupFilter) filterRemove(scope blockScope, blockHashes []uint64) 
 		return blockHashes
 	}
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	pod := f.lockPod(scope.podIdentifier, false)
+	if pod == nil {
+		return blockHashes
+	}
+	defer pod.mu.Unlock()
 
-	bucket := f.refs[scope.podIdentifier]
+	bucket := pod.refs
 	kept := make([]uint64, 0, len(blockHashes))
 	for _, h := range blockHashes {
-		if bucket == nil {
-			kept = append(kept, h) // unknown pod -> defensive pass-through
-			continue
-		}
 		k := scope.key(h)
 		count, ok := bucket[k]
 		if !ok || count <= 0 {
@@ -169,8 +192,8 @@ func (f *eventDedupFilter) filterRemove(scope blockScope, blockHashes []uint64) 
 		}
 		bucket[k] = count // still referenced -> suppress this remove
 	}
-	if bucket != nil && len(bucket) == 0 {
-		delete(f.refs, scope.podIdentifier)
+	if len(bucket) == 0 {
+		f.retirePod(scope.podIdentifier, pod)
 	}
 	return kept
 }
@@ -184,9 +207,12 @@ func (f *eventDedupFilter) clear(podIdentifier string) {
 		return
 	}
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.refs, podIdentifier)
+	pod := f.lockPod(podIdentifier, false)
+	if pod == nil {
+		return
+	}
+	defer pod.mu.Unlock()
+	f.retirePod(podIdentifier, pod)
 }
 
 func (f *eventDedupFilter) clearRank(podIdentifier string, dataParallelRank int) {
@@ -194,15 +220,18 @@ func (f *eventDedupFilter) clearRank(podIdentifier string, dataParallelRank int)
 		return
 	}
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	bucket := f.refs[podIdentifier]
+	pod := f.lockPod(podIdentifier, false)
+	if pod == nil {
+		return
+	}
+	defer pod.mu.Unlock()
+	bucket := pod.refs
 	for key := range bucket {
 		if key.dataParallelRank == dataParallelRank {
 			delete(bucket, key)
 		}
 	}
 	if len(bucket) == 0 {
-		delete(f.refs, podIdentifier)
+		f.retirePod(podIdentifier, pod)
 	}
 }

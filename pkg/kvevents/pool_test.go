@@ -207,9 +207,7 @@ func TestSubscriberManager_RemoveSubscriberResetsQueuedPodState(t *testing.T) {
 		kvblock.EmptyBlockHash, makeTokens(16), "test-model", nil)
 	require.NoError(t, err)
 	require.Len(t, keys, 1)
-	pool.dedup.mu.Lock()
-	_, tracked := pool.dedup.refs[sourceEndpoint]
-	pool.dedup.mu.Unlock()
+	_, tracked := pool.dedup.refs.Load(sourceEndpoint)
 	assert.False(t, tracked)
 	_, cataloged := pool.GroupCatalog().Get(sourceEndpoint, kvblock.GroupID(0))
 	assert.False(t, cataloged, "retire reset must drop learned group metadata")
