@@ -16,7 +16,11 @@ limitations under the License.
 
 package kvblock
 
-import "sync"
+import (
+	"sync"
+
+	"k8s.io/utils/ptr"
+)
 
 // GroupID identifies a vLLM KV cache group.
 type GroupID int
@@ -43,6 +47,13 @@ func NewGroupCatalog() *GroupCatalog {
 
 // Learn records group metadata for a pod.
 func (c *GroupCatalog) Learn(podID string, g GroupID, meta GroupMetadata) {
+	// Repeated KV events announce unchanged metadata and need only a read lock.
+	if current, found := c.Get(podID, g); found &&
+		current.Kind == meta.Kind && current.BlockSize == meta.BlockSize &&
+		ptr.Equal(current.SlidingWindowSize, meta.SlidingWindowSize) {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
