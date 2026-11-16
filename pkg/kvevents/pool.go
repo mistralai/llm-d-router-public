@@ -142,6 +142,8 @@ func blockStoredEventDigestible(ev *BlockStoredEvent, canonicalBlockSize int) (b
 
 // Config holds the configuration for the event processing pool.
 type Config struct {
+	// NativeHashes indexes engine hashes directly for clients of vLLM /hash.
+	NativeHashes bool `json:"nativeHashes,omitempty"`
 	// ZMQEndpoint is the ZMQ address to connect to (e.g., "tcp://indexer:5557").
 	ZMQEndpoint string `json:"zmqEndpoint,omitempty"`
 	// TopicFilter is the ZMQ subscription filter (e.g., "kv@").
@@ -221,6 +223,7 @@ func DefaultConfig() *Config {
 // Pool keeps transient event-stream state while durable key mappings are
 // delegated to the Index.
 type Pool struct {
+	nativeHashes   bool
 	queues         []workqueue.TypedRateLimitingInterface[*RawMessage]
 	concurrency    int // can replace use with len(queues)
 	index          kvblock.Index
@@ -263,6 +266,7 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 	}
 
 	p := &Pool{
+		nativeHashes:   cfg.NativeHashes,
 		queues:         make([]workqueue.TypedRateLimitingInterface[*RawMessage], cfg.Concurrency),
 		concurrency:    cfg.Concurrency,
 		index:          index,
@@ -633,6 +637,10 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 
 	// Process each event in the batch
 	for _, genericEvent := range batch.Events {
+		if p.nativeHashes {
+			p.processNativeEvent(ctx, genericEvent, podIdentifier, modelName)
+			continue
+		}
 		switch ev := genericEvent.(type) {
 		case *BlockStoredEvent:
 			deviceTier := normalizeDeviceTier(ev.DeviceTier)
