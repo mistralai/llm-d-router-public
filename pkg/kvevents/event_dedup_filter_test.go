@@ -17,7 +17,11 @@ limitations under the License.
 package kvevents //nolint:testpackage // tests use the unexported eventDedupFilter
 
 import (
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -202,4 +206,121 @@ func TestGroupIdxOrNoGroup(t *testing.T) {
 	assert.Equal(t, noGroupIdx, groupIdxOrNoGroup(nil))
 	g := 3
 	assert.Equal(t, 3, groupIdxOrNoGroup(&g))
+}
+
+func TestEventDedupFilter_ConcurrentStoresPreserveReferences(t *testing.T) {
+	f := newEventDedupFilter()
+	s := gpuScope("pod-a")
+	hashes := []uint64{1, 2, 3}
+	var workers sync.WaitGroup
+	for range 16 {
+		workers.Go(func() {
+			for range 100 {
+				f.trackStore(s, hashes)
+			}
+		})
+	}
+	workers.Wait()
+
+	var forwarded atomic.Int64
+	for range 16 {
+		workers.Go(func() {
+			for range 100 {
+				forwarded.Add(int64(len(f.filterRemove(s, hashes))))
+			}
+		})
+	}
+	workers.Wait()
+	assert.Equal(t, int64(len(hashes)), forwarded.Load())
+	_, tracked := f.refs.Load(s.podIdentifier)
+	assert.False(t, tracked, "empty pods must be reclaimed")
+}
+
+func TestEventDedupFilter_ConcurrentEmptyAndRecreate(t *testing.T) {
+	f := newEventDedupFilter()
+	s := gpuScope("pod-a")
+	var workers sync.WaitGroup
+	for worker := range 16 {
+		workers.Go(func() {
+			hashes := []uint64{uint64(worker)}
+			for range 1000 {
+				f.trackStore(s, hashes)
+				f.trackStore(s, hashes)
+				assert.Empty(t, f.filterRemove(s, hashes), "a concurrent retirement must not lose stores")
+				assert.Equal(t, hashes, f.filterRemove(s, hashes))
+			}
+		})
+	}
+	workers.Wait()
+	_, tracked := f.refs.Load(s.podIdentifier)
+	assert.False(t, tracked, "the final remove must reclaim the pod")
+}
+
+func TestEventDedupFilter_IndependentPodsDoNotShareLock(t *testing.T) {
+	f := newEventDedupFilter()
+	a := gpuScope("pod-a")
+	b := gpuScope("pod-b")
+	f.trackStore(a, []uint64{1})
+	pod := f.lockPod(a.podIdentifier, false)
+	defer pod.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.trackStore(b, []uint64{1})
+		f.filterRemove(b, []uint64{1})
+		f.clear(b.podIdentifier)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an unrelated pod is blocked by pod-a's lock")
+	}
+}
+
+func TestEventDedupFilter_ConcurrentClearAndStore(t *testing.T) {
+	f := newEventDedupFilter()
+	s := gpuScope("pod-a")
+	var workers sync.WaitGroup
+	for range 8 {
+		workers.Go(func() {
+			for range 1000 {
+				f.trackStore(s, []uint64{1})
+				f.clear(s.podIdentifier)
+			}
+		})
+	}
+	workers.Wait()
+	_, tracked := f.refs.Load(s.podIdentifier)
+	assert.False(t, tracked, "the last clear must reclaim the pod")
+
+	f.trackStore(s, []uint64{1})
+	f.trackStore(s, []uint64{1})
+	assert.Empty(t, f.filterRemove(s, []uint64{1}))
+	assert.Equal(t, []uint64{1}, f.filterRemove(s, []uint64{1}))
+}
+
+func BenchmarkEventDedupFilterIndependentPods(b *testing.B) {
+	for _, size := range []int{1, 32, 128} {
+		b.Run(fmt.Sprintf("hashes=%d", size), func(b *testing.B) {
+			f := newEventDedupFilter()
+			var nextPod atomic.Uint64
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				s := gpuScope(fmt.Sprintf("pod-%d", nextPod.Add(1)))
+				hashes := make([]uint64, size)
+				for i := range hashes {
+					hashes[i] = uint64(i + 1)
+				}
+				// Keep each pod present across iterations, as in an active cache.
+				f.trackStore(s, []uint64{0})
+				for pb.Next() {
+					f.trackStore(s, hashes)
+					f.trackStore(s, hashes)
+					f.filterRemove(s, hashes)
+					f.filterRemove(s, hashes)
+				}
+			})
+		})
+	}
 }
