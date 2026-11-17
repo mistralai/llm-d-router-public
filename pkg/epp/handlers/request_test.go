@@ -918,7 +918,6 @@ func TestHandleRequestHeadersBodyless(t *testing.T) {
 
 			require.NoError(t, server.HandleRequestHeaders(context.Background(), reqCtx, req))
 
-			assert.Equal(t, tc.wantBodyless, reqCtx.bodyless)
 			assert.Equal(t, tc.wantBodyless, reqCtx.grpcBidirectional)
 			if tc.wantRandomEndpoint {
 				assert.Equal(t, "1.2.3.4:80", reqCtx.TargetEndpoint)

@@ -311,54 +311,32 @@ func TestProcessBodylessSchedulingErrorSendsImmediateResponse(t *testing.T) {
 }
 
 func TestFinishTunnel(t *testing.T) {
-	tests := []struct {
-		name              string
-		grpcBidirectional bool
-		wantTrailCalls    int
-		wantDurations     uint64
-	}{
-		{
-			name:              "bidirectional stream runs the trail hook and records its duration",
-			grpcBidirectional: true,
-			wantTrailCalls:    1,
-			wantDurations:     1,
-		},
-		{
-			name: "other bodyless request is only marked complete",
-		},
+	useCleanMetrics(t)
+	director := &tunnelDirector{}
+	server := &StreamingServer{director: director}
+	reqCtx := &RequestContext{
+		grpcBidirectional:        true,
+		IncomingModelName:        tunnelModel,
+		TargetModelName:          tunnelModel,
+		RequestReceivedTimestamp: time.Now().Add(-time.Minute),
+	}
+	labels := map[string]string{
+		"model_name":  tunnelModel,
+		"fairness_id": reqcommon.DefaultFairnessID,
+		"priority":    "0",
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			useCleanMetrics(t)
-			director := &tunnelDirector{}
-			server := &StreamingServer{director: director}
-			reqCtx := &RequestContext{
-				bodyless:                 true,
-				grpcBidirectional:        tt.grpcBidirectional,
-				IncomingModelName:        tunnelModel,
-				TargetModelName:          tunnelModel,
-				RequestReceivedTimestamp: time.Now().Add(-time.Minute),
-			}
-			labels := map[string]string{
-				"model_name":  tunnelModel,
-				"fairness_id": reqcommon.DefaultFairnessID,
-				"priority":    "0",
-			}
+	server.finishTunnel(context.Background(), reqCtx)
 
-			server.finishTunnel(context.Background(), reqCtx)
+	assert.True(t, reqCtx.responseComplete)
+	assert.False(t, reqCtx.responseCompleteTimestamp.IsZero())
+	assert.Equal(t, 1, director.trailCalls)
+	assert.Equal(t, uint64(1), histogramSampleCount(t, tunnelDurationMetric, labels))
 
-			assert.True(t, reqCtx.responseComplete)
-			assert.Equal(t, tt.grpcBidirectional, !reqCtx.responseCompleteTimestamp.IsZero())
-			assert.Equal(t, tt.wantTrailCalls, director.trailCalls)
-			assert.Equal(t, tt.wantDurations, histogramSampleCount(t, tunnelDurationMetric, labels))
+	server.finishTunnel(context.Background(), reqCtx)
 
-			server.finishTunnel(context.Background(), reqCtx)
-
-			assert.Equal(t, tt.wantTrailCalls, director.trailCalls, "finishing twice must not repeat the side effects")
-			assert.Equal(t, tt.wantDurations, histogramSampleCount(t, tunnelDurationMetric, labels))
-		})
-	}
+	assert.Equal(t, 1, director.trailCalls, "finishing twice must not repeat the side effects")
+	assert.Equal(t, uint64(1), histogramSampleCount(t, tunnelDurationMetric, labels))
 }
 
 func TestHandleResponseTrail(t *testing.T) {
