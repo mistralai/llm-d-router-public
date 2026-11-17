@@ -183,9 +183,11 @@ func newProducerWithIndexer(ctx context.Context, idx kvCacheIndexer) *Producer {
 
 func TestNativeHashProduceUsesResponseGeometryAndWirePayload(t *testing.T) {
 	ctx := utils.NewTestContext(t)
+	const endpointPath = "/v1/completions/hash"
 	const body = `{"model":"model","messages":[{"role":"user","content":"hello"}],"cache_salt":"tenant"}`
 	blockSize := 32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, endpointPath, r.URL.Path)
 		got, err := io.ReadAll(r.Body)
 		require.NoError(t, err)
 		assert.JSONEq(t, body, string(got))
@@ -209,7 +211,7 @@ func TestNativeHashProduceUsesResponseGeometryAndWirePayload(t *testing.T) {
 	}
 	p := newProducerWithIndexer(ctx, idx)
 	var err error
-	p.nativeHasher, err = newNativeHashClient(server.URL, "1s")
+	p.nativeHasher, err = newNativeHashClient(server.URL+endpointPath, "1s")
 	require.NoError(t, err)
 	assert.Empty(t, p.Consumes().Required)
 	request := &scheduling.InferenceRequest{TargetModel: "model", Headers: map[string]string{"authorization": "Bearer test"}, Body: &fwkrequest.InferenceRequestBody{RawBody: []byte(body)}}

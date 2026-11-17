@@ -55,7 +55,7 @@ const PluginType = "precise-prefix-cache-producer"
 
 // PluginConfig configures the precise-prefix-cache-producer.
 type PluginConfig struct {
-	// HashEndpoint is a vLLM /hash URL for a pool with compatible hash settings.
+	// HashEndpoint is a vLLM /v1/completions/hash URL for a pool with compatible hash settings.
 	// Setting it enables native hash ingestion and bypasses token production.
 	HashEndpoint         string                        `json:"hashEndpoint,omitempty"`
 	HashTimeout          string                        `json:"hashTimeout,omitempty"`

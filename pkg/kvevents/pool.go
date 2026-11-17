@@ -142,7 +142,7 @@ func blockStoredEventDigestible(ev *BlockStoredEvent, canonicalBlockSize int) (b
 
 // Config holds the configuration for the event processing pool.
 type Config struct {
-	// NativeHashes indexes engine hashes directly for clients of vLLM /hash.
+	// NativeHashes indexes engine hashes directly for clients of vLLM /v1/completions/hash.
 	NativeHashes bool `json:"nativeHashes,omitempty"`
 	// ZMQEndpoint is the ZMQ address to connect to (e.g., "tcp://indexer:5557").
 	ZMQEndpoint string `json:"zmqEndpoint,omitempty"`

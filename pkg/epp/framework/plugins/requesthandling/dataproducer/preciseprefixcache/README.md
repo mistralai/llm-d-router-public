@@ -4,13 +4,13 @@
 
 ## Native vLLM hashes
 
-Set `hashEndpoint` to a running vLLM Python server's `/hash` endpoint to use
-engine hashes for requests and KV events:
+Set `hashEndpoint` to a running vLLM Python server's `/v1/completions/hash`
+endpoint to use engine hashes for requests and KV events:
 
 ```yaml
 - type: precise-prefix-cache-producer
   parameters:
-    hashEndpoint: http://vllm:8000/hash
+    hashEndpoint: http://vllm:8000/v1/completions/hash
     hashTimeout: 5s
     speculativeIndexing: false
 ```
@@ -18,8 +18,9 @@ engine hashes for requests and KV events:
 The vLLM server must enable prefix caching and `--enable-scale-out`. Its hash
 settings, tokenizer, chat template, adapters and multimodal preprocessing must
 match the pool. The KV-event topic's model name must equal the primary served
-base-model name returned by `/hash`. Use grouped vLLM events. For pools with
-different hash configurations, configure separate producers and hash services.
+base-model name returned by `/v1/completions/hash`. Use grouped vLLM events.
+For pools with different hash configurations, configure separate producers and
+hash services.
 
 This mode has no token-producer dependency. It sends the forwarded OpenAI chat
 or completion JSON unchanged, or sends parser-provided token IDs and multimodal
