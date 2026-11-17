@@ -71,7 +71,6 @@ func (s *StreamingServer) HandleRequestHeaders(ctx context.Context, reqCtx *Requ
 	// A gRPC bidirectional stream is routed from its headers: its body is a
 	// sequence of messages that ends only when the stream ends.
 	if isGrpcBidirectionalStream(reqCtx.Request.Headers) {
-		reqCtx.bodyless = true
 		reqCtx.grpcBidirectional = true
 	}
 	return nil

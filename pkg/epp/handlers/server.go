@@ -153,9 +153,8 @@ type RequestContext struct {
 	// (enqueue-and-wait). Meaningful only when FlowControlAdmitted is true.
 	FlowControlQueueDuration time.Duration
 
-	// bodyless requests are routed from their headers; their body is never read.
-	bodyless bool
-	// grpcBidirectional marks a gRPC bidirectional stream.
+	// grpcBidirectional marks a gRPC bidirectional stream, routed from its headers;
+	// its body is never read.
 	grpcBidirectional bool
 
 	// Lifecycle bookkeeping.
@@ -443,7 +442,7 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			// Use a fresh context as the request context might be canceled (Client Disconnect).
 			// We only need logging from the original context.
 			cleanupCtx := log.IntoContext(context.Background(), logger)
-			if reqCtx.bodyless {
+			if reqCtx.grpcBidirectional {
 				s.director.HandleResponseTrail(cleanupCtx, reqCtx)
 			} else {
 				s.director.HandleResponseBody(cleanupCtx, reqCtx, true)
@@ -517,7 +516,7 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			logger.V(logutil.DEFAULT).Info("EPP received request") // Request ID and trace fields are logged as logger context values.
 
 			err = s.HandleRequestHeaders(ctx, reqCtx, v)
-			if err == nil && reqCtx.bodyless {
+			if err == nil && reqCtx.grpcBidirectional {
 				reqCtx.Request.Metadata = envoy.ExtractMetadataValues(req)
 				reqCtx, err = s.director.HandleBodylessRequest(ctx, reqCtx)
 				// The Director may resolve agent identity after this request span opened.
@@ -663,7 +662,7 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			if cause := terminationCauseFromGRPCTrailers(v.ResponseTrailers); cause != "" {
 				reqCtx.TerminationCause = cause
 			}
-			if reqCtx.bodyless {
+			if reqCtx.grpcBidirectional {
 				s.finishTunnel(ctx, reqCtx)
 			} else {
 				s.finishResponse(ctx, reqCtx, respBody, reqCtx.modelServerStreaming, false)
@@ -717,10 +716,8 @@ func (s *StreamingServer) finishTunnel(ctx context.Context, reqCtx *RequestConte
 	}
 
 	reqCtx.responseComplete = true
-	if reqCtx.grpcBidirectional {
-		reqCtx.responseCompleteTimestamp = time.Now()
-		s.HandleResponseTrail(ctx, reqCtx)
-	}
+	reqCtx.responseCompleteTimestamp = time.Now()
+	s.HandleResponseTrail(ctx, reqCtx)
 }
 
 // finishResponse ensures all post-response logic, such as metric recording
