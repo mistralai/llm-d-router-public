@@ -32,4 +32,6 @@ mk/261013-least-loaded-pool-saturation                # least-loaded pool aggreg
 
 nzt/native-sidecar                                   # native v2/v3 P/D sidecar (https://github.com/mistralai/llm-d-router-public/pull/59)
 
+selim/route-grpc-bidirectional-streams                # add support for grpc bidirectional requests (https://github.com/mistralai/llm-d-router-public/pull/67)
+
 codex/ciclone-runner-overlay                        # run all composed workflows on Ciclone workers
