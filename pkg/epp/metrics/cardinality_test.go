@@ -17,6 +17,7 @@ limitations under the License.
 package metrics
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ import (
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	metricsutil "github.com/llm-d/llm-d-router/pkg/common/observability/metrics"
 )
 
@@ -144,6 +146,62 @@ func TestFairnessLabelBoundOnRequestMetrics(t *testing.T) {
 
 	require.Equal(t, testCap+1, promtestutil.CollectAndCount(llmdRequestCounter),
 		"100 distinct fairness IDs must collapse to cap+overflow series on the request family")
+}
+
+// The tunnel metrics take the same request-derived fairness label as the request metrics, so a
+// flood of distinct IDs must collapse to cap+overflow series on both of them.
+func TestTunnelMetricsBoundFairnessCardinality(t *testing.T) {
+	const testCap = 3
+	resetFairnessLabelLimit(t)
+	metricsutil.SetFairnessIDLabelLimit(testCap)
+	oldModels := modelLabelLimiter
+	modelLabelLimiter = metricsutil.NewBoundedLabel(10)
+	Reset()
+	t.Cleanup(func() {
+		modelLabelLimiter = oldModels
+		Reset()
+	})
+
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	received := time.Now()
+	for i := 0; i < 100; i++ {
+		fairnessID := fmt.Sprintf("tenant-%d", i)
+		RecordTunneledRequestCounter("model-a", "model-a", fairnessID, 0)
+		RecordTunnelRequestDuration(ctx, "model-a", "model-a", fairnessID, "0", received, received.Add(time.Second))
+	}
+
+	require.Equal(t, testCap+1, promtestutil.CollectAndCount(llmdTunnelCounter),
+		"100 distinct fairness IDs must collapse to cap+overflow series on the tunnel counter")
+	require.Equal(t, testCap+1, promtestutil.CollectAndCount(llmdTunnelDuration),
+		"100 distinct fairness IDs must collapse to cap+overflow series on the tunnel histogram")
+}
+
+// The tunnel metrics take request-body model names, so a flood of distinct names must collapse to
+// cap+overflow series on both of them.
+func TestTunnelMetricsBoundModelCardinality(t *testing.T) {
+	const testCap = 3
+	resetFairnessLabelLimit(t)
+	metricsutil.SetFairnessIDLabelLimit(10)
+	oldModels := modelLabelLimiter
+	modelLabelLimiter = metricsutil.NewBoundedLabel(testCap)
+	Reset()
+	t.Cleanup(func() {
+		modelLabelLimiter = oldModels
+		Reset()
+	})
+
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	received := time.Now()
+	for i := 0; i < 100; i++ {
+		model := fmt.Sprintf("model-%d", i)
+		RecordTunneledRequestCounter(model, model, "tenant", 0)
+		RecordTunnelRequestDuration(ctx, model, model, "tenant", "0", received, received.Add(time.Second))
+	}
+
+	require.Equal(t, testCap+1, promtestutil.CollectAndCount(llmdTunnelCounter),
+		"100 distinct model names must collapse to cap+overflow series on the tunnel counter")
+	require.Equal(t, testCap+1, promtestutil.CollectAndCount(llmdTunnelDuration),
+		"100 distinct model names must collapse to cap+overflow series on the tunnel histogram")
 }
 
 // RecordFlowControlRequestQueueDuration takes request-body model names; they must flow through the

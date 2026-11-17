@@ -33,6 +33,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	"github.com/llm-d/llm-d-router/pkg/epp/datalayer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
 )
@@ -58,6 +59,32 @@ type Scheduler struct {
 	profiles       map[string]fwksched.SchedulerProfile
 }
 
+// BodylessCompatible reports whether every plugin in the profile can handle a
+// request with no body.
+func (p *SchedulerProfile) BodylessCompatible() bool {
+	for _, filter := range p.filters {
+		if bc, ok := filter.(plugin.BodylessCapable); !ok || !bc.BodylessCompatible() {
+			return false
+		}
+	}
+	for _, scorer := range p.scorers {
+		if bc, ok := scorer.Scorer.(plugin.BodylessCapable); !ok || !bc.BodylessCompatible() {
+			return false
+		}
+	}
+	if bc, ok := p.picker.(plugin.BodylessCapable); !ok || !bc.BodylessCompatible() {
+		return false
+	}
+	return true
+}
+
+// bodylessCompatible treats a profile that does not implement BodylessCapable
+// as incompatible.
+func bodylessCompatible(profile fwksched.SchedulerProfile) bool {
+	bc, ok := profile.(plugin.BodylessCapable)
+	return ok && bc.BodylessCompatible()
+}
+
 // Schedule finds the target pod based on metrics and the requested lora adapter.
 func (s *Scheduler) Schedule(ctx context.Context, request *fwksched.InferenceRequest, candidateEndpoints []fwksched.Endpoint) (result *fwksched.SchedulingResult, err error) {
 	logger := log.FromContext(ctx)
@@ -77,6 +104,8 @@ func (s *Scheduler) Schedule(ctx context.Context, request *fwksched.InferenceReq
 	// fails: delete and len are no-ops on a nil map, and the happy path skips
 	// the allocation.
 	var profileRunErrors map[string]error
+	// Counted across rounds: a bodyless request fails here only when no profile ran.
+	bodylessSkipped, profilesRun := 0, 0
 
 	for { // get the next set of profiles to run iteratively based on the request and the previous execution results
 		if verboseEnabled {
@@ -98,6 +127,14 @@ func (s *Scheduler) Schedule(ctx context.Context, request *fwksched.InferenceReq
 		}
 
 		for name, profile := range profiles {
+			if request.Bodyless && !bodylessCompatible(profile) {
+				loggerVerbose.Info("Skipping bodyless incompatible profile", "profile", name)
+				// Nil marks it evaluated so the handler does not pick it again.
+				profileRunResults[name] = nil
+				bodylessSkipped++
+				continue
+			}
+			profilesRun++
 			if verboseEnabled {
 				loggerVerbose.Info("Running scheduler profile", "profile", name)
 			}
@@ -120,6 +157,11 @@ func (s *Scheduler) Schedule(ctx context.Context, request *fwksched.InferenceReq
 
 			profileRunResults[name] = profileRunResult // if profile failed to run, the run result is nil
 		}
+	}
+
+	if bodylessSkipped > 0 && profilesRun == 0 {
+		err = fmt.Errorf("no bodyless-compatible scheduler profile for request %s", request.RequestID)
+		return nil, err
 	}
 
 	if len(profileRunResults) == 0 {

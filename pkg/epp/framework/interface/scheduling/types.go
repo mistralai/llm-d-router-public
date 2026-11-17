@@ -59,6 +59,8 @@ type InferenceRequest struct {
 	FairnessID string
 	// RequestSizeBytes is the size of the raw request body in bytes when available.
 	RequestSizeBytes int
+	// Bodyless indicates a request routed without reading its body, such as a gRPC bidirectional stream.
+	Bodyless bool
 	// SchedulingResult captures the scheduling decisions made during the cycle.
 	SchedulingResult *SchedulingResult
 
