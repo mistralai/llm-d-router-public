@@ -20,6 +20,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -176,6 +179,137 @@ func newProducerWithIndexer(ctx context.Context, idx kvCacheIndexer) *Producer {
 		pluginState:     plugin.NewPluginState(ctx),
 		blockSizeTokens: testBlockSize,
 	}
+}
+
+func TestNativeHashProduceUsesResponseGeometryAndWirePayload(t *testing.T) {
+	ctx := utils.NewTestContext(t)
+	const endpointPath = "/v1/completions/hash"
+	const body = `{"model":"model","messages":[{"role":"user","content":"hello"}],"cache_salt":"tenant"}`
+	blockSize := 32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, endpointPath, r.URL.Path)
+		got, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		assert.JSONEq(t, body, string(got))
+		assert.Equal(t, "Bearer test", r.Header.Get("Authorization"))
+		_, _ = fmt.Fprintf(w, `{"schema_version":1,"model":"model","hash_algorithm":"sha256","hash_encoding":"hex","hash_block_size":%d,"num_hash_lookahead_tokens":0,"groups":[{"group_idx":0,"kind":"full_attention","block_size":%d}],"prompts":[{"num_tokens":%d,"block_hashes":["0000000000000001","0000000000000002"]}]}`, blockSize, blockSize, 2*blockSize+2)
+	}))
+	defer server.Close()
+	group := 0
+	idx := &fakeKVCacheIndexer{
+		computeFromTokens: func(context.Context, []uint32, string, []*kvblock.BlockExtraFeatures) ([]kvblock.BlockHash, error) {
+			t.Fatal("native hash requests must bypass token hashing")
+			return nil, nil
+		},
+		matchBlockKeys: func(_ context.Context, keys []kvblock.BlockHash, _ sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+			assert.Equal(t, []kvblock.BlockHash{kvblock.NativeBlockKey("model", &group, 1), kvblock.NativeBlockKey("model", &group, 2)}, keys)
+			return map[string]kvcache.PodMatch{"10.0.0.1:8080": {
+				MatchedBlocks: 2, ConfirmedBlocks: 2, WeightedScore: 2,
+				BlocksByTier: map[string]int{kvcache.GPUTier: 2},
+			}}, nil
+		},
+	}
+	p := newProducerWithIndexer(ctx, idx)
+	var err error
+	p.nativeHasher, err = newNativeHashClient(server.URL+endpointPath, "1s")
+	require.NoError(t, err)
+	assert.Empty(t, p.Consumes().Required)
+	request := &scheduling.InferenceRequest{TargetModel: "model", Headers: map[string]string{"authorization": "Bearer test"}, Body: &fwkrequest.InferenceRequestBody{RawBody: []byte(body)}}
+	for _, size := range []int{32, 64} {
+		blockSize = size
+		endpoints := freshEndpoints()
+		require.NoError(t, p.Produce(ctx, request, endpoints))
+		info, ok := p.matchInfo(endpoints[0])
+		require.True(t, ok)
+		assert.Equal(t, 2*size, info.CachedBlockCount()*info.BlockSizeTokens())
+		miss, ok := p.matchInfo(endpoints[1])
+		require.True(t, ok)
+		assert.Zero(t, miss.CachedBlockCount())
+	}
+}
+
+func TestNativeHashProduceUsesMinimumCoverageAcrossDenseGroups(t *testing.T) {
+	for _, firstGroupMissing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("firstGroupMissing=%t", firstGroupMissing), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, `{"schema_version":1,"model":"model","hash_algorithm":"sha256","hash_encoding":"hex","hash_block_size":32,"groups":[{"group_idx":0,"kind":"full_attention","block_size":64},{"group_idx":1,"kind":"full_attention","block_size":32}],"prompts":[{"num_tokens":128,"block_hashes":["0000000000000001","0000000000000002","0000000000000003","0000000000000004"]}]}`)
+			}))
+			defer server.Close()
+			group := 0
+			indexer := &fakeKVCacheIndexer{matchBlockKeys: func(_ context.Context, keys []kvblock.BlockHash, _ sets.Set[string]) (map[string]kvcache.PodMatch, error) {
+				count := 1
+				if group == 0 {
+					assert.Equal(t, []kvblock.BlockHash{kvblock.NativeBlockKey("model", &group, 2), kvblock.NativeBlockKey("model", &group, 4)}, keys)
+					group++
+					if firstGroupMissing {
+						return nil, nil //nolint:nilnil // Exercise a nil map as an empty match result.
+					}
+					count = 2
+				} else {
+					assert.Len(t, keys, 4)
+				}
+				return map[string]kvcache.PodMatch{"10.0.0.1:8080": {
+					MatchedBlocks: count, ConfirmedBlocks: count, WeightedScore: float64(count),
+					BlocksByTier: map[string]int{kvcache.GPUTier: count},
+				}}, nil
+			}}
+			p := newProducerWithIndexer(t.Context(), indexer)
+			var err error
+			p.nativeHasher, err = newNativeHashClient(server.URL, "1s")
+			require.NoError(t, err)
+			endpoints := freshEndpoints()
+			request := &scheduling.InferenceRequest{Body: &fwkrequest.InferenceRequestBody{RawBody: []byte(`{"prompt":"hello"}`)}}
+			require.NoError(t, p.Produce(t.Context(), request, endpoints))
+			info, ok := p.matchInfo(endpoints[0])
+			require.True(t, ok)
+			want := 32
+			if firstGroupMissing {
+				want = 0
+			}
+			assert.Equal(t, want, info.CachedBlockCount())
+			assert.Equal(t, want, info.MatchBlocks())
+			assert.Equal(t, want, info.ConfirmedCachedBlockCount())
+		})
+	}
+}
+
+func TestNativeHashInvalidResponseDoesNotPublishCacheHits(t *testing.T) {
+	for _, body := range []string{
+		`not json`,
+		`{"schema_version":2}`,
+		`{"schema_version":1,"model":"model","hash_algorithm":"sha256","hash_encoding":"hex","hash_block_size":32,"groups":[{"group_idx":0,"kind":"full_attention","block_size":32}],"prompts":[{"num_tokens":64,"block_hashes":["0000000000000001"]}]}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, body)
+			}))
+			defer server.Close()
+			p := newProducerWithIndexer(t.Context(), &fakeKVCacheIndexer{})
+			var err error
+			p.nativeHasher, err = newNativeHashClient(server.URL, "1s")
+			require.NoError(t, err)
+			endpoints := freshEndpoints()
+			request := &scheduling.InferenceRequest{Body: &fwkrequest.InferenceRequestBody{
+				RawBody: []byte(`{"model":"model","prompt":"hello"}`),
+			}}
+			require.NoError(t, p.Produce(t.Context(), request, endpoints))
+			_, found := p.matchInfo(endpoints[0])
+			assert.False(t, found)
+		})
+	}
+}
+
+func TestNativeHashPretokenizedMultimodalPayloadPreservesIdentity(t *testing.T) {
+	request := &scheduling.InferenceRequest{TargetModel: "adapter", Body: &fwkrequest.InferenceRequestBody{
+		TokenizedRequest: &fwkrequest.TokenizedRequest{CacheSalt: "tenant-a", Prompts: []fwkrequest.PromptTokens{{
+			TokenIDs:           []uint32{1, 2, 3, 4},
+			MultiModalFeatures: []fwkrequest.MultiModalFeature{{Modality: reqcommon.Modality("image"), Hash: "image-a", Offset: 1, Length: 2}},
+		}}},
+	}}
+	payloads, err := nativeHashPayloads(request)
+	require.NoError(t, err)
+	require.Len(t, payloads, 1)
+	assert.JSONEq(t, `{"model":"adapter","token_ids":[1,2,3,4],"cache_salt":"tenant-a","features":{"mm_hashes":{"image":["image-a"]},"mm_placeholders":{"image":[{"offset":1,"length":2}]}}}`, string(payloads[0]))
 }
 
 func TestMatchEndpointBlockKeys_ReusesPodID(t *testing.T) {

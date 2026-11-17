@@ -58,6 +58,67 @@ func newTestPool(t *testing.T, blockSize int) (
 	return pool, idx, tp
 }
 
+func TestNativeHashesStoreWithoutParentAndEvictWithoutTranslation(t *testing.T) {
+	ctx := t.Context()
+	pool, idx, _ := newTestPool(t, 128)
+	pool.nativeHashes = true
+	recording := &recordingIndex{Index: idx}
+	pool.index = recording
+	group := 3
+	key := kvblock.NativeBlockKey("model", &group, 42)
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{&BlockStoredEvent{
+		BlockHashes: []uint64{42}, ParentHash: 999, BlockSize: 32,
+		GroupIdx: &group, KVCacheSpecKind: KVCacheSpecKindMlaAttention,
+	}}}, "pod", "model")
+	entries, err := idx.Lookup(ctx, []kvblock.BlockHash{key}, nil)
+	require.NoError(t, err)
+	require.Len(t, entries[key], 1)
+	assert.Zero(t, recording.getRequestKeyCalls)
+	_, err = idx.GetRequestKey(ctx, key)
+	require.Error(t, err, "native ingestion must not populate engine-to-request translations")
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{&BlockRemovedEvent{
+		BlockHashes: []uint64{42}, GroupIdx: &group,
+	}}}, "pod", "model")
+	entries, err = idx.Lookup(ctx, []kvblock.BlockHash{key}, nil)
+	require.NoError(t, err)
+	assert.Empty(t, entries[key])
+	assert.Zero(t, recording.getRequestKeyCalls)
+}
+
+func TestNativeHashesKeepGroupsModelsAndTiersIndependent(t *testing.T) {
+	ctx := t.Context()
+	pool, idx, _ := newTestPool(t, 128)
+	pool.nativeHashes = true
+	groupA, groupB := 0, 1
+	for _, model := range []string{"model-a", "model-b"} {
+		for _, group := range []*int{&groupA, &groupB} {
+			for _, tier := range []string{"gpu", "cpu"} {
+				pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{&BlockStoredEvent{
+					BlockHashes: []uint64{42}, GroupIdx: group, DeviceTier: tier,
+				}}}, "pod", model)
+			}
+		}
+	}
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{&BlockRemovedEvent{
+		BlockHashes: []uint64{42}, GroupIdx: &groupA, DeviceTier: "gpu",
+	}}}, "pod", "model-a")
+	keyA := kvblock.NativeBlockKey("model-a", &groupA, 42)
+	keyB := kvblock.NativeBlockKey("model-a", &groupB, 42)
+	keyModelB := kvblock.NativeBlockKey("model-b", &groupA, 42)
+	entries, err := idx.Lookup(ctx, []kvblock.BlockHash{keyA, keyB, keyModelB}, nil)
+	require.NoError(t, err)
+	require.Len(t, entries[keyA], 1)
+	assert.Equal(t, "cpu", entries[keyA][0].DeviceTier)
+	assert.Len(t, entries[keyB], 2)
+	assert.Len(t, entries[keyModelB], 2)
+	pool.processEventBatch(ctx, &EventBatch{Events: []GenericEvent{&AllBlocksClearedEvent{}}}, "pod", "model-a")
+	entries, err = idx.Lookup(ctx, []kvblock.BlockHash{keyA, keyB, keyModelB}, nil)
+	require.NoError(t, err)
+	for _, values := range entries {
+		assert.Empty(t, values)
+	}
+}
+
 type recordingIndex struct {
 	kvblock.Index
 	getRequestKeyCalls int

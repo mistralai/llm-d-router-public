@@ -2,6 +2,63 @@
 
 **Type:** `precise-prefix-cache-producer`
 
+## Native vLLM hashes
+
+Set `hashEndpoint` to a running vLLM Python server's `/v1/completions/hash`
+endpoint to use engine hashes for requests and KV events:
+
+```yaml
+- type: precise-prefix-cache-producer
+  parameters:
+    hashEndpoint: http://vllm:8000/v1/completions/hash
+    hashTimeout: 5s
+    speculativeIndexing: false
+```
+
+The vLLM server must enable prefix caching and `--enable-scale-out`. Its hash
+settings, tokenizer, chat template, adapters and multimodal preprocessing must
+match the pool. The KV-event topic's model name must equal the primary served
+base-model name returned by `/v1/completions/hash`. Use grouped vLLM events.
+For pools with different hash configurations, configure separate producers and
+hash services.
+
+This mode has no token-producer dependency. It sends the forwarded OpenAI chat
+or completion JSON unchanged, or sends parser-provided token IDs and multimodal
+metadata for pretokenized inputs. It forwards the request's Authorization header.
+Do not explicitly configure a token producer solely for this producer. Other
+plugins that consume tokens can still request token production independently.
+
+Each response supplies its effective hash and cache-group block sizes, including
+DCP scaling. No canonical block size needs to match vLLM. Changed sizes take
+effect on the next response without restarting the EPP. During a rollout with
+incompatible hash settings, the selected hash service can produce conservative
+misses for backends using a different configuration.
+
+Stored and removed engine hashes address the index directly. Parent ancestry,
+event token IDs, multimodal rehashing and `engineToRequestKeys` are unnecessary
+on this path. Model and group namespaces remain separate. The router retains
+its 64-bit hash representation, taking the low 64 bits of the full hexadecimal
+hash, consistently with its KV-event decoder.
+
+Scores report the minimum contiguous cached token coverage across full, MLA,
+and sink-full attention groups, summed across prompts. Sparse state groups are
+indexed but do not contribute to this score. Dense coverage on hybrid models
+is a routing estimate; it does not establish that every recurrent or
+sliding-window state needed for a scheduler cache hit is present. Partial tails
+are retained in the index but full-group boundaries determine this score.
+Residency is aggregated by pod address and port; the index does not distinguish
+DP ranks sharing that address. Use separately addressable workers when routing
+requires rank-specific cache predictions.
+
+Speculative indexing is unsupported in native mode. Invalid or unavailable hash
+responses omit the cache prediction, allowing other routing signals to operate.
+Anthropic, Responses, prompt embeddings and legacy-translated tokens are
+unsupported. Event loss still needs the existing resynchronization policy.
+The mode adds a hash RPC; end-to-end throughput and latency must be measured
+separately from event-ingestion performance.
+
+## Token-based hashing
+
 DataProducer that owns the precise KV-block index and publishes
 per-endpoint `PrefixCacheMatchInfo`. Pairs with the generic
 [`prefix-cache-scorer`](../../../scheduling/scorer/prefix/); the scorer

@@ -55,6 +55,10 @@ const PluginType = "precise-prefix-cache-producer"
 
 // PluginConfig configures the precise-prefix-cache-producer.
 type PluginConfig struct {
+	// HashEndpoint is a vLLM /v1/completions/hash URL for a pool with compatible hash settings.
+	// Setting it enables native hash ingestion and bypasses token production.
+	HashEndpoint         string                        `json:"hashEndpoint,omitempty"`
+	HashTimeout          string                        `json:"hashTimeout,omitempty"`
 	TokenProcessorConfig *kvblock.TokenProcessorConfig `json:"tokenProcessorConfig"`
 	IndexerConfig        *kvcache.Config               `json:"indexerConfig"`
 	KVEventsConfig       *kvevents.Config              `json:"kvEventsConfig"`
@@ -95,6 +99,7 @@ type subscriberManager interface {
 // Speculative-indexing logic lives in prerequest.go; per-pod ZMQ subscriber
 // lifecycle in extractor.go.
 type Producer struct {
+	nativeHasher   *nativeHashClient
 	typedName      plugin.TypedName
 	kvCacheIndexer kvCacheIndexer
 
@@ -155,11 +160,33 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 // The kvcache indexer, KV-events pool, and any local ZMQ subscriber start
 // in background goroutines bound to ctx.
 func New(ctx context.Context, name string, config PluginConfig) (*Producer, error) {
+	var nativeHasher *nativeHashClient
+	if config.HashEndpoint != "" {
+		if config.SpeculativeIndexing {
+			return nil, errors.New("hashEndpoint requires speculativeIndexing=false")
+		}
+		var err error
+		nativeHasher, err = newNativeHashClient(config.HashEndpoint, config.HashTimeout)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if config.TokenProcessorConfig == nil {
 		config.TokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
 	}
 	if config.KVEventsConfig == nil {
 		config.KVEventsConfig = kvevents.DefaultConfig()
+	}
+	if config.KVEventsConfig.NativeHashes && nativeHasher == nil {
+		return nil, errors.New("nativeHashes requires hashEndpoint")
+	}
+	if nativeHasher != nil {
+		if config.KVEventsConfig.EngineType != "" && config.KVEventsConfig.EngineType != engineadapter.EngineTypeVLLM {
+			return nil, errors.New("hashEndpoint requires the vllm event adapter")
+		}
+		kvConfig := *config.KVEventsConfig
+		kvConfig.NativeHashes = true
+		config.KVEventsConfig = &kvConfig
 	}
 
 	var podSelector labels.Selector
@@ -210,6 +237,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 	prefixmetrics.Register()
 
 	return &Producer{
+		nativeHasher:       nativeHasher,
 		typedName:          plugin.TypedName{Type: PluginType, Name: name},
 		kvCacheIndexer:     indexer,
 		subscribersManager: subscribersManager,
@@ -306,6 +334,9 @@ func (p *Producer) Produces() map[plugin.DataKey]any {
 // Level-2 attribute matching to require the engine-aligned vllm backend
 // (rejecting the estimate backend's byte-packed pseudo-tokens at startup).
 func (p *Producer) Consumes() plugin.DataDependencies {
+	if p.nativeHasher != nil {
+		return plugin.DataDependencies{}
+	}
 	return plugin.DataDependencies{
 		Required: map[plugin.DataKey]any{
 			tokenproducer.TokenizedPromptDataKey: plugin.ConsumedData{
@@ -324,6 +355,9 @@ func (p *Producer) Consumes() plugin.DataDependencies {
 func (p *Producer) Produce(ctx context.Context,
 	request *scheduling.InferenceRequest, endpoints []scheduling.Endpoint,
 ) error {
+	if p.nativeHasher != nil {
+		return p.produceNativeHashes(ctx, request, endpoints)
+	}
 	ctx, span := tracing.Tracer(rhplugins.TracerScope).Start(ctx, "produce_precise_prefix_cache",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
