@@ -838,6 +838,14 @@ func (d *Director) runResponseHeaderPlugins(ctx context.Context, request *fwksch
 }
 
 func (d *Director) runResponseBodyPlugins(ctx context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, targetEndpoint *fwkdl.EndpointMetadata) {
+	// A response can reach this extension point for a request that was never scheduled: a
+	// request without a body is routed from its headers alone, so HandleRequest never
+	// builds a SchedulingRequest, while its response still runs these plugins.
+	// ResponseBodyProcessor implementations are written against a scheduled request, and
+	// one that dereferences it takes the process down.
+	if request == nil {
+		return
+	}
 	loggerTrace := log.FromContext(ctx).V(logutil.TRACE)
 	for _, plugin := range d.requestControlPlugins.responseStreamingPlugins {
 		// This loop runs per response chunk, so it caches TypedName and guards

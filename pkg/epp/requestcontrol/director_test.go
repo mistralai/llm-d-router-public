@@ -1927,7 +1927,8 @@ func TestDirector_HandleResponseBody(t *testing.T) {
 		Response: &handlers.Response{
 			Headers: map[string]string{"X-Test-Streaming-Header": "StreamValue"},
 		},
-		TargetPod: &fwkdl.EndpointMetadata{ID: types.NamespacedName{Namespace: "namespace1", Name: "test-pod-name"}},
+		SchedulingRequest: &fwksched.InferenceRequest{RequestID: "epp-req-id-for-streaming"},
+		TargetPod:         &fwkdl.EndpointMetadata{ID: types.NamespacedName{Namespace: "namespace1", Name: "test-pod-name"}},
 	}
 
 	// Each dispatch snapshots the accumulator, so every invocation carries the total at call time.
@@ -1967,6 +1968,41 @@ func TestDirector_HandleResponseBody(t *testing.T) {
 			assert.True(t, resp.EndOfStream, "EndOfStream should be true for last chunk")
 		}
 	}
+}
+
+func TestDirector_HandleResponseBody_UnscheduledRequest(t *testing.T) {
+	plugin := &requestReadingPlugin{typedName: fwkplugin.TypedName{Type: testPostStreamingType, Name: "request-reader"}}
+	ctx := logutil.NewTestLoggerIntoContext(context.Background())
+	director := NewDirectorWithConfig(datastore.NewDatastore(t.Context(), nil), &mockScheduler{}, nil, nil,
+		NewConfig().WithResponseStreamingPlugins(plugin))
+
+	// A request without a body is routed from its headers alone, so no SchedulingRequest
+	// is built; its response still runs the response-body plugins.
+	bodyless := &handlers.RequestContext{
+		Request:  &handlers.Request{ID: "bodyless", Headers: map[string]string{}},
+		Response: &handlers.Response{Headers: map[string]string{}},
+	}
+	require.NotPanics(t, func() {
+		director.HandleResponseBody(ctx, bodyless, false)
+		director.HandleResponseBody(ctx, bodyless, true)
+	})
+
+	plugin.mu.Lock()
+	assert.Empty(t, plugin.requests, "a response-body plugin must not run for a request that was never scheduled")
+	plugin.mu.Unlock()
+
+	// A scheduled request still reaches the plugin, with its scheduling request.
+	scheduled := &handlers.RequestContext{
+		Request:           &handlers.Request{ID: "scheduled", Headers: map[string]string{}},
+		Response:          &handlers.Response{Headers: map[string]string{}},
+		SchedulingRequest: &fwksched.InferenceRequest{RequestID: "scheduled"},
+	}
+	director.HandleResponseBody(ctx, scheduled, true)
+
+	plugin.mu.Lock()
+	defer plugin.mu.Unlock()
+	require.Len(t, plugin.requests, 1, "a scheduled request still reaches the plugin")
+	assert.Equal(t, "scheduled", plugin.requests[0].RequestID)
 }
 
 func TestDirector_HandleResponseBody_ChunkOrdering(t *testing.T) {
@@ -2242,6 +2278,25 @@ func (p *blockingResponseStreamingPlugin) release() {
 	close(p.releaseCh)
 }
 
+// requestReadingPlugin records the scheduling request each response-body callback
+// carries. It reads the request, as a plugin written against a scheduled request does,
+// so a callback carrying none panics.
+type requestReadingPlugin struct {
+	typedName fwkplugin.TypedName
+
+	mu       sync.Mutex
+	requests []*fwksched.InferenceRequest
+}
+
+func (p *requestReadingPlugin) TypedName() fwkplugin.TypedName { return p.typedName }
+
+func (p *requestReadingPlugin) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, _ *fwkrc.Response, _ *fwkdl.EndpointMetadata) {
+	_ = request.RequestID
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.requests = append(p.requests, request)
+}
+
 func newResponseBodyTestRequestContext(requestID string) *handlers.RequestContext {
 	return &handlers.RequestContext{
 		Request: &handlers.Request{
@@ -2252,7 +2307,10 @@ func newResponseBodyTestRequestContext(requestID string) *handlers.RequestContex
 		Response: &handlers.Response{
 			Headers: map[string]string{},
 		},
-		TargetPod: &fwkdl.EndpointMetadata{},
+		// The response-body extension point only runs for a request that carries a body,
+		// which the director schedules before the response arrives.
+		SchedulingRequest: &fwksched.InferenceRequest{RequestID: requestID},
+		TargetPod:         &fwkdl.EndpointMetadata{},
 	}
 }
 
