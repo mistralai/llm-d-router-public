@@ -27,8 +27,8 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Check typos
-        uses: crate-ci/typos@v1.50.3
+        uses: crate-ci/typos@9023c1f779400877cafdd98052113fc777e2cfdc # v1.51.1
 

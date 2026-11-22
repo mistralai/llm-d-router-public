@@ -2,7 +2,8 @@
 
 The coordinator is a Go service that accepts inference requests and drives them through
 a configurable pipeline of steps. It currently supports the OpenAI-compatible API
-(`/v1/chat/completions`, `/v1/completions`, `/v1/responses`), and the entry layer is
+(`/v1/chat/completions`, `/v1/completions`, `/v1/responses`) and the Anthropic
+Messages API (`/v1/messages`). The entry layer is
 designed to be extended to other inference protocols. Each step performs one unit of
 work (download media, tokenize, encode, prefill, decode). The pre-processing steps call
 side services directly (media download, and the render service for tokenization); the
@@ -34,8 +35,9 @@ The goals the design serves:
   needed state.
 - Tokenize the prompt once (in the render step) and reuse the token IDs across encode,
   prefill, and decode in the tokens-in (`/inference/v1/generate`) format, so workers
-  never re-tokenize; the OpenAI-format (`/v1/chat/completions`) fallback re-tokenizes
-  on each worker instead.
+  never re-tokenize. Text chat requests can also use
+  [prefill-owned tokenization](#prefill-owned-tokenization-for-text-chat) with a
+  compatible decode backend.
 - Tokens-in / tokens-out operation: steps can exchange token IDs directly instead of
   raw text, cutting per-step tokenization to a single render pass. This is also
   beneficial for reinforcement learning (RL), where the training loop works in token
@@ -76,6 +78,7 @@ absorb further processing modes as they are added.
   - [Environment overrides](#environment-overrides)
   - [Connector selection](#connector-selection)
   - [Should the coordinator use the tokens-in format?](#should-the-coordinator-use-the-tokens-in-format)
+  - [Prefill-owned tokenization for text chat](#prefill-owned-tokenization-for-text-chat)
   - [The built-in steps](#the-built-in-steps)
   - [Adding a step to the pipeline](#adding-a-step-to-the-pipeline)
 - [References](#references)
@@ -221,7 +224,7 @@ completions prompt is already a token array). See
 
 | Component | Path | Responsibility |
 | :---- | :---- | :---- |
-| Entry server | [pkg/coordinator/server/](../pkg/coordinator/server/) | chi server, TLS unless `secure_serving` is false. Accepts `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, and `/inference/v1/generate`, builds the `RequestContext`, runs the pipeline, exposes `/healthz` and `/readyz`, and passes any other path through to the gateway. |
+| Entry server | [pkg/coordinator/server/](../pkg/coordinator/server/) | chi server, TLS unless `secure_serving` is false. Accepts `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, and `/inference/v1/generate`, builds the `RequestContext`, runs the pipeline, exposes `/healthz` and `/readyz`, and passes any other path through to the gateway. |
 | Pipeline | [pkg/coordinator/pipeline/](../pkg/coordinator/pipeline/) | The `Step` abstraction, the ordered executor, the step registry, and the `RequestContext`. |
 | Steps | [pkg/coordinator/steps/](../pkg/coordinator/steps/) | The built-in steps. Each registers itself with the pipeline registry in an `init()` function. |
 | Gateway client | [pkg/coordinator/gateway/](../pkg/coordinator/gateway/) | HTTP client with a keep-alive pool to the configured Inference Gateway, path/format helpers, and the `x-llm-d-epp-profile` header constants. |
@@ -730,10 +733,10 @@ single step may override the default in its own `params` (`kv_connector:` /
 
 `pipeline.use_openai_format` selects the wire format for the encode and prefill steps
 (the steps that choose their upstream endpoint by format). Decode and conditional-decode
-always forward on the client's original OpenAI path and are unaffected by this setting:
+always forward on the client's original path and are unaffected by this setting:
 
-- `true` (default): forward the client's original OpenAI path (`/v1/chat/completions`,
-  `/v1/completions`, `/v1/responses`).
+- `true` (default): forward the client's original path (`/v1/chat/completions`,
+  `/v1/completions`, `/v1/responses`, `/v1/messages`).
 - `false`: the tokens-in format. Rewrite to the internal `/inference/v1/generate`
   token-array endpoint, sending `token_ids` and `features` (including `kwargs_data`)
   directly in the body.
@@ -754,12 +757,10 @@ addressed.
 
 #### Format tradeoff
 
-The choice trades request size against worker recompute. The recompute half applies
-to every request, multimodal or not: in the generate format, the added `token_ids`
-field prevents re-tokenization on the worker; the chat-completions format carries no
-equivalent field, so the worker re-tokenizes there regardless. The request-size half
-matters only for multimodal requests, where the two formats differ in how the image
-is carried.
+The choice trades request size against worker recompute. In the generate format,
+`token_ids` prevents re-tokenization on the worker. Chat completions re-tokenizes
+unless the backend supports the optional prompt reuse contract below. For multimodal
+requests, the formats also differ in how the image is carried.
 
 - `/v1/chat/completions` carries the image as a raw `data:` URL. The body stays small,
   but the worker re-runs the vision preprocessor from the image bytes.
@@ -789,16 +790,43 @@ length (the number of image placeholder tokens) grows with resolution in both fo
 The `ec_transfer_params` shape and `size_bytes` are identical between the two formats;
 only the request carrier differs.
 
+### Prefill-owned tokenization for text chat
+
+[pd-chat-token-reuse.yaml](../config/coordinator/pd-chat-token-reuse.yaml) configures
+a `prefill` then `decode` pipeline on `/v1/chat/completions`. The prefill step's
+`reuse_prompt_token_ids: true` option requests `return_token_ids: true` from P and
+copies its response's `prompt_token_ids` into `kv_transfer_params.prompt_token_ids`
+for D. Only prompt IDs are forwarded; P's sampled output token is discarded.
+D receives the original chat request and generation settings and returns its normal
+chat response, including streaming reasoning and tool-call deltas.
+
+This is an opt-in backend extension. P must return prompt IDs and NIXL transfer
+metadata; D must consume `kv_transfer_params.prompt_token_ids` before prompt
+templating/tokenization. A backend that ignores this field still tokenizes again.
+Keep the tokenizer and model-specific output parsers enabled on D. Missing or invalid
+P-side prompt IDs fail the request instead of silently falling back to tokenization.
+
+The option accepts text chat only and requires `kv-nixl` and OpenAI format. Use the
+two-step pipeline from the example: a `render` step would tokenize before P, and a
+`conditional-decode` probe may tokenize on D before falling back to P. Configure EPP
+to estimate prompt length without invoking a tokenizer. Exact prefix-cache routing
+that calls a tokenizer would add another prompt tokenization.
+
+The gateway must route `x-llm-d-epp-profile: prefill` and `x-llm-d-epp-profile: decode` to compatible
+worker pools. Before rollout, verify actual KV transfer and the absence of D-side
+prompt tokenization, along with cancellation cleanup and output parity for the
+chosen model, template, parsers, and speculative decoding configuration.
+
 ### The built-in steps
 
 | `type` | Purpose | Key params |
 | :---- | :---- | :---- |
 | `async-broker` | Optional, first when enabled. Bridge to the [llm-d-async](https://github.com/llm-d/llm-d-async) broker: requests carrying the mode header are labeled and passed through (`passthrough`) or queued (`enqueue`, `wait`); requests without it are untouched. Also registers `GET/DELETE /v1/requests/{id}` on the listener. Full doc: [coordinator_async_broker.md](coordinator_async_broker.md). | `redis_url` (required), `routes`, `objectives`, `quota`, `wait_cap_seconds` |
-| `replace-media-urls` | Download `image_url` (chat completions) or `input_image` (Responses) references, inline as base64 data URIs, seed `MultimodalEntries`. | `download_timeout`, `max_concurrent_downloads`, `max_multimodal_entries` |
-| `render` | Tokenize via the render service; populate `TokenIDs` and per-image hash/placeholder/kwargs. | `address` (required), `timeout`, `max_total_tokens`, `max_total_placeholder_tokens` |
+| `replace-media-urls` | Download `image_url`, `audio_url`, and `video_url` references (chat completions) or `input_image` references (Responses) and accept inline `input_audio`, inline each as a base64 `data:` URI, seed one `MultimodalEntries` item per part tagged with its modality. | `download_timeout`, `max_concurrent_downloads`, `max_multimodal_entries`, `max_download_size`, `max_image_download_size`, `max_audio_download_size`, `max_video_download_size`, `allowed_image_content_types`, `allowed_audio_content_types`, `allowed_video_content_types`, `allow_private_networks`, `allowed_domains` |
+| `render` | Tokenize via the render service; populate `TokenIDs` and each entry's hash/placeholder/kwargs from the per-modality `mm_hashes` / `mm_placeholders` / `kwargs_data` maps. | `address` (required), `timeout`, `max_total_tokens`, `max_total_placeholder_tokens` |
 | `conditional-decode` | Optional fast path: attempt decode with `Prefer: if-available`; on 412 continue, otherwise stream the response and stop. | (none) |
 | `encode` | Parallel fan-out, one request per multimodal entry; merge EC descriptors. | `max_parallel`, `use_openai_format`, `ec_connector` |
-| `prefill` | Single prefill call with tokens + EC/KV hints; capture `kv_transfer_params`. | `use_openai_format`, `kv_connector`, `ec_connector` |
+| `prefill` | Single prefill call with tokens + EC/KV hints; capture `kv_transfer_params`. | `use_openai_format`, `kv_connector`, `ec_connector`, `reuse_prompt_token_ids` |
 | `decode` | Stream the final completion to the client. | `kv_connector` |
 
 Parameter semantics and defaults are documented inline in
