@@ -137,6 +137,10 @@ type Config struct {
 	// no effect with --kv-connector=offloading, where the tier is always present.
 	EnableP2PPull bool
 
+	// ReusePromptTokenIDs forwards prefill prompt IDs to compatible vLLM chat
+	// endpoints so decode can skip text prompt rendering and tokenization.
+	ReusePromptTokenIDs bool
+
 	// EnableSSRFProtection enables SSRF protection using InferencePool allowlisting.
 	EnableSSRFProtection bool
 	// InferencePoolNamespace is the Kubernetes namespace of the InferencePool to watch.
