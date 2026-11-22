@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 	"github.com/llm-d/llm-d-router/pkg/kvcache"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
@@ -212,6 +213,42 @@ func TestMatchBlockKeysEmptyKeys(t *testing.T) {
 	assert.Empty(t, got)
 }
 
+func TestMatchBlockKeysKeepsDataParallelRankChainsIndependent(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(t.Context())
+	indexer, idx := newMatcher(t, kvcache.DefaultKVCacheBackendConfig())
+	rank0, rank1 := 0, 1
+	populateIndex(t, idx, map[kvblock.BlockHash][]kvblock.PodEntry{
+		10: {
+			{PodIdentifier: "pod-a", DeviceTier: "gpu", DataParallelRank: &rank0},
+			{PodIdentifier: "pod-a", DeviceTier: "gpu", DataParallelRank: &rank1},
+		},
+		20: {
+			{PodIdentifier: "pod-a", DeviceTier: "gpu", DataParallelRank: &rank0},
+			{PodIdentifier: "pod-a", DeviceTier: "gpu", DataParallelRank: &rank1},
+		},
+		30: {
+			{PodIdentifier: "pod-a", DeviceTier: "gpu", DataParallelRank: &rank1},
+		},
+	})
+
+	got, err := indexer.MatchBlockKeysByEndpoint(ctx, []kvblock.BlockHash{10, 20, 30}, sets.New("pod-a"))
+	require.NoError(t, err)
+	rank0Key, err := routing.BuildDPScoringKey("pod-a", rank0)
+	require.NoError(t, err)
+	rank1Key, err := routing.BuildDPScoringKey("pod-a", rank1)
+	require.NoError(t, err)
+	assertPodMatches(t, map[string]kvcache.PodMatch{
+		rank0Key: {WeightedScore: 2, MatchedBlocks: 2, ConfirmedBlocks: 2, BlocksByTier: map[string]int{"gpu": 2}},
+		rank1Key: {WeightedScore: 3, MatchedBlocks: 3, ConfirmedBlocks: 3, BlocksByTier: map[string]int{"gpu": 3}},
+	}, got)
+
+	podMatches, err := indexer.MatchBlockKeys(ctx, []kvblock.BlockHash{10, 20, 30}, sets.New("pod-a"))
+	require.NoError(t, err)
+	assertPodMatches(t, map[string]kvcache.PodMatch{
+		"pod-a": {WeightedScore: 3, MatchedBlocks: 3, ConfirmedBlocks: 3, BlocksByTier: map[string]int{"gpu": 3}},
+	}, podMatches)
+}
+
 func TestMatchBlockKeysCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(logging.NewTestLoggerIntoContext(t.Context()))
 	walked, idx := newMatcher(t, kvcache.DefaultKVCacheBackendConfig())
@@ -309,6 +346,12 @@ func TestMatchBlockKeysConfiguredTierWeights(t *testing.T) {
 		entry    kvblock.PodEntry
 		want     float64
 	}{
+		{
+			name:     "default backends score storage at 0.6",
+			backends: kvcache.DefaultKVCacheBackendConfig(),
+			entry:    kvblock.PodEntry{PodIdentifier: "pod-a", DeviceTier: "storage"},
+			want:     0.6,
+		},
 		{
 			name:     "default backends score shared_storage at 0.4",
 			backends: kvcache.DefaultKVCacheBackendConfig(),
