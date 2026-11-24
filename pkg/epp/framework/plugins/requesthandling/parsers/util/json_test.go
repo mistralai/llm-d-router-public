@@ -19,6 +19,7 @@ package parserutil
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -79,6 +80,66 @@ func TestUnmarshalEnvelopeScalars(t *testing.T) {
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatalf("scalar mismatch (-want +got):\n%s", diff)
 	}
+}
+
+func TestUnmarshalValidatedEnvelope(t *testing.T) {
+	for _, input := range []string{
+		`{}`, ` { } `, `null`, `[]`, `"text"`, `1`,
+		` {
+ "model": "m", "stream": true, "seed": 9007199254740993, "null": null, "prompt": "raw\ntext",
+ "tools": [ {"parameters": {"z": 1e0, "a": 2}} ],
+ "extra": { "z": "last", "a": "<first>" }
+}`,
+		`{"prompt":"line\n\"quoted\" \\ \uD83D\uDE00","large":1e1000,"fraction":-1.50e-2,"empty":"","f":false}`,
+		`{"a":"\\","b":"\\\"","c":"}]{[","d":[{"e":"\"}"},[]],"a":{"dup":true}}`,
+		`{"mo\u0064el":"m","\"":1,"\\":2}`,
+		"{\"m\xc3\xb6del\":\"m\",\"\xff\":1,\"k\":\"\xff\"}",
+		"{\t\"prompt\"\r\n:\n[1, 2]\t}\n",
+	} {
+		t.Run(input, func(t *testing.T) {
+			data := []byte(input)
+			if !json.Valid(data) {
+				t.Fatal("input must be valid JSON")
+			}
+			_, split := splitValidatedObject(data)
+			if isObject := strings.HasPrefix(strings.TrimSpace(input), "{"); split != isObject {
+				t.Fatalf("splitValidatedObject() ok = %v, want %v", split, isObject)
+			}
+			want, wantErr := UnmarshalEnvelope(data, "prompt")
+			got, err := UnmarshalValidatedEnvelope(data, "prompt")
+			if fmt.Sprint(err) != fmt.Sprint(wantErr) {
+				t.Fatalf("UnmarshalValidatedEnvelope() error = %v, want %v", err, wantErr)
+			}
+			for i := range data {
+				data[i] = 'x'
+			}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Fatalf("envelope mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func FuzzUnmarshalValidatedEnvelope(f *testing.F) {
+	for _, input := range []string{
+		`{}`, `null`, `[]`, `{"prompt":[1,2],"seed":1e1000}`, `{"prompt":"\uD800","prompt":{"z":1,"a":2}}`,
+		`{"a":"\\\"}","b":[{"c":"]"}],"\u0064":null}`, " {\"k\" : [ ] , \"\xff\" : -0.5e-3 } ",
+	} {
+		f.Add([]byte(input))
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if !json.Valid(data) {
+			return
+		}
+		want, wantErr := UnmarshalEnvelope(data, "prompt")
+		got, err := UnmarshalValidatedEnvelope(data, "prompt")
+		if fmt.Sprint(err) != fmt.Sprint(wantErr) {
+			t.Fatalf("error = %v, want %v", err, wantErr)
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Fatalf("envelope mismatch (-want +got):\n%s", diff)
+		}
+	})
 }
 
 func FuzzJSONMapAcceptance(f *testing.F) {
