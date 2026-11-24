@@ -137,7 +137,8 @@ func (p *OpenAIParser) ParseRequest(ctx context.Context, body []byte, headers ma
 	var bodyMap fwkrh.PayloadMap
 	if apiType == chatCompletionsAPI || apiType == completionsAPI {
 		var payload map[string]any
-		payload, err = parserutil.UnmarshalEnvelope(body, promptField)
+		// extractRequestBody validated body with json.Unmarshal.
+		payload, err = parserutil.UnmarshalValidatedEnvelope(body, promptField)
 		bodyMap = fwkrh.PayloadMap(payload)
 		extractedBody.RawBody = body
 	} else if rawField := tokenInputField(extractedBody); rawField == "" {

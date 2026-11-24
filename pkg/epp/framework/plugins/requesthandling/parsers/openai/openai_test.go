@@ -36,6 +36,7 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwkplugins "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins"
+	parserutil "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/parsers/util"
 )
 
 var (
@@ -1573,6 +1574,114 @@ func TestOpenAIParser_RequestFieldErrors(t *testing.T) {
 				if !errors.Is(err, fieldErr.Err) {
 					t.Fatal("field error must preserve the original client error")
 				}
+			}
+		})
+	}
+}
+
+func TestOpenAIParser_ChatCompletionsDecodeErrors(t *testing.T) {
+	const (
+		messages    = `"messages":[{"role":"user","content":"hi"}]`
+		invalidChat = "invalid chat completions request: must have valid messages field"
+	)
+	for _, tt := range []struct {
+		body    string
+		wantErr string
+	}{
+		{body: ``, wantErr: "unexpected end of JSON input"},
+		{body: `{"messages":[`, wantErr: "unexpected end of JSON input"},
+		{body: `{` + messages + `} trailing`, wantErr: "invalid character 't' after top-level value"},
+		{body: `{` + messages + `} {}`, wantErr: "invalid character '{' after top-level value"},
+		{body: `{"messages":[{"role":"user","content":"hi"},]}`, wantErr: "invalid character ']' looking for beginning of value"},
+		{body: `{` + messages + `,"model":}`, wantErr: "invalid character '}' looking for beginning of value"},
+		{body: "{\"messages\":[{\"role\":\"user\",\"content\":\"\x01\"}]}", wantErr: `invalid character '\x01' in string`},
+		{body: `[]`, wantErr: invalidChat},
+		{body: `null`, wantErr: invalidChat},
+		{body: `"text"`, wantErr: invalidChat},
+		{body: `{"model":"m"}`, wantErr: invalidChat},
+		{body: `{"messages":[]}`, wantErr: invalidChat},
+		{body: `{"messages":{}}`, wantErr: invalidChat},
+		{body: `{"messages":[{"role":"user","content":7}]}`, wantErr: invalidChat},
+	} {
+		t.Run(tt.body, func(t *testing.T) {
+			_, err := NewOpenAIParser().ParseRequest(context.Background(), []byte(tt.body), map[string]string{":path": reqcommon.PathChatCompletions})
+			want := "error extracting request body: " + tt.wantErr
+			if err == nil || err.Error() != want {
+				t.Fatalf("ParseRequest() error = %v, want %q", err, want)
+			}
+		})
+	}
+}
+
+func TestOpenAIParser_ChatCompletionsPayloadMatchesEnvelope(t *testing.T) {
+	const content = "quote \" backslash \\ braces {}[] newline \n tab \t unicode \u00e9\U0001F600 "
+	turns := make([]any, 32)
+	for i := range turns {
+		turns[i] = map[string]any{"role": "user", "content": strings.Repeat(content, 2048)}
+	}
+	largeBody, err := json.Marshal(map[string]any{"model": "m", "messages": turns, "stream": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "unknown fields",
+			body: `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true,"max_completion_tokens":16,` +
+				`"seed":9007199254740993,"temperature":0.5,"logit_bias":{"1":-100},"stop":["a","b"],"user":null,` +
+				`"vendor_ext":{"nested":[1,{"x":"}]\"[\\"}]}}`,
+		},
+		{
+			name: "whitespace and escaped keys",
+			body: " \n{ \"mo\\u0064el\" : \"m\" ,\t\"messages\" :[ {\"role\":\"user\",\"content\":\"a\\\"b\\\\\"} ] ," +
+				" \"stream\" : false , \"n\" : -1.5e3 , \"\\\"\" : true }\r\n",
+		},
+		{
+			name: "duplicate keys",
+			body: `{"model":"a","messages":[{"role":"user","content":"x"}],"model":"b","stream":true,"stream":false}`,
+		},
+		{
+			name: "non-ASCII and invalid UTF-8 keys",
+			body: "{\"m\xc3\xb6del\":\"m\",\"\xff\":1,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}",
+		},
+		{
+			name: "multimodal content",
+			body: `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"look"},` +
+				`{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`,
+		},
+		{
+			name: "empty values and raw prompt",
+			body: `{"model":"","messages":[{"role":"user","content":""}],"tools":[],"metadata":{},"prompt":"raw"}`,
+		},
+		{name: "large multi-turn", body: string(largeBody)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(tt.body)
+			got, err := NewOpenAIParser().ParseRequest(context.Background(), body, map[string]string{":path": reqcommon.PathChatCompletions})
+			if err != nil {
+				t.Fatalf("ParseRequest() error = %v", err)
+			}
+			wantPayload, err := parserutil.UnmarshalEnvelope(body, promptField)
+			if err != nil {
+				t.Fatalf("UnmarshalEnvelope() error = %v", err)
+			}
+			if diff := cmp.Diff(wantPayload, map[string]any(got.Body.Payload.(fwkrh.PayloadMap))); diff != "" {
+				t.Errorf("payload mismatch (-want +got):\n%s", diff)
+			}
+			var wantChat fwkrh.ChatCompletionsRequest
+			if err := json.Unmarshal(body, &wantChat); err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(&wantChat, got.Body.ChatCompletions); diff != "" {
+				t.Errorf("chat completions mismatch (-want +got):\n%s", diff)
+			}
+			wantModel, _ := wantPayload["model"].(string)
+			if got.Body.Model != wantModel || string(got.Body.RawBody) != tt.body || !got.JSONValidated {
+				t.Errorf("Model = %q, RawBody preserved = %v, JSONValidated = %v; want %q, true, true",
+					got.Body.Model, string(got.Body.RawBody) == tt.body, got.JSONValidated, wantModel)
 			}
 		})
 	}

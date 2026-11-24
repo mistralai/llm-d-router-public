@@ -191,7 +191,10 @@ func BenchmarkOpenAIParser_ChatCompletions(b *testing.B) {
 		{name: "Text/ISL128K", body: benchChatBody(b, benchConversation(128*1024, 1), nil)},
 		{name: "Text/ISL32K-32turns", body: benchChatBody(b, benchConversation(32*1024, 32), nil)},
 		{name: "Text/ISL128K-64turns", body: benchChatBody(b, benchConversation(128*1024, 64), nil)},
+		{name: "Text/ISL1M-128turns", body: benchChatBody(b, benchConversation(1024*1024, 128), nil)},
 		{name: "Agentic/ISL32K-20tools-8calls", body: benchChatBody(b, benchAgenticConversation(32*1024, 8),
+			map[string]any{"tools": benchTools(20)})},
+		{name: "Agentic/ISL2M-20tools-256calls", body: benchChatBody(b, benchAgenticConversation(2*1024*1024, 256),
 			map[string]any{"tools": benchTools(20)})},
 		{name: "MM/ImageURLx4-ISL1K", body: benchChatBody(b, []any{benchMultimodalMessage(benchText(shortPrompt),
 			benchImageURL(0), benchImageURL(1), benchImageURL(2), benchImageURL(3))}, nil)},
@@ -225,7 +228,7 @@ func BenchmarkOpenAIParser_ChatCompletions(b *testing.B) {
 			return err
 		}},
 		{name: "Envelope", run: func(body []byte) error {
-			result, err := parserutil.UnmarshalEnvelope(body, promptField)
+			result, err := parserutil.UnmarshalValidatedEnvelope(body, promptField)
 			benchmarkChatEnvelope = result
 			return err
 		}},
