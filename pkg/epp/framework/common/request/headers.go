@@ -23,6 +23,9 @@ const (
 	// MediaTypeEventStream is the base media type for Server-Sent Events, without
 	// the optional parameters a server may append (for example "; charset=utf-8").
 	MediaTypeEventStream = "text/event-stream"
+	// MediaTypeGRPC is the gRPC media type. A request may append a message
+	// format subtype (for example "application/grpc+proto").
+	MediaTypeGRPC = "application/grpc"
 )
 
 // GetRequestPath extracts the request path from headers with fallback priority.

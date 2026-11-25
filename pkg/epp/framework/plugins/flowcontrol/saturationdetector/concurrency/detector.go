@@ -67,6 +67,7 @@ var (
 	_ fwksched.Filter                        = &detector{}
 	_ flowcontrol.SaturationDetector         = &detector{}
 	_ flowcontrol.DispatchReservationTracker = &detector{}
+	_ fwkplugin.BodylessCapable              = &detector{}
 )
 
 // detector implements a saturation detector and scheduling filter based on active request concurrency.
@@ -113,6 +114,12 @@ func newDetector(name string, cfg config, logger logr.Logger) *detector {
 // TypedName returns the type and name tuple of this plugin instance.
 func (d *detector) TypedName() fwkplugin.TypedName {
 	return d.typedName
+}
+
+// BodylessCompatible reports true: a bodyless request has no uncached token count,
+// so in "tokens" and "hybrid" mode it adds no incoming tokens to the endpoint.
+func (d *detector) BodylessCompatible() bool {
+	return true
 }
 
 func (d *detector) Consumes() fwkplugin.DataDependencies {

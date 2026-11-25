@@ -41,7 +41,10 @@ const (
 )
 
 // compile-time type validation
-var _ fwksched.Picker = &MaxScorePicker{}
+var (
+	_ fwksched.Picker           = &MaxScorePicker{}
+	_ fwkplugin.BodylessCapable = &MaxScorePicker{}
+)
 
 // MaxScorePickerFactory defines the factory function for MaxScorePicker.
 func MaxScorePickerFactory(name string, rawParameters *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
@@ -82,6 +85,11 @@ func (p *MaxScorePicker) WithName(name string) *MaxScorePicker {
 // TypedName returns the type and name tuple of this plugin instance.
 func (p *MaxScorePicker) TypedName() fwkplugin.TypedName {
 	return p.typedName
+}
+
+// BodylessCompatible reports true: picking reads only the endpoint scores.
+func (p *MaxScorePicker) BodylessCompatible() bool {
+	return true
 }
 
 // Pick selects the endpoint(s) with the highest score calculated during the scoring phase.

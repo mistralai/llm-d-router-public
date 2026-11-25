@@ -577,6 +577,35 @@ func TestDetector_TokenFilterIncomingTokens(t *testing.T) {
 		"the published cost is counted whether or not the prompt is tokenized")
 }
 
+// TestDetector_BodylessRequest verifies that a bodyless request, which carries no uncached
+// token count, is filtered on the endpoint's current load in every mode.
+func TestDetector_BodylessRequest(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	bodyless := &fwksched.InferenceRequest{RequestID: "bodyless", Bodyless: true}
+	for _, mode := range []concurrencyMode{modeRequests, modeTokens, modeHybrid} {
+		reg := newLocalRegistry()
+		detector := newDetector("test-detector",
+			config{mode: mode, maxConcurrency: 10, maxTokenConcurrency: 100, failClosed: true}, logr.Discard())
+		require.True(t, detector.BodylessCompatible())
+
+		loadedName := "loaded-endpoint"
+		reg.update(fullEndpointName(loadedName), func(load *attrconcurrency.InFlightLoad) {
+			load.Requests = 10
+			load.Tokens = 100
+		})
+		candidates := []fwksched.Endpoint{
+			newStubSchedulingEndpoint(reg, loadedName),
+			newStubSchedulingEndpoint(reg, cleanEndpoint),
+		}
+
+		kept := detector.Filter(ctx, bodyless, candidates)
+		require.Len(t, kept, 1, "mode %s: the endpoint at its limit is filtered", mode)
+		require.Equal(t, cleanEndpoint, kept[0].GetMetadata().ID.Name)
+	}
+}
+
 // TestDetector_TokenFilterOversizedRequest verifies that a request larger than the token limit is
 // kept off loaded endpoints and still placed on an endpoint with no in-flight tokens.
 func TestDetector_TokenFilterOversizedRequest(t *testing.T) {

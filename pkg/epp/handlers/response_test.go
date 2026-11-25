@@ -153,6 +153,12 @@ func (m *mockDirector) GetRandomEndpoint() *fwkdl.EndpointMetadata {
 func (m *mockDirector) HandleRequest(ctx context.Context, reqCtx *RequestContext, inferenceRequestBody *fwkrh.InferenceRequestBody) (*RequestContext, error) {
 	return reqCtx, nil
 }
+func (m *mockDirector) HandleBodylessRequest(ctx context.Context, reqCtx *RequestContext) (*RequestContext, error) {
+	return reqCtx, nil
+}
+func (m *mockDirector) HandleResponseTrail(ctx context.Context, reqCtx *RequestContext) *RequestContext {
+	return reqCtx
+}
 
 func TestHandleResponseBody(t *testing.T) {
 	ctx := logutil.NewTestLoggerIntoContext(context.Background())

@@ -213,6 +213,7 @@ router:
                                           - x-llm-d-kv-cache-source-host-port
                                           - x-kv-cache-source-host-port
                                           - x-llm-d-pin-host-port
+                                          - x-grpc-bidirectional-stream
                                         typed_per_filter_config:
                                           envoy.filters.http.ext_proc:
                                             "@type": type.googleapis.com/envoy.config.route.v3.FilterConfig

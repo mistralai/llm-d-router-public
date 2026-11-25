@@ -48,6 +48,7 @@ type Config struct {
 	preRequestPlugins        []fwkrc.PreRequest
 	responseReceivedPlugins  []fwkrc.ResponseHeaderProcessor
 	responseStreamingPlugins []fwkrc.ResponseBodyProcessor
+	responseTrailerPlugins   []fwkrc.ResponseTrailerProcessor
 
 	// propagatePriority gates whether the director injects the resolved priority
 	// into the outbound request body. Off by default so the body is untouched.
@@ -107,6 +108,13 @@ func (c *Config) WithResponseStreamingPlugins(plugins ...fwkrc.ResponseBodyProce
 	return c
 }
 
+// WithResponseTrailerPlugins sets the given plugins as the ResponseTrailer plugins.
+// If the Config has ResponseTrailer plugins already, this call replaces the existing plugins with the given ones.
+func (c *Config) WithResponseTrailerPlugins(plugins ...fwkrc.ResponseTrailerProcessor) *Config {
+	c.responseTrailerPlugins = plugins
+	return c
+}
+
 // WithDataProducerPlugins sets the given plugins as the DataProducer plugins.
 func (c *Config) WithDataProducerPlugins(plugins ...fwkrc.DataProducer) *Config {
 	c.dataProducerPlugins = plugins
@@ -142,6 +150,9 @@ func (c *Config) AddPlugins(pluginObjects ...plugin.Plugin) {
 		if responseStreamingPlugin, ok := plugin.(fwkrc.ResponseBodyProcessor); ok {
 			c.responseStreamingPlugins = append(c.responseStreamingPlugins, responseStreamingPlugin)
 		}
+		if responseTrailerPlugin, ok := plugin.(fwkrc.ResponseTrailerProcessor); ok {
+			c.responseTrailerPlugins = append(c.responseTrailerPlugins, responseTrailerPlugin)
+		}
 		if dataProducerPlugin, ok := plugin.(fwkrc.DataProducer); ok {
 			c.dataProducerPlugins = append(c.dataProducerPlugins, dataProducerPlugin)
 		}
@@ -170,6 +181,7 @@ func (c *Config) OrderPlugins(sortedPluginNames []string) {
 	c.responders = orderByName(c.responders, rank)
 	c.responseReceivedPlugins = orderByName(c.responseReceivedPlugins, rank)
 	c.responseStreamingPlugins = orderByName(c.responseStreamingPlugins, rank)
+	c.responseTrailerPlugins = orderByName(c.responseTrailerPlugins, rank)
 }
 
 // orderByName returns the plugins ordered by their rank, followed by the unranked
