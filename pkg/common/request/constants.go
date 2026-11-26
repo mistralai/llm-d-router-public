@@ -93,6 +93,10 @@ const (
 	FieldBootstrapHost = "bootstrap_host"
 	FieldBootstrapPort = "bootstrap_port"
 	FieldBootstrapRoom = "bootstrap_room"
+
+	// vLLM per-request KV offloading limits, carried inside kv_transfer_params.
+	FieldMaxLoadTokens    = "max_load_tokens"    //#nosec G101 -- request field name, not a credential
+	FieldMaxOffloadTokens = "max_offload_tokens" //#nosec G101 -- request field name, not a credential
 )
 
 // Usage fields in a response body. Chat Completions and Completions report

@@ -53,6 +53,44 @@ const (
 	requestFieldRemoteHandshakePort  = "remote_handshake_port"
 )
 
+// clientOffloadLimitFields are the client's kv_transfer_params fields that
+// the sidecar carries onto the kv_transfer_params it builds for prefill and
+// decode. They limit the KV offloading connectors of the engine, which run
+// alongside the NixlConnector under vLLM's MultiConnector.
+var clientOffloadLimitFields = []string{reqcommon.FieldMaxLoadTokens, reqcommon.FieldMaxOffloadTokens}
+
+// clientOffloadLimits returns the client's offload limit fields from the
+// kv_transfer_params of body, or nil when there are none.
+func clientOffloadLimits(body map[string]any) map[string]any {
+	var client map[string]any
+	switch v := body[reqcommon.FieldKVTransferParams].(type) {
+	case map[string]any:
+		client = v
+	case json.RawMessage:
+		if err := json.Unmarshal(v, &client); err != nil {
+			return nil
+		}
+	}
+	var limits map[string]any
+	for _, field := range clientOffloadLimitFields {
+		if value, ok := client[field]; ok {
+			if limits == nil {
+				limits = map[string]any{}
+			}
+			limits[field] = value
+		}
+	}
+	return limits
+}
+
+// addOffloadLimits sets the client's offload limits on the kv_transfer_params
+// of a prefill or decode request. It is a no-op when kvParams is not a map.
+func addOffloadLimits(kvParams any, limits map[string]any) {
+	if params, ok := kvParams.(map[string]any); ok {
+		maps.Copy(params, limits)
+	}
+}
+
 func newNIXLV2RequestID() (string, error) {
 	id, err := uuid.NewUUID()
 	if err != nil {
@@ -118,6 +156,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 
 	// Keeps the client's body intact for the decode request below.
 	prefillRequest := maps.Clone(body)
+	offloadLimits := clientOffloadLimits(body)
 
 	// WRITE mode populates the destination fields the prefill engine needs for
 	// its RDMA Write; READ mode leaves them nil per the standard NIXLv2 contract.
@@ -166,6 +205,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 
 	// Compose the OffloadingConnector p2p pull onto the NIXL prefill request.
 	s.addP2PPullToPrefill(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
+	addOffloadLimits(prefillRequest[reqcommon.FieldKVTransferParams], offloadLimits)
 
 	reqcommon.CapSingleToken(prefillRequest, apiType)
 
@@ -388,6 +428,7 @@ retryLoop:
 			}
 		}
 	}
+	addOffloadLimits(pKVTransferParams, offloadLimits)
 	body[reqcommon.FieldKVTransferParams] = pKVTransferParams
 
 	dbody, err := json.Marshal(body)
@@ -478,6 +519,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 
 	// Keeps the client's body intact for the decode request built below.
 	prefillRequest := maps.Clone(body)
+	offloadLimits := clientOffloadLimits(body)
 
 	// Pin both requests to the same DP rank (kv_transfer_params + HTTP header).
 	// The header and remote_dp_rank must be in [0, dp_size_local).
@@ -532,6 +574,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	}
 	// Compose the OffloadingConnector p2p pull onto the NIXL prefill request.
 	s.addP2PPullToPrefill(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
+	addOffloadLimits(prefillRequest[reqcommon.FieldKVTransferParams], offloadLimits)
 
 	reqcommon.CapSingleToken(prefillRequest, apiType)
 
@@ -581,6 +624,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 			dkv["remote_dp_size_local"] = s.config.MoRIIODPSizeLocal
 		}
 	}
+	addOffloadLimits(body[reqcommon.FieldKVTransferParams], offloadLimits)
 
 	dbody, err := json.Marshal(body)
 	if err != nil {

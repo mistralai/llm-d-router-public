@@ -46,9 +46,6 @@ const (
 	// PluginType is the registered type name of the selective KV policy plugin.
 	PluginType = "selective-kv-policy"
 
-	fieldMaxLoadTokens    = "max_load_tokens"    //#nosec G101 -- config field name, not a credential
-	fieldMaxOffloadTokens = "max_offload_tokens" //#nosec G101 -- config field name, not a credential
-
 	waitingQueueEWMAHalfLife = 2 * time.Second
 	waitingQueueReopenRatio  = 0.5
 )
@@ -270,15 +267,15 @@ func mutateKVTransferParams(payload requesthandling.PayloadMap, load loadAction,
 	changed := false
 	switch load {
 	case loadDisable:
-		changed = setZero(params, fieldMaxLoadTokens)
+		changed = setZero(params, commonrequest.FieldMaxLoadTokens)
 	case loadEnable:
-		if _, exists := params[fieldMaxLoadTokens]; exists {
-			delete(params, fieldMaxLoadTokens)
+		if _, exists := params[commonrequest.FieldMaxLoadTokens]; exists {
+			delete(params, commonrequest.FieldMaxLoadTokens)
 			changed = true
 		}
 	}
 	if offload == PolicyDisable {
-		changed = setZero(params, fieldMaxOffloadTokens) || changed
+		changed = setZero(params, commonrequest.FieldMaxOffloadTokens) || changed
 	}
 	if changed {
 		payload[commonrequest.FieldKVTransferParams] = params
