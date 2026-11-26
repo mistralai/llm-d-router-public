@@ -202,6 +202,41 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		Expect(string(decodeBodies[0])).To(ContainSubstring(`"messages":` + messages))
 	})
 
+	It("should carry the client's KV offload limits onto the prefill and decode kv_transfer_params", func() {
+		proxyBaseAddr := startProxy()
+
+		body := `{"model":"Qwen/Qwen2-0.5B","messages":[{"role":"user","content":"Hello"}],"max_tokens":50,` +
+			`"kv_transfer_params":{"max_offload_tokens":0,"max_load_tokens":0,"unrelated":true}}`
+		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+reqcommon.PathChatCompletions, strings.NewReader(body))
+		Expect(err).ToNot(HaveOccurred())
+		req.Header.Add(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
+
+		rp, err := http.DefaultClient.Do(req)
+		Expect(err).ToNot(HaveOccurred())
+		defer rp.Body.Close()
+		responseBody, _ := io.ReadAll(rp.Body) //nolint:errcheck
+		Expect(rp.StatusCode).To(Equal(http.StatusOK), string(responseBody))
+
+		pkv := kvParams(testInfo.prefillHandler, 0)
+		Expect(pkv).To(HaveKeyWithValue(reqcommon.FieldDoRemoteDecode, true))
+		Expect(pkv).To(HaveKeyWithValue(reqcommon.FieldMaxOffloadTokens, BeNumerically("==", 0)))
+		Expect(pkv).To(HaveKeyWithValue(reqcommon.FieldMaxLoadTokens, BeNumerically("==", 0)))
+		Expect(pkv).ToNot(HaveKey("unrelated"))
+
+		dkv := kvParams(testInfo.decodeHandler, 0)
+		Expect(dkv).To(HaveKeyWithValue(reqcommon.FieldRemoteEngineID, "5b5fb28f-3f30-4bdd-9a36-958d52459200"))
+		Expect(dkv).To(HaveKeyWithValue(reqcommon.FieldMaxOffloadTokens, BeNumerically("==", 0)))
+		Expect(dkv).To(HaveKeyWithValue(reqcommon.FieldMaxLoadTokens, BeNumerically("==", 0)))
+	})
+
+	It("should add no KV offload limits when the client sets none", func() {
+		proxyBaseAddr := startProxy()
+		sendChatCompletionsRequest(proxyBaseAddr)
+
+		Expect(kvParams(testInfo.prefillHandler, 0)).ToNot(HaveKey(reqcommon.FieldMaxOffloadTokens))
+		Expect(kvParams(testInfo.decodeHandler, 0)).ToNot(HaveKey(reqcommon.FieldMaxOffloadTokens))
+	})
+
 	It("should add prefiller cached tokens when decoder usage details omit cached_tokens", func() {
 		testInfo.decodeHandler.RawResponse = `{"id":"chatcmpl-test","object":"chat.completion","choices":[],"usage":{"prompt_tokens":64,"completion_tokens":1,"total_tokens":65,"prompt_tokens_details":{}}}`
 		proxyBaseAddr := startProxy()
@@ -1123,6 +1158,25 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		ph := dpRankHeader(env.prefillHandler, 0)
 		Expect(ph).To(Equal(strconv.Itoa(int(pRank))))
 		Expect(dpRankHeader(env.decodeHandler, 0)).To(Equal(ph))
+	})
+
+	It("parallel-dispatch carries the client's KV offload limits onto both requests", func() {
+		env := startMoRIProxy(func(c *Config) {
+			c.MoRIIOParallelDispatch = true
+		})
+		env.sendTo(reqcommon.PathChatCompletions,
+			`{"model":"Qwen/Qwen2-0.5B","messages":[{"role":"user","content":"Hello"}],"max_tokens":50,`+
+				`"kv_transfer_params":{"max_offload_tokens":0,"max_load_tokens":0}}`)
+
+		pkv := kvParams(env.prefillHandler, 0)
+		Expect(pkv).To(HaveKeyWithValue(reqcommon.FieldDoRemoteDecode, true))
+		Expect(pkv).To(HaveKeyWithValue(reqcommon.FieldMaxOffloadTokens, BeNumerically("==", 0)))
+		Expect(pkv).To(HaveKeyWithValue(reqcommon.FieldMaxLoadTokens, BeNumerically("==", 0)))
+
+		dkv := kvParams(env.decodeHandler, 0)
+		Expect(dkv).To(HaveKeyWithValue(reqcommon.FieldDoRemotePrefill, true))
+		Expect(dkv).To(HaveKeyWithValue(reqcommon.FieldMaxOffloadTokens, BeNumerically("==", 0)))
+		Expect(dkv).To(HaveKeyWithValue(reqcommon.FieldMaxLoadTokens, BeNumerically("==", 0)))
 	})
 
 	// 2P2D DP=16: the prefill request gets all decode hosts; the decode request
